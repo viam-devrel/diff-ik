@@ -1,0 +1,13 @@
+{
+  "module_name": "diff-ik",
+  "visibility": "public_unlisted",
+  "namespace": "devrel",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "motion",
+  "model_name": "servo",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-11-15T15:13:17.496074Z",
+  "module_readme_link": "README.md"
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "devrel:diff-ik",
+  "visibility": "public_unlisted",
+  "url": "",
+  "description": "Modular motion service: servo",
+  "markdown_link": "README.md",
+  "entrypoint": "bin/diff-ik",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64"
+    ]
+  }
+}
