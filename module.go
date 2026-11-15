@@ -3,11 +3,19 @@ package diffik
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"time"
 
+	"github.com/golang/geo/r3"
+	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/robot/framesystem"
 	motion "go.viam.com/rdk/services/motion"
+	"go.viam.com/rdk/spatialmath"
 )
 
 var (
@@ -23,53 +31,33 @@ func init() {
 	)
 }
 
+// Config lists the arms this service may servo.
 type Config struct {
-	/*
-		Put config attributes here. There should be public/exported fields
-		with a `json` parameter at the end of each attribute.
-
-		Example config struct:
-			type Config struct {
-				Pin   string `json:"pin"`
-				Board string `json:"board"`
-				MinDeg *float64 `json:"min_angle_deg,omitempty"`
-			}
-
-		If your model does not need a config, replace Config in the init
-		function with resource.NoNativeConfig
-	*/
+	Arms []string `json:"arms"`
 }
 
-// Validate ensures all parts of the config are valid and important fields exist.
-// Returns three values:
-//  1. Required dependencies: other resources that must exist for this resource to work.
-//  2. Optional dependencies: other resources that may exist but are not required.
-//  3. An error if any Config fields are missing or invalid.
-//
-// The `path` parameter indicates
-// where this resource appears in the machine's JSON configuration
-// (for example, "components.0"). You can use it in error messages
-// to indicate which resource has a problem.
-//
-// Note: Validate receives a copy of the config; mutations to it will do
-// nothing. Fill in any default values in your resource's constructor function
-// instead.
+// Validate requires at least one arm and no duplicates, and returns the arms as dependencies.
+// The frame system needs no declaration: the module manager always injects it.
 func (cfg Config) Validate(path string) ([]string, []string, error) {
-	// Add config validation code here
-	return nil, nil, nil
+	if len(cfg.Arms) == 0 {
+		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "arms")
+	}
+	seen := map[string]bool{}
+	for _, a := range cfg.Arms {
+		if a == "" || seen[a] {
+			return nil, nil, fmt.Errorf("%s: arms must be unique, non-empty names", path)
+		}
+		seen[a] = true
+	}
+	return slices.Clone(cfg.Arms), nil, nil
 }
 
 type diffIkServo struct {
 	resource.AlwaysRebuild
-	resource.Named
 
-	name resource.Name
-
+	name   resource.Name
 	logger logging.Logger
-	cfg    Config
-
-	cancelCtx  context.Context
-	cancelFunc func()
+	m      *servoManager
 }
 
 func newDiffIkServo(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (motion.Service, error) {
@@ -77,35 +65,320 @@ func newDiffIkServo(ctx context.Context, deps resource.Dependencies, rawConf res
 	if err != nil {
 		return nil, err
 	}
-
 	return NewServo(ctx, deps, rawConf.ResourceName(), conf, logger)
-
 }
 
+// NewServo builds the service from its dependencies: each configured arm and the injected frame system.
 func NewServo(ctx context.Context, deps resource.Dependencies, name resource.Name, conf Config, logger logging.Logger) (motion.Service, error) {
+	arms := map[string]arm.Arm{}
+	for _, n := range conf.Arms {
+		a, err := arm.FromDependencies(deps, n)
+		if err != nil {
+			return nil, err
+		}
+		arms[n] = a
+	}
+	fs, err := framesystem.FromDependencies(deps)
+	if err != nil {
+		return nil, err
+	}
+	return newServo(name, logger, newServoManager(arms, fs, logger)), nil
+}
 
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
+func newServo(name resource.Name, logger logging.Logger, m *servoManager) *diffIkServo {
+	return &diffIkServo{name: name, logger: logger, m: m}
+}
 
-	s := &diffIkServo{
-		name:       name,
-		logger:     logger,
-		cfg:        conf,
-		cancelCtx:  cancelCtx,
-		cancelFunc: cancelFunc,
+func (s *diffIkServo) Name() resource.Name { return s.name }
+
+// Move is not implemented; it refuses an arm that has a live servo session.
+func (s *diffIkServo) Move(ctx context.Context, req motion.MoveReq) (bool, error) {
+	if s.m.busy(req.ComponentName) {
+		return false, fmt.Errorf("arm %s busy", req.ComponentName)
+	}
+	return false, errUnimplemented
+}
+
+// StopPlan ramp-stops the servo session on req.ComponentName, if any.
+func (s *diffIkServo) StopPlan(ctx context.Context, req motion.StopPlanReq) error {
+	return s.m.stopArm(ctx, req.ComponentName)
+}
+
+func (s *diffIkServo) Close(ctx context.Context) error { return s.m.close(ctx) }
+
+// DoCommand implements the servo protocol. See docs/superpowers/specs/2026-11-15-diff-ik-phase2-design.md.
+func (s *diffIkServo) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	name, ok := cmd["command"].(string)
+	if !ok {
+		return nil, errors.New("command is required")
+	}
+	if name == "servo_start" {
+		return s.servoStart(ctx, cmd)
+	}
+	switch name {
+	case "servo_target", "servo_twist", "servo_stop", "servo_status":
+	default:
+		return nil, fmt.Errorf("unknown command %q", name)
+	}
+	id, ok := cmd["session_id"].(string)
+	if !ok {
+		return nil, errors.New("session_id is required")
+	}
+	sess, err := s.m.get(id)
+	if err != nil {
+		return nil, err
+	}
+	switch name {
+	case "servo_target":
+		pm, ok := cmd["pose"].(map[string]interface{})
+		if !ok {
+			return nil, errors.New("pose is required")
+		}
+		p, err := parsePose(pm)
+		if err != nil {
+			return nil, err
+		}
+		st, err := sess.target(p)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"state": string(st.State), "err_mm": st.ErrMM, "err_deg": st.ErrDeg}, nil
+	case "servo_twist":
+		lin, err := vec3(cmd, "linear")
+		if err != nil {
+			return nil, err
+		}
+		ang, err := vec3(cmd, "angular")
+		if err != nil {
+			return nil, err
+		}
+		st, err := sess.twist(lin.Mul(1/mmPerM), ang.Mul(math.Pi/180))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"state": string(st.State)}, nil
+	case "servo_stop":
+		st, err := sess.stop(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return statusMap(st), nil
+	default: // servo_status
+		return statusMap(sess.status()), nil
+	}
+}
+
+func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	armName, ok := cmd["component_name"].(string)
+	if !ok || armName == "" {
+		return nil, errors.New("component_name is required")
+	}
+	frame, err := optString(cmd, "frame", referenceframe.World)
+	if err != nil {
+		return nil, err
+	}
+	mode, err := optString(cmd, "mode", string(ModePose))
+	if err != nil {
+		return nil, err
+	}
+	rate, err := optNum(cmd, "rate_hz", 50)
+	if err != nil {
+		return nil, err
+	}
+	if !(rate >= 1 && rate <= 1000) {
+		return nil, fmt.Errorf("rate_hz must be in [1, 1000], got %v", rate)
+	}
+	timeout, err := optNum(cmd, "timeout_ms", 500)
+	if err != nil {
+		return nil, err
+	}
+	if !(timeout > 0 && timeout <= 10000) {
+		return nil, fmt.Errorf("timeout_ms must be in (0, 10000], got %v", timeout)
+	}
+	ramp, err := optNum(cmd, "ramp_ms", 200)
+	if err != nil {
+		return nil, err
+	}
+	if !(ramp > 0 && ramp <= 5000) {
+		return nil, fmt.Errorf("ramp_ms must be in (0, 5000], got %v", ramp)
+	}
+	lc := LoopConfig{RateHz: rate}
+	if raw, ok := cmd["limits"]; ok {
+		lm, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, errors.New("limits must be an object")
+		}
+		if v, ok := lm["joint_deg_s"]; ok {
+			if lc.MaxJointDegPerS, err = numOrList(v, "limits.joint_deg_s"); err != nil {
+				return nil, err
+			}
+		}
+		for _, f := range []struct {
+			key string
+			dst *float64
+		}{
+			{"linear_mm_s", &lc.MaxLinearMMPerS},
+			{"angular_deg_s", &lc.MaxAngularDegPerS},
+			{"resync_deg", &lc.ResyncDeg},
+		} {
+			if v, ok := lm[f.key]; ok {
+				n, err := num(v, "limits."+f.key)
+				if err != nil {
+					return nil, err
+				}
+				if !(n > 0) {
+					return nil, fmt.Errorf("limits.%s must be > 0, got %v", f.key, n)
+				}
+				*f.dst = n
+			}
+		}
+	}
+	if v, ok := cmd["task_weights"]; ok {
+		ws, err := numOrList(v, "task_weights")
+		if err != nil {
+			return nil, err
+		}
+		if len(ws) != 6 {
+			return nil, fmt.Errorf("task_weights must be 6 numbers > 0, got %v", v)
+		}
+		copy(lc.TaskWeights[:], ws)
+	}
+	sess, pose, err := s.m.start(ctx, armName, SessionConfig{
+		Frame: frame, Mode: Mode(mode), Loop: lc,
+		Timeout: time.Duration(timeout * float64(time.Millisecond)),
+		Ramp:    time.Duration(ramp * float64(time.Millisecond)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"session_id": sess.id, "pose": poseMap(pose)}, nil
+}
+
+func (s *diffIkServo) Status(ctx context.Context) (map[string]interface{}, error) {
+	return nil, errUnimplemented
+}
+
+// num converts a DoCommand number (float64 from protobuf, int in Go callers) and rejects NaN/Inf.
+func num(v interface{}, key string) (float64, error) {
+	var f float64
+	switch n := v.(type) {
+	case float64:
+		f = n
+	case int:
+		f = float64(n)
+	case int64:
+		f = float64(n)
+	default:
+		return 0, fmt.Errorf("%s must be a number, got %v", key, v)
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("%s must be finite, got %v", key, f)
+	}
+	return f, nil
+}
+
+func optNum(m map[string]interface{}, key string, def float64) (float64, error) {
+	v, ok := m[key]
+	if !ok {
+		return def, nil
+	}
+	return num(v, key)
+}
+
+func optString(m map[string]interface{}, key, def string) (string, error) {
+	v, ok := m[key]
+	if !ok {
+		return def, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string, got %v", key, v)
 	}
 	return s, nil
 }
 
-func (s *diffIkServo) Name() resource.Name {
-	return s.name
+// numOrList parses a number or a list of numbers, each > 0.
+func numOrList(v interface{}, key string) ([]float64, error) {
+	items, ok := v.([]interface{})
+	if !ok {
+		items = []interface{}{v}
+	}
+	out := make([]float64, len(items))
+	for i, it := range items {
+		n, err := num(it, key)
+		if err != nil {
+			return nil, err
+		}
+		if !(n > 0) {
+			return nil, fmt.Errorf("%s values must be > 0, got %v", key, n)
+		}
+		out[i] = n
+	}
+	return out, nil
 }
 
-// Move is the primary method to move multiple components or any object to a specified location.
-// Given a destination pose and a component, Move constructs a kinematic chain from goal to destination,
-// solves it while adhering to constraints, and executes the movement to avoid collisions with the machine itself
-// and other known objects. The above arguments are all grouped together in the MoveReq struct.
-func (s *diffIkServo) Move(ctx context.Context, req motion.MoveReq) (bool, error) {
-	return false, errUnimplemented
+func vec3(m map[string]interface{}, key string) (r3.Vector, error) {
+	items, ok := m[key].([]interface{})
+	if !ok || len(items) != 3 {
+		return r3.Vector{}, fmt.Errorf("%s must be 3 numbers", key)
+	}
+	var f [3]float64
+	for i, it := range items {
+		n, err := num(it, key)
+		if err != nil {
+			return r3.Vector{}, err
+		}
+		f[i] = n
+	}
+	return r3.Vector{X: f[0], Y: f[1], Z: f[2]}, nil
+}
+
+var poseKeys = []string{"x", "y", "z", "o_x", "o_y", "o_z", "theta"}
+
+// parsePose reads {x, y, z (mm), o_x, o_y, o_z, theta (deg)}. The orientation vector is normalised.
+func parsePose(m map[string]interface{}) (spatialmath.Pose, error) {
+	var f [7]float64
+	for i, k := range poseKeys {
+		v, ok := m[k]
+		if !ok {
+			return nil, fmt.Errorf("pose.%s is required", k)
+		}
+		n, err := num(v, "pose."+k)
+		if err != nil {
+			return nil, err
+		}
+		f[i] = n
+	}
+	o := r3.Vector{X: f[3], Y: f[4], Z: f[5]}
+	if n := o.Norm(); !(n > 1e-9) || math.IsInf(n, 0) {
+		return nil, errors.New("pose orientation vector (o_x, o_y, o_z) must be non-zero and finite")
+	}
+	o = o.Normalize()
+	return spatialmath.NewPose(r3.Vector{X: f[0], Y: f[1], Z: f[2]},
+		&spatialmath.OrientationVectorDegrees{OX: o.X, OY: o.Y, OZ: o.Z, Theta: f[6]}), nil
+}
+
+func poseMap(p spatialmath.Pose) map[string]interface{} {
+	pt, ov := p.Point(), p.Orientation().OrientationVectorDegrees()
+	return map[string]interface{}{"x": pt.X, "y": pt.Y, "z": pt.Z, "o_x": ov.OX, "o_y": ov.OY, "o_z": ov.OZ, "theta": ov.Theta}
+}
+
+func statusMap(st SessionStatus) map[string]interface{} {
+	js := make([]interface{}, len(st.Config.MaxJointDegPerS))
+	for i, v := range st.Config.MaxJointDegPerS {
+		js[i] = v
+	}
+	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+	return map[string]interface{}{
+		"state": string(st.State), "err_mm": st.ErrMM, "err_deg": st.ErrDeg, "rate_hz": st.RateHz,
+		"last_command_age_ms": ms(st.LastCmdAge),
+		"limits": map[string]interface{}{
+			"joint_deg_s": js, "linear_mm_s": st.Config.MaxLinearMMPerS,
+			"angular_deg_s": st.Config.MaxAngularDegPerS, "resync_deg": st.Config.ResyncDeg,
+		},
+		"tick_p50_ms": ms(st.TickP50), "tick_p99_ms": ms(st.TickP99),
+		"overruns": float64(st.Overruns), "resyncs": float64(st.Resyncs), "damping": st.Damping,
+	}
 }
 
 // MoveOnMap moves a base component to a destination Pose on a SLAM map and returns a unique ExecutionID.
@@ -134,11 +407,6 @@ func (s *diffIkServo) MoveOnGlobe(ctx context.Context, req motion.MoveOnGlobeReq
 // deprecated, use framesystem.Servce.GetPose
 func (s *diffIkServo) GetPose(ctx context.Context, componentName string, destinationFrame string, supplementalTransforms []*referenceframe.LinkInFrame, extra map[string]interface{}) (*referenceframe.PoseInFrame, error) {
 	return nil, errUnimplemented
-}
-
-// StopPlan stops a base component being moved by an in progress `MoveOnGlobe()` or `MoveOnMap()` call.
-func (s *diffIkServo) StopPlan(ctx context.Context, req motion.StopPlanReq) error {
-	return errUnimplemented
 }
 
 // ListPlanStatuses returns the statuses of plans created by `MoveOnGlobe()` or `MoveOnMap()` since the motion service initialized.
@@ -177,18 +445,4 @@ func (s *diffIkServo) PlanHistory(ctx context.Context, req motion.PlanHistoryReq
 // and must not close either.
 func (s *diffIkServo) TempStreamArmJointPositions(ctx context.Context, armName string, opts motion.TempStreamOptions, targets <-chan []referenceframe.Input, responses chan<- motion.TempStreamResponse, extra map[string]interface{}) error {
 	return errUnimplemented
-}
-
-func (s *diffIkServo) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	return nil, errUnimplemented
-}
-
-func (s *diffIkServo) Status(ctx context.Context) (map[string]interface{}, error) {
-	return nil, errUnimplemented
-}
-
-func (s *diffIkServo) Close(context.Context) error {
-	// Put close code here
-	s.cancelFunc()
-	return nil
 }

@@ -36,3 +36,5 @@ reload-*/
 docs/briefs/
 docs/plans
 docs/specs
+clients/ts/node_modules/
+__pycache__/

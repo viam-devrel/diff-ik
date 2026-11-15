@@ -164,3 +164,12 @@ func TestDLSStep(t *testing.T) {
 		}
 	}
 }
+
+func TestExpRotInvertsRotVec(t *testing.T) {
+	for _, v := range []r3.Vector{{X: 0.3}, {Y: -1.2, Z: 0.4}, {X: 1e-9}, {}} {
+		got := RotVec(ExpRot(v), quat.Number{Real: 1})
+		if got.Sub(v).Norm() > 1e-12 {
+			t.Errorf("RotVec(ExpRot(%v)) = %v", v, got)
+		}
+	}
+}

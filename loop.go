@@ -12,6 +12,7 @@ import (
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
+	"gonum.org/v1/gonum/num/quat"
 )
 
 // JointIO is how the loop talks to an arm: read measured joints, send a joint target, stop.
@@ -102,12 +103,22 @@ type State string
 
 // Loop states.
 const (
-	StateIdle      State = "idle"
-	StateRunning   State = "running"
-	StateConverged State = "converged"
-	StateStalled   State = "stalled"
-	StateFaulted   State = "faulted"
+	StateIdle           State = "idle"
+	StateRunning        State = "running"
+	StateConverged      State = "converged"
+	StateStalled        State = "stalled"
+	StateFaulted        State = "faulted"
+	StateStopped        State = "stopped"
+	StateStoppedTimeout State = "stopped_timeout"
 )
+
+const (
+	minHold = 100 * time.Millisecond // floor on the SetMotion extrapolation hold
+	leashS  = 0.1                    // the target may lead FK(q_cmd) by this many seconds at the speed limits
+)
+
+// errRampDone is returned by tick once a RampStop has completed and the arm has been stopped.
+var errRampDone = errors.New("ramp stop complete")
 
 // Status is a snapshot of the loop. Errors are measured (from read-back joints) unless prefixed Cmd.
 type Status struct {
@@ -134,18 +145,31 @@ type Loop struct {
 	lo, hi []float64
 
 	// OnTick, if set before Run, is called after every tick with a status snapshot.
+	// The tick that completes a ramp-stop is not reported; read Status after Run returns.
 	OnTick func(Status)
 
-	qCmd    []float64
-	errRing []float64 // weighted measured error norm, one per tick, for stall detection
+	// Now is the loop's clock for the extrapolation hold and the ramp. Nil means time.Now. Set before Run.
+	Now func() time.Time
 
-	mu       sync.Mutex
-	target   spatialmath.Pose
-	status   Status
-	tickDurs []time.Duration
-	ticks    int
-	first    time.Time // start of the first tick
-	last     time.Time // start of the latest tick
+	stopErr error // io.Stop result of a completed ramp; written and read only on the loop goroutine
+
+	qCmd []float64
+
+	mu        sync.Mutex
+	errRing   []float64 // weighted measured error norm, one per tick, for stall detection
+	target    spatialmath.Pose
+	vel       [6]float64    // feedforward twist, base frame, m/s and rad/s
+	extrap    bool          // vel came from SetMotion, so the hold applies
+	lastSet   time.Time     // time of the last SetMotion
+	holdAfter time.Duration // stop extrapolating this long after lastSet
+	rampStart time.Time     // zero: no ramp
+	rampDur   time.Duration
+	rampFinal State
+	status    Status
+	tickDurs  []time.Duration
+	ticks     int
+	first     time.Time // start of the first tick
+	last      time.Time // start of the latest tick
 }
 
 // NewLoop builds a loop for model, driven through io.
@@ -165,12 +189,100 @@ func NewLoop(model referenceframe.Model, io JointIO, cfg LoopConfig) (*Loop, err
 	return l, nil
 }
 
-// SetTarget sets the pose (mm, base frame) the loop servos to. Latest wins.
-func (l *Loop) SetTarget(p spatialmath.Pose) {
+// SetTarget sets a stationary target pose (mm, base frame). Latest wins.
+func (l *Loop) SetTarget(p spatialmath.Pose) { l.SetMotion(p, [6]float64{}) }
+
+// SetMotion sets the target pose (mm, base frame) and a feedforward twist vel (m/s, rad/s, base frame).
+// The loop advances the target at vel until max(2 × the interval since the previous SetMotion, 100 ms)
+// has passed, then holds it. Latest wins. Ignored once a RampStop has begun.
+func (l *Loop) SetMotion(p spatialmath.Pose, vel [6]float64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.target = p
+	if !l.rampStart.IsZero() {
+		return
+	}
+	now := l.now()
+	l.holdAfter = minHold
+	if !l.lastSet.IsZero() {
+		l.holdAfter = max(minHold, 2*now.Sub(l.lastSet))
+	}
+	l.lastSet = now
+	l.target, l.vel, l.extrap = p, vel, true
 	l.errRing = l.errRing[:0]
+}
+
+// SetVelocity sets the feedforward twist (m/s, rad/s, base frame) and keeps advancing the current
+// target at it, with no hold. Ignored before a target exists or once a RampStop has begun.
+func (l *Loop) SetVelocity(vel [6]float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.rampStart.IsZero() || l.target == nil {
+		return
+	}
+	l.vel, l.extrap = vel, false
+}
+
+// RampStop scales the commanded velocity linearly to zero over ramp, then stops the arm and ends
+// Run (returning nil) with state final. The target stops advancing and SetMotion/SetVelocity are
+// ignored from the call on. A second call keeps the first deadline and only upgrades final to StateStopped.
+func (l *Loop) RampStop(ramp time.Duration, final State) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.rampStart.IsZero() {
+		l.rampStart, l.rampDur, l.rampFinal = l.now(), ramp, final
+		return
+	}
+	if final == StateStopped {
+		l.rampFinal = final
+	}
+}
+
+func (l *Loop) now() time.Time {
+	if l.Now != nil {
+		return l.Now()
+	}
+	return time.Now()
+}
+
+// rampScale reports whether a ramp-stop is active and the velocity scale in [0, 1]. Caller holds l.mu.
+func (l *Loop) rampScale() (bool, float64) {
+	if l.rampStart.IsZero() {
+		return false, 1
+	}
+	if l.rampDur <= 0 {
+		return true, 0
+	}
+	return true, math.Max(0, 1-float64(l.now().Sub(l.rampStart))/float64(l.rampDur))
+}
+
+// advance moves the stored target one tick along vel and returns the target and the feedforward
+// twist to use. cp and cq are FK(q_cmd). Caller holds l.mu.
+//   - Hold (SetMotion only): after holdAfter the target stays put and no feedforward is added.
+//   - Ramp: the target stays put but the feedforward still applies; tick scales it toward zero.
+//   - Leash, per axis: an advance is skipped only when the commanded-side error already exceeds
+//     leashS × the speed limit and the advance would grow it (vel · e > 0).
+func (l *Loop) advance(dt float64, cp r3.Vector, cq quat.Number, ramping bool) (spatialmath.Pose, [6]float64) {
+	var zero [6]float64
+	if l.extrap && l.now().Sub(l.lastSet) > l.holdAfter {
+		return l.target, zero
+	}
+	vel := l.vel
+	if ramping || vel == zero {
+		return l.target, vel
+	}
+	tp, tq := l.target.Point().Mul(1/mmPerM), l.target.Orientation().Quaternion()
+	e := PoseError(tp, tq, cp, cq)
+	vl, el := r3.Vector{X: vel[0], Y: vel[1], Z: vel[2]}, r3.Vector{X: e[0], Y: e[1], Z: e[2]}
+	if !(el.Norm() > leashS*l.cfg.MaxLinearMMPerS/mmPerM && vl.Dot(el) > 0) {
+		tp = tp.Add(vl.Mul(dt))
+	}
+	va, ea := r3.Vector{X: vel[3], Y: vel[4], Z: vel[5]}, r3.Vector{X: e[3], Y: e[4], Z: e[5]}
+	if !(ea.Norm() > leashS*deg2rad(l.cfg.MaxAngularDegPerS) && va.Dot(ea) > 0) {
+		tq = quat.Mul(ExpRot(va.Mul(dt)), tq)
+	}
+	q := spatialmath.Quaternion(tq)
+	l.target = spatialmath.NewPose(tp.Mul(mmPerM), &q)
+	return l.target, vel
 }
 
 // Config returns the loop's configuration with defaults filled in.
@@ -208,7 +320,15 @@ func (l *Loop) Run(ctx context.Context) error {
 		case <-t.C:
 		}
 		start := time.Now()
-		if err := l.tick(ctx, dt); err != nil {
+		// ponytail: one fixed budget; the first tick also opens the stream, so the floor is generous.
+		// A hung Read/Send faults (and stops the arm) after this instead of blocking forever.
+		tctx, cancel := context.WithTimeout(ctx, max(5*period, 500*time.Millisecond))
+		err := l.tick(tctx, dt)
+		cancel()
+		if err != nil {
+			if errors.Is(err, errRampDone) {
+				return l.stopErr // tick already stopped the arm
+			}
 			if ctx.Err() != nil {
 				return l.stop(ctx.Err())
 			}
@@ -250,6 +370,19 @@ func (l *Loop) stop(cause error) error {
 
 // tick runs one control step. See the spec's per-tick data flow; step numbers match.
 func (l *Loop) tick(ctx context.Context, dt float64) error {
+	// 0. ramp-stop complete: stop the arm and end. This runs before the idle return so an idle ramp ends too.
+	l.mu.Lock()
+	ramping, scale := l.rampScale()
+	if ramping && scale == 0 {
+		l.status.State = l.rampFinal
+		l.mu.Unlock()
+		// final state is set even if io.Stop fails; Run returns that error (spec: 'or the stop error')
+		l.stopErr = l.stop(nil)
+		return errRampDone
+	}
+	hasTarget := l.target != nil
+	l.mu.Unlock()
+
 	// 1. measured joints
 	qm, err := l.io.Read(ctx)
 	if err != nil {
@@ -258,13 +391,10 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	if len(qm) != len(l.lo) {
 		return fmt.Errorf("arm reported %d joints, model has %d", len(qm), len(l.lo))
 	}
-	l.mu.Lock()
-	target := l.target
-	l.mu.Unlock()
 	if l.qCmd == nil {
 		l.qCmd = slices.Clone(qm)
 	}
-	if target == nil {
+	if !hasTarget {
 		l.mu.Lock()
 		l.status.State = StateIdle
 		l.status.QMeas = slices.Clone(qm)
@@ -272,24 +402,31 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 		return nil
 	}
 
-	// 2. hybrid resync
+	// 2. hybrid resync (outside mu)
 	resynced := false
 	if maxAbsDiff(l.qCmd, qm) > deg2rad(l.cfg.ResyncDeg) {
 		copy(l.qCmd, qm)
 		resynced = true
 	}
 
-	// 3. error at commanded state
-	tp, tq := target.Point().Mul(1/mmPerM), target.Orientation().Quaternion()
+	// 3. FK(q_cmd), then advance the target under mu, then the error from the copy (spec "Tick order")
 	cp, cq, err := FK(l.model, l.qCmd)
 	if err != nil {
 		return err
 	}
+	l.mu.Lock()
+	ramping, scale = l.rampScale() // a RampStop may have landed since step 0
+	// not covered by a test: a missed mid-tick ramp start only costs one full-scale tick
+	target, vel := l.advance(dt, cp, cq, ramping)
+	l.mu.Unlock()
+	tp, tq := target.Point().Mul(1/mmPerM), target.Orientation().Quaternion()
 	e := PoseError(tp, tq, cp, cq)
 
-	// 4–5. capped task velocity → task step
-	lin := capNorm(r3.Vector{X: e[0], Y: e[1], Z: e[2]}.Mul(l.cfg.Gain), l.cfg.MaxLinearMMPerS/mmPerM)
-	ang := capNorm(r3.Vector{X: e[3], Y: e[4], Z: e[5]}.Mul(l.cfg.Gain), deg2rad(l.cfg.MaxAngularDegPerS))
+	// 4–5. v = vel + Gain·e, capped, scaled by any ramp → task step
+	lin := capNorm(r3.Vector{X: vel[0] + l.cfg.Gain*e[0], Y: vel[1] + l.cfg.Gain*e[1], Z: vel[2] + l.cfg.Gain*e[2]},
+		l.cfg.MaxLinearMMPerS/mmPerM).Mul(scale)
+	ang := capNorm(r3.Vector{X: vel[3] + l.cfg.Gain*e[3], Y: vel[4] + l.cfg.Gain*e[4], Z: vel[5] + l.cfg.Gain*e[5]},
+		deg2rad(l.cfg.MaxAngularDegPerS)).Mul(scale)
 	dx := [6]float64{lin.X * dt, lin.Y * dt, lin.Z * dt, ang.X * dt, ang.Y * dt, ang.Z * dt}
 
 	// 6. weighted DLS
@@ -350,13 +487,13 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	st.CmdErrMM, st.CmdErrDeg = posMM(e), angDeg(e)
 	st.Damping, st.Limited = lambda, limited
 	st.QCmd, st.QMeas = slices.Clone(l.qCmd), slices.Clone(qm)
-	st.State = l.nextState(em, limited)
+	st.State = l.nextState(em, limited, vel != ([6]float64{}))
 	return nil
 }
 
-// nextState picks converged/stalled/running. Caller holds l.mu.
-func (l *Loop) nextState(em [6]float64, limited bool) State {
-	if posMM(em) <= l.cfg.TolMM && angDeg(em) <= l.cfg.TolDeg {
+// nextState picks converged/stalled/running. moving means a feedforward twist is active. Caller holds l.mu.
+func (l *Loop) nextState(em [6]float64, limited, moving bool) State {
+	if !moving && posMM(em) <= l.cfg.TolMM && angDeg(em) <= l.cfg.TolDeg {
 		l.errRing = l.errRing[:0]
 		return StateConverged
 	}

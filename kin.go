@@ -112,3 +112,13 @@ func dlsStep(J *mat.Dense, w [6]float64, dx [6]float64, eps, maxDamping float64)
 	}
 	return append([]float64(nil), x.RawVector().Data...), math.Sqrt(l2), sigmaMin, nil
 }
+
+// ExpRot returns the unit quaternion for base-frame rotation vector v (rad): the inverse of RotVec.
+func ExpRot(v r3.Vector) quat.Number {
+	th := v.Norm()
+	if th < 1e-12 {
+		return quat.Number{Real: 1}
+	}
+	s := math.Sin(th/2) / th
+	return quat.Number{Real: math.Cos(th / 2), Imag: s * v.X, Jmag: s * v.Y, Kmag: s * v.Z}
+}

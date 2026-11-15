@@ -1,0 +1,322 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["viam-sdk"]
+# ///
+"""Phase 2 bench for the diff-ik servo DoCommand surface.
+
+Usage (sim, local plaintext listener):
+  uv run clients/python/servo_bench.py --address 127.0.0.1:<port> --insecure --arm pick-arm --joint-deg-s 60
+With API keys instead: export VIAM_API_KEY_ID / VIAM_API_KEY and drop --insecure.
+Spec: docs/superpowers/specs/2026-11-15-diff-ik-phase2-design.md, "Measurements".
+"""
+
+import argparse
+import asyncio
+import math
+import os
+import statistics
+import sys
+import time
+
+FAILS: list[str] = []
+
+
+def report(metric: str, value: str, bar: str = "report", ok: bool | None = None) -> None:
+    mark = "" if ok is None else ("PASS" if ok else "FAIL")
+    if ok is False:
+        FAILS.append(metric)
+    print(f"{metric:<38} {value:<26} {bar:<20} {mark}", flush=True)
+
+
+def moved(q0: list[float], q: list[float], eps: float = 0.05) -> bool:
+    return any(abs(a - b) > eps for a, b in zip(q0, q))
+
+
+def first_stationary(samples: list[tuple[float, list[float]]], after: float, eps: float = 0.05,
+                     window: float = 0.1) -> float | None:
+    """Time of the first sample after `after` from which every joint stays within eps for `window` seconds.
+
+    A time window, not a sample count: polls over loopback arrive ~1 ms apart, so consecutive
+    samples of a moving arm differ by far less than eps."""
+    s = [x for x in samples if x[0] >= after]
+    for i, (t, q) in enumerate(s):
+        if s[-1][0] < t + window:
+            return None  # not enough samples left to prove it
+        if all(not moved(q, q2, eps) for t2, q2 in s[i + 1:] if t2 <= t + window):
+            return t
+    return None
+
+
+async def connect(args):
+    from viam.robot.client import RobotClient
+    from viam.rpc.dial import DialOptions
+
+    if args.insecure:
+        dial = DialOptions(insecure=True, disable_webrtc=True)
+    else:
+        dial = DialOptions.with_api_key(os.environ["VIAM_API_KEY"], os.environ["VIAM_API_KEY_ID"])
+    return await RobotClient.at_address(args.address, RobotClient.Options(dial_options=dial))
+
+
+async def cmd(svc, **kw):
+    return await svc.do_command(kw)
+
+
+async def expect_err(svc, label: str, substr: str, **kw) -> None:
+    try:
+        await cmd(svc, **kw)
+        report(f"smoke: {label}", "no error", f"error ∋ '{substr}'", False)
+    except Exception as e:  # SDK wraps server errors in several exception types
+        report(f"smoke: {label}", "error", f"error ∋ '{substr}'", substr in str(e))
+
+
+class Poller:
+    """Polls the arm on a second connection: joint positions (deg) or end positions (mm)."""
+
+    def __init__(self, arm, end: bool = False):
+        self.arm, self.end = arm, end
+        self.samples: list[tuple[float, list[float]]] = []
+        self.task: asyncio.Task | None = None
+
+    async def _run(self) -> None:
+        while True:
+            if self.end:
+                p = await self.arm.get_end_position()
+                v = [p.x, p.y, p.z]
+            else:
+                v = list((await self.arm.get_joint_positions()).values)
+            self.samples.append((time.monotonic(), v))
+
+    def start(self) -> None:
+        self.samples = []
+        self.task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+
+def start_kw(args, **kw):
+    base = {"command": "servo_start", "component_name": args.arm, "frame": f"{args.arm}_origin",
+            "limits": {"joint_deg_s": args.joint_deg_s}}
+    base.update(kw)
+    return base
+
+
+async def hold_until_converged(svc, sid: str, pose: dict, timeout: float = 6.0) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        r = await cmd(svc, command="servo_target", session_id=sid, pose=pose)
+        if r["state"] == "converged":
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
+async def smoke(svc, args) -> None:
+    r = await svc.do_command(start_kw(args, mode="pose"))
+    sid, p0 = r["session_id"], r["pose"]
+    await expect_err(svc, "busy arm", "busy", **start_kw(args))
+    await expect_err(svc, "wrong mode", "wrong mode", command="servo_twist", session_id=sid,
+                     linear=[0, 0, 0], angular=[0, 0, 0])
+    await expect_err(svc, "unknown session", "unknown session_id", command="servo_status", session_id="nope")
+    await expect_err(svc, "unknown command", "unknown command", command="servo_fly")
+    goal = dict(p0, z=p0["z"] + 10)
+    ok = await hold_until_converged(svc, sid, goal)
+    st = await cmd(svc, command="servo_status", session_id=sid)
+    report("smoke: pose converges", st["state"], "converged", ok)
+    fin = await cmd(svc, command="servo_stop", session_id=sid)
+    report("smoke: pose stop", fin["state"], "stopped", fin["state"] == "stopped")
+    await expect_err(svc, "ended session", "session ended", command="servo_target", session_id=sid, pose=goal)
+
+    r = await svc.do_command(start_kw(args, mode="twist"))
+    sid = r["session_id"]
+    for _ in range(5):
+        await cmd(svc, command="servo_twist", session_id=sid, linear=[0, 0, -10], angular=[0, 0, 0])
+        await asyncio.sleep(0.1)
+    st = await cmd(svc, command="servo_status", session_id=sid)
+    report("smoke: twist running", st["state"], "running", st["state"] == "running")
+    fin = await cmd(svc, command="servo_stop", session_id=sid)
+    report("smoke: twist stop", fin["state"], "stopped", fin["state"] == "stopped")
+
+
+async def latency(svc, arm2, args) -> None:
+    r = await svc.do_command(start_kw(args, mode="pose"))
+    sid, base = r["session_id"], r["pose"]
+    poll = Poller(arm2)
+    lats, rtts = [], []
+    for i in range(10):
+        prev = dict(base, x=base["x"] + (0 if i % 2 == 0 else 20))
+        tgt = dict(base, x=base["x"] + (20 if i % 2 == 0 else 0))
+        if not await hold_until_converged(svc, sid, prev):
+            report(f"latency step {i}", "no convergence", "converged", False)
+            break
+        poll.start()
+        await asyncio.sleep(0.15)
+        if not poll.samples:
+            await poll.stop()
+            report(f"latency step {i}", "no joint samples", "samples", False)
+            break
+        q0 = poll.samples[-1][1]
+        t0 = time.monotonic()
+        await cmd(svc, command="servo_target", session_id=sid, pose=tgt)
+        rtts.append(time.monotonic() - t0)
+        lat, last_send = None, t0
+        while lat is None and time.monotonic() - t0 < 2:
+            await asyncio.sleep(0.01)
+            hit = next((ts for ts, q in poll.samples if ts > t0 and moved(q0, q)), None)
+            if hit is not None:
+                lat = hit - t0
+            elif time.monotonic() - last_send > 0.1:
+                await cmd(svc, command="servo_target", session_id=sid, pose=tgt)  # feed the dead-man
+                last_send = time.monotonic()
+        await poll.stop()
+        if lat is not None:
+            lats.append(lat)
+    await cmd(svc, command="servo_stop", session_id=sid)
+    if lats:
+        report("command→motion latency (median)", f"{statistics.median(lats) * 1000:.0f} ms")
+        report("command→motion latency (max)", f"{max(lats) * 1000:.0f} ms")
+    report("servo_target round-trip (median)", f"{statistics.median(rtts) * 1000:.1f} ms")
+    report("latency steps measured", f"{len(lats)}/10", "10/10", len(lats) == 10)
+
+
+async def twist_for(svc, sid: str, linear: list[float], seconds: float) -> float:
+    """Re-send a twist every 100 ms for `seconds`; returns the time of the last send."""
+    end, last = time.monotonic() + seconds, 0.0
+    while time.monotonic() < end:
+        last = time.monotonic()
+        await cmd(svc, command="servo_twist", session_id=sid, linear=linear, angular=[0, 0, 0])
+        await asyncio.sleep(0.1)
+    return last
+
+
+async def stop_latency(svc, arm2, args) -> None:
+    sid = (await svc.do_command(start_kw(args, mode="twist")))["session_id"]
+    poll = Poller(arm2)
+    poll.start()
+    await twist_for(svc, sid, [50, 0, 0], 1.0)
+    p_before = await arm2.get_end_position()
+    t0 = time.monotonic()
+    fin = await cmd(svc, command="servo_stop", session_id=sid)
+    rtt = time.monotonic() - t0
+    await asyncio.sleep(1.5)
+    await poll.stop()
+    p_after = await arm2.get_end_position()
+    still = first_stationary(poll.samples, t0)
+    report("servo_stop round-trip (incl. ramp)", f"{rtt * 1000:.0f} ms")
+    report("stop sent → arm stationary", "never" if still is None else f"{(still - t0) * 1000:.0f} ms")
+    d = math.dist((p_before.x, p_before.y, p_before.z), (p_after.x, p_after.y, p_after.z))
+    report("travel after stop sent", f"{d:.1f} mm")
+    report("stop final state", fin["state"], "stopped", fin["state"] == "stopped")
+
+
+async def deadman(svc, arm2, args) -> None:
+    timeout_ms, ramp_ms, rate = 500, 200, 50
+    sid = (await svc.do_command(start_kw(args, mode="twist", timeout_ms=timeout_ms, ramp_ms=ramp_ms,
+                                         rate_hz=rate)))["session_id"]
+    poll = Poller(arm2)
+    poll.start()
+    t_last = await twist_for(svc, sid, [-50, 0, 0], 1.0)
+    t_to = None
+    while time.monotonic() - t_last < 3:
+        st = await cmd(svc, command="servo_status", session_id=sid)
+        if st["state"] == "stopped_timeout":
+            t_to = time.monotonic() - t_last
+            break
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(1.0)
+    await poll.stop()
+    bar = timeout_ms + 2 * 1000 / rate + ramp_ms + 50
+    report("last cmd → stopped_timeout", "never" if t_to is None else f"{t_to * 1000:.0f} ms",
+           f"≤ {bar:.0f} ms", t_to is not None and t_to * 1000 <= bar)
+    still = first_stationary(poll.samples, t_last)
+    report("last cmd → arm stationary", "never" if still is None else f"{(still - t_last) * 1000:.0f} ms")
+
+
+async def circle(svc, arm2, args, resync: float | None) -> None:
+    limits = {"joint_deg_s": args.joint_deg_s}
+    if resync:
+        limits["resync_deg"] = resync
+    r = await svc.do_command(start_kw(args, mode="pose", limits=limits))
+    sid, c = r["session_id"], r["pose"]
+    radius, speed = 50.0, 50.0
+    omega = speed / radius
+    laps_t = 2 * 2 * math.pi / omega
+    if not await hold_until_converged(svc, sid, dict(c, x=c["x"] + radius)):
+        report(f"circle (resync {resync or 'default'})", "no convergence at start", "converged", False)
+        await cmd(svc, command="servo_stop", session_id=sid)
+        return
+    poll = Poller(arm2, end=True)
+    poll.start()
+    t0, n = time.monotonic(), 0
+    while (t := time.monotonic() - t0) < laps_t:
+        th = omega * t
+        await cmd(svc, command="servo_target", session_id=sid,
+                  pose=dict(c, x=c["x"] + radius * math.cos(th), y=c["y"] + radius * math.sin(th)))
+        n += 1
+        await asyncio.sleep(max(0.0, t0 + n / 50 - time.monotonic()))
+    await poll.stop()
+    st = await cmd(svc, command="servo_status", session_id=sid)
+    await cmd(svc, command="servo_stop", session_id=sid)
+    errs = []
+    for ts, (x, y, z) in poll.samples:
+        th = omega * (ts - t0)
+        if 0 <= ts - t0 <= laps_t:
+            errs.append(math.dist((x, y, z), (c["x"] + radius * math.cos(th), c["y"] + radius * math.sin(th), c["z"])))
+    label = f"circle resync={resync or 'default'}"
+    if not errs:
+        report(f"{label}: samples", "none", "> 0", False)
+        return
+    mean = statistics.mean(errs)
+    if resync == 15:
+        report(f"{label}: mean error", f"{mean:.1f} mm", "≤ 22.1 mm", mean <= 22.1)
+    else:
+        report(f"{label}: mean error", f"{mean:.1f} mm", "report (P1: 45.8)")
+    report(f"{label}: max error", f"{max(errs):.1f} mm")
+    report(f"{label}: resyncs / overruns", f"{st['resyncs']:.0f} / {st['overruns']:.0f}")
+    report(f"{label}: target rate", f"{n / laps_t:.1f} Hz")
+
+
+async def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--address", default="localhost:8080")
+    ap.add_argument("--insecure", action="store_true")
+    ap.add_argument("--service", default="servo")
+    ap.add_argument("--arm", required=True)
+    ap.add_argument("--joint-deg-s", type=float, default=90)
+    ap.add_argument("--steps", default="smoke,latency,stop,deadman,circle")
+    args = ap.parse_args()
+
+    from viam.components.arm import Arm
+    from viam.services.motion import MotionClient
+
+    robot, robot2 = await connect(args), await connect(args)
+    try:
+        svc = MotionClient.from_robot(robot, args.service)
+        arm2 = Arm.from_robot(robot2, args.arm)
+        steps = args.steps.split(",")
+        if "smoke" in steps:
+            await smoke(svc, args)
+        if "latency" in steps:
+            await latency(svc, arm2, args)
+        if "stop" in steps:
+            await stop_latency(svc, arm2, args)
+        if "deadman" in steps:
+            await deadman(svc, arm2, args)
+        if "circle" in steps:
+            await circle(svc, arm2, args, None)
+            await circle(svc, arm2, args, 15)
+    finally:
+        await robot.close()
+        await robot2.close()
+    print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'ALL PASS'}")
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
