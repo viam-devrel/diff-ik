@@ -156,7 +156,11 @@ func (s *diffIkServo) DoCommand(ctx context.Context, cmd map[string]interface{})
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{"state": string(st.State)}, nil
+		out := map[string]interface{}{"state": string(st.State)}
+		if st.RollIgnored {
+			out["roll_ignored"] = true
+		}
+		return out, nil
 	case "servo_stop":
 		st, err := sess.stop(ctx)
 		if err != nil {
@@ -203,6 +207,13 @@ func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}
 		return nil, fmt.Errorf("ramp_ms must be in (0, 5000], got %v", ramp)
 	}
 	lc := LoopConfig{RateHz: rate}
+	if v, ok := cmd["task"]; ok {
+		t, ok := v.(string)
+		if !ok || (t != TaskPose && t != TaskPointing) {
+			return nil, fmt.Errorf("unsupported task %v: use %q or %q", v, TaskPose, TaskPointing)
+		}
+		lc.Task = t
+	}
 	if raw, ok := cmd["limits"]; ok {
 		lm, ok := raw.(map[string]interface{})
 		if !ok {
@@ -220,6 +231,8 @@ func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}
 			{"linear_mm_s", &lc.MaxLinearMMPerS},
 			{"angular_deg_s", &lc.MaxAngularDegPerS},
 			{"resync_deg", &lc.ResyncDeg},
+			{"singular_eps", &lc.SingularEps},
+			{"max_damping", &lc.MaxDamping},
 		} {
 			if v, ok := lm[f.key]; ok {
 				n, err := num(v, "limits."+f.key)
@@ -234,14 +247,27 @@ func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}
 		}
 	}
 	if v, ok := cmd["task_weights"]; ok {
-		ws, err := numOrList(v, "task_weights")
-		if err != nil {
-			return nil, err
+		items, ok := v.([]interface{})
+		if !ok || len(items) != 6 {
+			return nil, fmt.Errorf("task_weights must be 6 numbers >= 0, not all zero, got %v", v)
 		}
-		if len(ws) != 6 {
-			return nil, fmt.Errorf("task_weights must be 6 numbers > 0, got %v", v)
+		sum := 0.0
+		for i, it := range items {
+			n, err := num(it, "task_weights")
+			if err != nil {
+				return nil, err
+			}
+			if n < 0 {
+				return nil, fmt.Errorf("task_weights must be >= 0, got %v", n)
+			}
+			lc.TaskWeights[i], sum = n, sum+n
 		}
-		copy(lc.TaskWeights[:], ws)
+		if sum == 0 {
+			return nil, errors.New("task_weights must not all be zero")
+		}
+		if lc.Task == TaskPointing {
+			s.logger.Warnw("task_weights are ignored in pointing mode (position has priority)")
+		}
 	}
 	sess, pose, err := s.m.start(ctx, armName, SessionConfig{
 		Frame: frame, Mode: Mode(mode), Loop: lc,
@@ -369,16 +395,22 @@ func statusMap(st SessionStatus) map[string]interface{} {
 		js[i] = v
 	}
 	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
-	return map[string]interface{}{
+	out := map[string]interface{}{
+		"task":  st.Task,
 		"state": string(st.State), "err_mm": st.ErrMM, "err_deg": st.ErrDeg, "rate_hz": st.RateHz,
 		"last_command_age_ms": ms(st.LastCmdAge),
 		"limits": map[string]interface{}{
 			"joint_deg_s": js, "linear_mm_s": st.Config.MaxLinearMMPerS,
 			"angular_deg_s": st.Config.MaxAngularDegPerS, "resync_deg": st.Config.ResyncDeg,
+			"singular_eps": st.Config.SingularEps, "max_damping": st.Config.MaxDamping,
 		},
 		"tick_p50_ms": ms(st.TickP50), "tick_p99_ms": ms(st.TickP99),
 		"overruns": float64(st.Overruns), "resyncs": float64(st.Resyncs), "damping": st.Damping,
 	}
+	if st.Task == TaskPointing {
+		out["pointing_residual_deg"] = st.PointingResidualDeg
+	}
+	return out
 }
 
 // MoveOnMap moves a base component to a destination Pose on a SLAM map and returns a unique ExecutionID.

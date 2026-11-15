@@ -488,3 +488,56 @@ func TestStopFailedKeepsJoinedStopError(t *testing.T) {
 		t.Fatal("a cancel joined with an arm.Stop failure must be reported")
 	}
 }
+
+func TestSessionTwistReportsIgnoredRoll(t *testing.T) {
+	m, _, clk := newTestManager(t, spatialmath.NewZeroPose())
+	cfg := testSessionCfg(ModeTwist)
+	cfg.Loop.Task = TaskPointing
+	s, _ := mustStart(t, m, cfg)
+	step(t, s, clk, 1) // populate ToolAxis
+	a := s.loop.Status().ToolAxis
+	st, err := s.twist(r3.Vector{}, a.Mul(deg2rad(10))) // pure roll about the tool axis
+	if err != nil || !st.RollIgnored {
+		t.Fatalf("roll twist: ignored=%v err=%v", st.RollIgnored, err)
+	}
+	st, err = s.twist(r3.Vector{X: 0.01}, r3.Vector{})
+	if err != nil || st.RollIgnored {
+		t.Fatalf("linear twist: ignored=%v err=%v", st.RollIgnored, err)
+	}
+}
+
+// The roll check is in the base frame: the session-frame twist is rotated into it first.
+func TestSessionTwistReportsIgnoredRollRotatedFrame(t *testing.T) {
+	fk, err := ur5e(t).Transform(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a0 := toolAxis(fk.Orientation().Quaternion())
+	k := a0.Cross(r3.Vector{Z: 1})
+	if k.Norm() < 1e-3 {
+		k = a0.Cross(r3.Vector{X: 1})
+	}
+	rq := spatialmath.Quaternion(ExpRot(k.Normalize().Mul(math.Pi / 2))) // R ⟂ a: R·a ⟂ a and R⁻¹·a ⟂ a
+	twb := spatialmath.NewPose(r3.Vector{X: 100}, &rq)
+	for _, tc := range []struct {
+		name    string
+		toWorld bool // send R_wb·a (the tool axis in the session frame) instead of the raw base-frame a
+		want    bool
+	}{{"tool axis in session frame", true, true}, {"raw base-frame axis", false, false}} {
+		m, _, clk := newTestManager(t, twb)
+		cfg := testSessionCfg(ModeTwist)
+		cfg.Frame = "world"
+		cfg.Loop.Task = TaskPointing
+		s, _ := mustStart(t, m, cfg)
+		step(t, s, clk, 1)
+		a := s.loop.Status().ToolAxis
+		ang := a
+		if tc.toWorld {
+			ang = spatialmath.Compose(spatialmath.NewPose(r3.Vector{}, twb.Orientation()), spatialmath.NewPoseFromPoint(a)).Point()
+		}
+		st, err := s.twist(r3.Vector{}, ang.Mul(deg2rad(10)))
+		if err != nil || st.RollIgnored != tc.want {
+			t.Fatalf("%s: ignored=%v err=%v, want %v", tc.name, st.RollIgnored, err, tc.want)
+		}
+	}
+}

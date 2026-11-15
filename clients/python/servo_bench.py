@@ -103,6 +103,8 @@ class Poller:
 def start_kw(args, **kw):
     base = {"command": "servo_start", "component_name": args.arm, "frame": f"{args.arm}_origin",
             "limits": {"joint_deg_s": args.joint_deg_s}}
+    if args.task:
+        base["task"] = args.task
     base.update(kw)
     return base
 
@@ -279,6 +281,8 @@ async def circle(svc, arm2, args, resync: float | None) -> None:
         report(f"{label}: mean error", f"{mean:.1f} mm", "report (P1: 45.8)")
     report(f"{label}: max error", f"{max(errs):.1f} mm")
     report(f"{label}: resyncs / overruns", f"{st['resyncs']:.0f} / {st['overruns']:.0f}")
+    if "pointing_residual_deg" in st:
+        report(f"{label}: pointing residual (geometry, not lag)", f"{st['pointing_residual_deg']:.1f}°")
     report(f"{label}: target rate", f"{n / laps_t:.1f} Hz")
 
 
@@ -288,6 +292,7 @@ async def main() -> int:
     ap.add_argument("--insecure", action="store_true")
     ap.add_argument("--service", default="servo")
     ap.add_argument("--arm", required=True)
+    ap.add_argument("--task", default=None, help="pose|pointing (default: the server's default for the arm)")
     ap.add_argument("--joint-deg-s", type=float, default=90)
     ap.add_argument("--steps", default="smoke,latency,stop,deadman,circle")
     args = ap.parse_args()

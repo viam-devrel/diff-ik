@@ -1,0 +1,16 @@
+{
+  "modules": [
+    {"type": "local", "name": "so-101", "executable_path": "/Users/nick.hehr/src/so-101/bin/arm"},
+    {"type": "local", "name": "diff-ik", "executable_path": "/Users/nick.hehr/src/diff-ik/bin/diff-ik"}
+  ],
+  "components": [
+    {"name": "arm", "api": "rdk:component:arm", "model": "devrel:so101:simulated",
+     "attributes": {"speed_degs_per_sec": 90}, "frame": {"parent": "world"}},
+    {"name": "gripper", "api": "rdk:component:gripper", "model": "devrel:so101:simulated-gripper",
+     "attributes": {}, "frame": {"parent": "arm"}}
+  ],
+  "services": [
+    {"name": "servo", "api": "rdk:service:motion", "model": "devrel:diff-ik:servo",
+     "attributes": {"arms": ["arm"]}}
+  ]
+}

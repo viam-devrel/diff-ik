@@ -12,6 +12,7 @@ import (
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
+	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/gonum/num/quat"
 )
 
@@ -35,6 +36,7 @@ type LoopConfig struct {
 	ResyncDeg         float64
 	TolMM             float64
 	TolDeg            float64
+	Task              string // "pose" | "pointing"; empty = pointing if DOF < 6 else pose
 }
 
 func (c LoopConfig) withDefaults(dof int) LoopConfig {
@@ -63,12 +65,21 @@ func (c LoopConfig) withDefaults(dof int) LoopConfig {
 	}
 	def(&c.TolMM, 2)
 	def(&c.TolDeg, 2)
+	if c.Task == "" {
+		c.Task = TaskPose
+		if dof < 6 {
+			c.Task = TaskPointing
+		}
+	}
 	return c
 }
 
 func (c LoopConfig) validate(dof int) error {
 	if c.RateHz < 1 {
 		return fmt.Errorf("rate_hz must be >= 1, got %v", c.RateHz)
+	}
+	if c.Task != TaskPose && c.Task != TaskPointing {
+		return fmt.Errorf("unsupported task %q: use %q or %q", c.Task, TaskPose, TaskPointing)
 	}
 	for i, w := range c.TaskWeights {
 		if w < 0 {
@@ -133,6 +144,9 @@ type Status struct {
 	Damping             float64
 	Limited             bool
 	QCmd, QMeas         []float64
+	Task                string    // active task mode
+	PointingResidualDeg float64   // pointing mode: the unreachable part of the pointing error at q_m
+	ToolAxis            r3.Vector // tool axis of FK(q_cmd), base frame (read by servo_twist)
 }
 
 const tickWindow = 500 // ticks kept for p50/p99
@@ -166,10 +180,12 @@ type Loop struct {
 	rampDur   time.Duration
 	rampFinal State
 	status    Status
-	tickDurs  []time.Duration
-	ticks     int
-	first     time.Time // start of the first tick
-	last      time.Time // start of the latest tick
+	lastReach float64 // pointing mode: |e2_reach| (rad) from the previous tick, for the leash. Not reset on
+	// SetMotion: a streamed servo_target calls SetMotion every tick, and resetting would disable the leash.
+	tickDurs []time.Duration
+	ticks    int
+	first    time.Time // start of the first tick
+	last     time.Time // start of the latest tick
 }
 
 // NewLoop builds a loop for model, driven through io.
@@ -186,6 +202,7 @@ func NewLoop(model referenceframe.Model, io JointIO, cfg LoopConfig) (*Loop, err
 		l.lo[i], l.hi[i] = lim.Min+fdStep, lim.Max-fdStep
 	}
 	l.status.State = StateIdle
+	l.status.Task = cfg.Task
 	return l, nil
 }
 
@@ -272,12 +289,28 @@ func (l *Loop) advance(dt float64, cp r3.Vector, cq quat.Number, ramping bool) (
 	}
 	tp, tq := l.target.Point().Mul(1/mmPerM), l.target.Orientation().Quaternion()
 	e := PoseError(tp, tq, cp, cq)
+	if l.cfg.Task != TaskPointing { // pose: a dropped row's error never leashes (spec "Leash": active norm)
+		for i, w := range l.cfg.TaskWeights {
+			if w == 0 {
+				e[i] = 0
+			}
+		}
+	}
 	vl, el := r3.Vector{X: vel[0], Y: vel[1], Z: vel[2]}, r3.Vector{X: e[0], Y: e[1], Z: e[2]}
 	if !(el.Norm() > leashS*l.cfg.MaxLinearMMPerS/mmPerM && vl.Dot(el) > 0) {
 		tp = tp.Add(vl.Mul(dt))
 	}
-	va, ea := r3.Vector{X: vel[3], Y: vel[4], Z: vel[5]}, r3.Vector{X: e[3], Y: e[4], Z: e[5]}
-	if !(ea.Norm() > leashS*deg2rad(l.cfg.MaxAngularDegPerS) && va.Dot(ea) > 0) {
+	va := r3.Vector{X: vel[3], Y: vel[4], Z: vel[5]}
+	ea := r3.Vector{X: e[3], Y: e[4], Z: e[5]}
+	angErr := ea.Norm()
+	if l.cfg.Task == TaskPointing {
+		// pointing: leash on the reachable part only, and along the pointing rotation (spec "Leash")
+		ea, _, _ = pointingError(toolAxis(cq), toolAxis(tq))
+		angErr = l.lastReach
+		at := toolAxis(tq)
+		va = va.Sub(at.Mul(va.Dot(at))) // roll is discarded: never move the target's axis about itself
+	}
+	if !(angErr > leashS*deg2rad(l.cfg.MaxAngularDegPerS) && va.Dot(ea) > 0) {
 		tq = quat.Mul(ExpRot(va.Mul(dt)), tq)
 	}
 	q := spatialmath.Quaternion(tq)
@@ -420,21 +453,13 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	target, vel := l.advance(dt, cp, cq, ramping)
 	l.mu.Unlock()
 	tp, tq := target.Point().Mul(1/mmPerM), target.Orientation().Quaternion()
-	e := PoseError(tp, tq, cp, cq)
 
-	// 4–5. v = vel + Gain·e, capped, scaled by any ramp → task step
-	lin := capNorm(r3.Vector{X: vel[0] + l.cfg.Gain*e[0], Y: vel[1] + l.cfg.Gain*e[1], Z: vel[2] + l.cfg.Gain*e[2]},
-		l.cfg.MaxLinearMMPerS/mmPerM).Mul(scale)
-	ang := capNorm(r3.Vector{X: vel[3] + l.cfg.Gain*e[3], Y: vel[4] + l.cfg.Gain*e[4], Z: vel[5] + l.cfg.Gain*e[5]},
-		deg2rad(l.cfg.MaxAngularDegPerS)).Mul(scale)
-	dx := [6]float64{lin.X * dt, lin.Y * dt, lin.Z * dt, ang.X * dt, ang.Y * dt, ang.Z * dt}
-
-	// 6. weighted DLS
+	// 4–6. task-space step: pose → weighted DLS (unchanged when m ≥ n) or dpinv; pointing → priority
 	J, err := Jacobian(l.model, l.qCmd)
 	if err != nil {
 		return err
 	}
-	dq, lambda, sigmaMin, err := dlsStep(J, l.cfg.TaskWeights, dx, l.cfg.SingularEps, l.cfg.MaxDamping)
+	dq, lambda, limitedTask, cmdPos, cmdAng, err := l.solve(J, tp, tq, cp, cq, vel, scale, dt)
 	if err != nil {
 		return err
 	}
@@ -468,13 +493,16 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	}
 	copy(l.qCmd, next)
 
-	// 10. measured error
+	// 10. measured error, per task
 	mp, mq, err := FK(l.model, qm)
 	if err != nil {
 		return err
 	}
-	em := PoseError(tp, tq, mp, mq)
-	limited := s < 1 || clamped || sigmaMin < l.cfg.SingularEps
+	ms, err := l.measure(tp, tq, mp, mq, qm)
+	if err != nil {
+		return err
+	}
+	limited := s < 1 || clamped || limitedTask
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -483,34 +511,150 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 		st.Resyncs++
 	}
 	st.TargetMM = target.Point()
-	st.ErrMM, st.ErrDeg = posMM(em), angDeg(em)
-	st.CmdErrMM, st.CmdErrDeg = posMM(e), angDeg(e)
+	st.ErrMM, st.ErrDeg = ms.posMM, ms.angDeg
+	st.CmdErrMM, st.CmdErrDeg = cmdPos, cmdAng
 	st.Damping, st.Limited = lambda, limited
+	st.Task, st.PointingResidualDeg, st.ToolAxis = l.cfg.Task, ms.residualDeg, toolAxis(cq)
 	st.QCmd, st.QMeas = slices.Clone(l.qCmd), slices.Clone(qm)
-	st.State = l.nextState(em, limited, vel != ([6]float64{}))
+	l.lastReach = deg2rad(ms.convDeg)
+	st.State = l.nextState(ms, limited, vel != ([6]float64{}))
 	return nil
 }
 
+// solve computes this tick's joint step for the configured task. cmdPos/cmdAng are the
+// commanded-side errors in mm / deg (spec "Status fields").
+func (l *Loop) solve(J *mat.Dense, tp r3.Vector, tq quat.Number, cp r3.Vector, cq quat.Number,
+	vel [6]float64, scale, dt float64,
+) (dq []float64, lambda float64, limited bool, cmdPos, cmdAng float64, err error) {
+	c := l.cfg
+	_, n := J.Dims()
+	if c.Task == TaskPointing {
+		ac, at := toolAxis(cq), toolAxis(tq)
+		r, u, v := pointingError(ac, at)
+		e1 := tp.Sub(cp)
+		v1 := capNorm(r3.Vector{X: vel[0], Y: vel[1], Z: vel[2]}.Add(e1.Mul(c.Gain)), c.MaxLinearMMPerS/mmPerM).Mul(scale)
+		w := r3.Vector{X: vel[3], Y: vel[4], Z: vel[5]}
+		v2 := capNorm(r3.Vector{X: u.Dot(w) + c.Gain*u.Dot(r), Y: v.Dot(w) + c.Gain*v.Dot(r)}, deg2rad(c.MaxAngularDegPerS)).Mul(scale)
+		J1 := mat.DenseCopyOf(J.Slice(0, 3, 0, n))
+		dq, l1, l2, err := prioritySolve(J1, pointingRows(J, u, v),
+			[]float64{v1.X * dt, v1.Y * dt, v1.Z * dt}, []float64{v2.X * dt, v2.Y * dt}, c.SingularEps, c.MaxDamping)
+		if err != nil {
+			return nil, 0, false, 0, 0, err
+		}
+		return dq, math.Max(l1, l2), l1 > 0 || l2 > 0, e1.Norm() * mmPerM, r.Norm() * 180 / math.Pi, nil
+	}
+
+	e := PoseError(tp, tq, cp, cq)
+	for i, w := range c.TaskWeights { // a dropped row must not use up the active rows' speed cap
+		if w == 0 {
+			e[i], vel[i] = 0, 0
+		}
+	}
+	lin := capNorm(r3.Vector{X: vel[0] + c.Gain*e[0], Y: vel[1] + c.Gain*e[1], Z: vel[2] + c.Gain*e[2]},
+		c.MaxLinearMMPerS/mmPerM).Mul(scale)
+	ang := capNorm(r3.Vector{X: vel[3] + c.Gain*e[3], Y: vel[4] + c.Gain*e[4], Z: vel[5] + c.Gain*e[5]},
+		deg2rad(c.MaxAngularDegPerS)).Mul(scale)
+	dx := [6]float64{lin.X * dt, lin.Y * dt, lin.Z * dt, ang.X * dt, ang.Y * dt, ang.Z * dt}
+	cmdPos, cmdAng = activePosMM(e, c.TaskWeights), activeAngDeg(e, c.TaskWeights)
+
+	var rows []int
+	for i, w := range c.TaskWeights {
+		if w > 0 {
+			rows = append(rows, i)
+		}
+	}
+	if len(rows) >= n { // unchanged Phase 1/2 path: bit-identical for the UR5e with all weights
+		dq, lambda, sigmaMin, err := dlsStep(J, c.TaskWeights, dx, c.SingularEps, c.MaxDamping)
+		return dq, lambda, sigmaMin < c.SingularEps, cmdPos, cmdAng, err
+	}
+	A := mat.NewDense(len(rows), n, nil)
+	b := make([]float64, len(rows))
+	for k, i := range rows {
+		sw := math.Sqrt(c.TaskWeights[i])
+		for j := 0; j < n; j++ {
+			A.Set(k, j, sw*J.At(i, j))
+		}
+		b[k] = sw * dx[i]
+	}
+	P, lambda, sigmaR, _, err := dpinv(A, c.SingularEps, c.MaxDamping, true)
+	if err != nil {
+		return nil, 0, false, 0, 0, err
+	}
+	var x mat.VecDense
+	x.MulVec(P, mat.NewVecDense(len(b), b))
+	return append([]float64(nil), x.RawVector().Data...), lambda, sigmaR < c.SingularEps, cmdPos, cmdAng, nil
+}
+
+// measured holds the per-task measured errors used for status, convergence and stall.
+type measured struct {
+	posMM, angDeg        float64 // angDeg: pointing angle (pointing) or active orientation norm (pose)
+	convDeg, residualDeg float64 // convDeg: angular error for convergence (reach in pointing, active orientation in pose); residualDeg: pointing only
+	stallNorm            float64
+}
+
+func (l *Loop) measure(tp r3.Vector, tq quat.Number, mp r3.Vector, mq quat.Number, qm []float64) (measured, error) {
+	c := l.cfg
+	if c.Task != TaskPointing {
+		em := PoseError(tp, tq, mp, mq)
+		norm := 0.0
+		for i, v := range em {
+			norm += c.TaskWeights[i] * v * v
+		}
+		return measured{posMM: activePosMM(em, c.TaskWeights), angDeg: activeAngDeg(em, c.TaskWeights),
+			convDeg: activeAngDeg(em, c.TaskWeights), stallNorm: math.Sqrt(norm)}, nil
+	}
+	Jm, err := Jacobian(l.model, qm)
+	if err != nil {
+		return measured{}, err
+	}
+	r, u, v := pointingError(toolAxis(mq), toolAxis(tq))
+	_, n := Jm.Dims()
+	reach, res, err := pointingReach(mat.DenseCopyOf(Jm.Slice(0, 3, 0, n)), pointingRows(Jm, u, v), [2]float64{u.Dot(r), v.Dot(r)})
+	if err != nil {
+		return measured{}, err
+	}
+	e1 := tp.Sub(mp).Norm()
+	return measured{posMM: e1 * mmPerM, angDeg: r.Norm() * 180 / math.Pi, convDeg: reach * 180 / math.Pi,
+		residualDeg: res * 180 / math.Pi, stallNorm: math.Hypot(e1, reach)}, nil
+}
+
 // nextState picks converged/stalled/running. moving means a feedforward twist is active. Caller holds l.mu.
-func (l *Loop) nextState(em [6]float64, limited, moving bool) State {
-	if !moving && posMM(em) <= l.cfg.TolMM && angDeg(em) <= l.cfg.TolDeg {
+// Converged: position within TolMM and the reachable/active angular error within TolDeg.
+func (l *Loop) nextState(ms measured, limited, moving bool) State {
+	if !moving && ms.posMM <= l.cfg.TolMM && ms.convDeg <= l.cfg.TolDeg {
 		l.errRing = l.errRing[:0]
 		return StateConverged
 	}
-	norm := 0.0
-	for i, v := range em {
-		norm += l.cfg.TaskWeights[i] * v * v
-	}
-	norm = math.Sqrt(norm)
 	window := int(l.cfg.RateHz) // 1 s of ticks
 	if len(l.errRing) == window {
 		l.errRing = l.errRing[1:]
 	}
-	l.errRing = append(l.errRing, norm)
-	if limited && len(l.errRing) == window && norm > 0.99*l.errRing[0] {
+	l.errRing = append(l.errRing, ms.stallNorm)
+	if limited && len(l.errRing) == window && ms.stallNorm > 0.99*l.errRing[0] {
 		return StateStalled
 	}
 	return StateRunning
+}
+
+// activePosMM / activeAngDeg are the norms of the components whose weight is > 0.
+func activePosMM(e [6]float64, w [6]float64) float64 {
+	s := 0.0
+	for i := 0; i < 3; i++ {
+		if w[i] > 0 {
+			s += e[i] * e[i]
+		}
+	}
+	return math.Sqrt(s) * mmPerM
+}
+
+func activeAngDeg(e [6]float64, w [6]float64) float64 {
+	s := 0.0
+	for i := 3; i < 6; i++ {
+		if w[i] > 0 {
+			s += e[i] * e[i]
+		}
+	}
+	return math.Sqrt(s) * 180 / math.Pi
 }
 
 // Oscillations counts, per joint, sign reversals between successive steps whose size exceeds minStep[i].
@@ -533,11 +677,7 @@ func Oscillations(qs [][]float64, minStep []float64) []int {
 	return out
 }
 
-func deg2rad(d float64) float64  { return d * math.Pi / 180 }
-func posMM(e [6]float64) float64 { return math.Sqrt(e[0]*e[0]+e[1]*e[1]+e[2]*e[2]) * mmPerM }
-func angDeg(e [6]float64) float64 {
-	return math.Sqrt(e[3]*e[3]+e[4]*e[4]+e[5]*e[5]) * 180 / math.Pi
-}
+func deg2rad(d float64) float64 { return d * math.Pi / 180 }
 
 func capNorm(v r3.Vector, max float64) r3.Vector {
 	if n := v.Norm(); n > max {

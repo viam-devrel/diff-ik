@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -90,8 +91,9 @@ type SessionConfig struct {
 // SessionStatus is a snapshot of a session, live or final.
 type SessionStatus struct {
 	Status
-	Config     LoopConfig
-	LastCmdAge time.Duration
+	Config      LoopConfig
+	LastCmdAge  time.Duration
+	RollIgnored bool // servo_twist only: an angular component about the tool axis was dropped (pointing mode)
 }
 
 // session is one arm's servo session: a loop plus the protocol state around it.
@@ -219,6 +221,12 @@ func (s *session) twist(lin, ang r3.Vector) (SessionStatus, error) {
 	rinv := spatialmath.PoseInverse(spatialmath.NewPose(r3.Vector{}, s.twb.Orientation()))
 	lb := spatialmath.Compose(rinv, spatialmath.NewPoseFromPoint(lin)).Point()
 	ab := spatialmath.Compose(rinv, spatialmath.NewPoseFromPoint(ang)).Point()
+	rollIgnored := false
+	if cfg.Task == TaskPointing {
+		if a := s.loop.Status().ToolAxis; a.Norm() > 0 && math.Abs(ab.Dot(a)) > 1e-6*ab.Norm() {
+			rollIgnored = true
+		}
+	}
 	s.mu.Lock()
 	if s.stopping != "" {
 		defer s.mu.Unlock()
@@ -227,7 +235,9 @@ func (s *session) twist(lin, ang r3.Vector) (SessionStatus, error) {
 	s.lastCmd = s.now()
 	s.loop.SetVelocity([6]float64{lb.X, lb.Y, lb.Z, ab.X, ab.Y, ab.Z})
 	s.mu.Unlock()
-	return s.status(), nil
+	st := s.status()
+	st.RollIgnored = rollIgnored
+	return st, nil
 }
 
 // stop handles servo_stop: ramp to zero, stop the arm, wait for the loop to end.

@@ -12,6 +12,7 @@ import (
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
+	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/gonum/num/quat"
 )
 
@@ -492,5 +493,343 @@ func TestHungReadFaults(t *testing.T) {
 	}
 	if l.Status().State != StateFaulted || !sim.stopped {
 		t.Fatalf("state = %s stopped = %v, want faulted and stopped", l.Status().State, sim.stopped)
+	}
+}
+
+func newSO101Loop(t *testing.T, q0 []float64, cfg LoopConfig) (*Loop, *simIO, referenceframe.Model, *fakeClock) {
+	t.Helper()
+	m := so101(t)
+	sim := &simIO{q: slices.Clone(q0)}
+	l, err := NewLoop(m, sim, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk := newFakeClock()
+	l.Now = clk.Now
+	return l, sim, m, clk
+}
+
+func fkPose(t *testing.T, m referenceframe.Model, q []float64) spatialmath.Pose {
+	t.Helper()
+	p, err := m.Transform(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestDefaultTaskByDOF(t *testing.T) {
+	l, _, _, _ := newSO101Loop(t, q0a, LoopConfig{})
+	if l.Config().Task != TaskPointing {
+		t.Fatalf("SO-101 default task = %q, want pointing", l.Config().Task)
+	}
+	u, _, _ := newTestLoop(t, home, LoopConfig{})
+	if u.Config().Task != TaskPose {
+		t.Fatalf("UR5e default task = %q, want pose", u.Config().Task)
+	}
+	if _, err := NewLoop(ur5e(t), &simIO{}, LoopConfig{Task: "fly"}); err == nil {
+		t.Fatal("unknown task: want error")
+	}
+}
+
+func TestSO101ReachablePointingConverges(t *testing.T) {
+	for _, q0 := range [][]float64{q0a, q0b, q0c} {
+		l, _, m, clk := newSO101Loop(t, q0, LoopConfig{})
+		qt := []float64{q0[0] + 0.12, q0[1] - 0.1, q0[2] + 0.15, q0[3] - 0.15, q0[4] + 0.1}
+		l.SetTarget(fkPose(t, m, qt))
+		clockTicks(t, l, clk, 300)
+		s := l.Status()
+		if s.State != StateConverged || s.ErrMM > 2 || s.ErrDeg > 2 || s.PointingResidualDeg > 1 {
+			t.Fatalf("q0=%v: state=%s pos=%.2fmm pointing=%.2f° residual=%.2f°", q0, s.State, s.ErrMM, s.ErrDeg, s.PointingResidualDeg)
+		}
+	}
+}
+
+func TestSO101UnreachablePointingConvergesWithResidual(t *testing.T) {
+	for _, q0 := range [][]float64{q0a, q0b, q0c} {
+		l, _, m, clk := newSO101Loop(t, q0, LoopConfig{})
+		start := fkPose(t, m, q0)
+		a := toolAxis(start.Orientation().Quaternion())
+		const az = 20 * math.Pi / 180
+		rq := spatialmath.Quaternion(quat.Mul(rotZ(az), start.Orientation().Quaternion()))
+		l.SetTarget(spatialmath.NewPose(start.Point(), &rq))
+		clockTicks(t, l, clk, 300)
+		s := l.Status()
+		want := math.Asin(math.Sin(az)*math.Hypot(a.X, a.Y)) * 180 / math.Pi // angle between a_t and the arm plane
+		if s.State != StateConverged || s.ErrMM > 2 || math.Abs(s.PointingResidualDeg-want) > 1 {
+			t.Fatalf("q0=%v: state=%s pos=%.2fmm residual=%.2f° want %.2f°", q0, s.State, s.ErrMM, s.PointingResidualDeg, want)
+		}
+	}
+}
+
+// Priority: an unreachable pointing request must not cost position accuracy (compare with the
+// same goal position targeted alone; q0a keeps the elbow away from its singularity).
+func TestSO101PointingNeverSacrificesPosition(t *testing.T) {
+	m := so101(t)
+	start := fkPose(t, m, q0a)
+	goal := start.Point().Add(r3.Vector{X: 20, Z: -15})
+	rq := spatialmath.Quaternion(quat.Mul(rotZ(25*math.Pi/180), start.Orientation().Quaternion()))
+	l, _, _, clk := newSO101Loop(t, q0a, LoopConfig{})
+	l.SetTarget(spatialmath.NewPose(goal, &rq))
+	clockTicks(t, l, clk, 300)
+	alone, _, _, clk2 := newSO101Loop(t, q0a, LoopConfig{})
+	alone.SetTarget(spatialmath.NewPose(goal, start.Orientation()))
+	clockTicks(t, alone, clk2, 300)
+	s, a := l.Status(), alone.Status()
+	if s.State != StateConverged || a.State != StateConverged || s.ErrMM > a.ErrMM+0.1 {
+		t.Fatalf("unreachable pointing: %s %.3f mm; position alone: %s %.3f mm", s.State, s.ErrMM, a.State, a.ErrMM)
+	}
+}
+
+func TestSO101PoseModeUnreachableRollDoesNotConverge(t *testing.T) {
+	m := so101(t)
+	start := fkPose(t, m, q0a)
+	rq := spatialmath.Quaternion(quat.Mul(rotZ(25*math.Pi/180), start.Orientation().Quaternion()))
+	target := spatialmath.NewPose(start.Point(), &rq)
+
+	l, _, _, clk := newSO101Loop(t, q0a, LoopConfig{Task: TaskPose})
+	l.SetTarget(target)
+	clockTicks(t, l, clk, 300)
+	if s := l.Status(); s.State == StateConverged {
+		t.Fatalf("pose mode converged on an unreachable orientation (err %.2f°)", s.ErrDeg)
+	}
+	p, _, _, clk2 := newSO101Loop(t, q0a, LoopConfig{Task: TaskPointing})
+	p.SetTarget(target)
+	clockTicks(t, p, clk2, 300)
+	if s := p.Status(); s.State != StateConverged {
+		t.Fatalf("pointing mode: state %s, want converged", s.State)
+	}
+}
+
+func TestSO101PointingTwistTracks(t *testing.T) {
+	l, _, m, clk := newSO101Loop(t, q0a, LoopConfig{})
+	l.SetTarget(fkPose(t, m, q0a))
+	l.SetVelocity([6]float64{0, 0.02, 0}) // 20 mm/s along base y
+	clockTicks(t, l, clk, 50)
+	if s := l.Status(); s.ErrMM > 1 {
+		t.Fatalf("twist tracking error %.2f mm, want < 1", s.ErrMM)
+	}
+}
+
+// A large unreachable residual must not block a reachable angular twist (leash uses e2_reach).
+// The twist mixes the in-plane pitch axis with the residual direction r, so a leash on the full
+// pointing error would block it (w·r > 0); the reachable part is not near the leash threshold.
+func TestSO101LeashIgnoresUnreachableResidual(t *testing.T) {
+	l, _, m, clk := newSO101Loop(t, q0a, LoopConfig{})
+	start := fkPose(t, m, q0a)
+	rq := spatialmath.Quaternion(quat.Mul(rotZ(30*math.Pi/180), start.Orientation().Quaternion()))
+	l.SetTarget(spatialmath.NewPose(start.Point(), &rq))
+	clockTicks(t, l, clk, 100) // converge with a large residual
+	_, cq, _ := FK(m, l.Status().QCmd)
+	r, _, _ := pointingError(toolAxis(cq), toolAxis(rq.Quaternion()))
+	if r.Norm() < deg2rad(3) {
+		t.Fatalf("test needs a large residual, got %.2f°", r.Norm()*180/math.Pi)
+	}
+	pitch := toolAxis(cq).Cross(r3.Vector{Z: 1}).Normalize()
+	if pitch.Dot(r) < 0 {
+		pitch = pitch.Mul(-1)
+	}
+	w := pitch.Add(r.Normalize().Mul(0.3)).Normalize().Mul(deg2rad(10))
+	l.SetVelocity([6]float64{0, 0, 0, w.X, w.Y, w.Z})
+	clockTicks(t, l, clk, 25)
+	l.mu.Lock()
+	got := RotVec(l.target.Orientation().Quaternion(), rq.Quaternion()).Norm() * 180 / math.Pi
+	l.mu.Unlock()
+	if math.Abs(got-5) > 0.25 {
+		t.Fatalf("target rotated %.2f° in 0.5 s at 10°/s, want 5 (leash must ignore the residual)", got)
+	}
+}
+
+// A pure roll twist must not move the target's tool axis or cost position (spec: roll discarded).
+func TestSO101PointingLeashIgnoresRoll(t *testing.T) {
+	l, _, m, clk := newSO101Loop(t, q0a, LoopConfig{})
+	l.SetTarget(fkPose(t, m, q0a))
+	clockTicks(t, l, clk, 5)
+	_, cq, _ := FK(m, l.Status().QCmd)
+	a0 := toolAxis(cq)
+	l.mu.Lock()
+	tq0 := l.target.Orientation().Quaternion()
+	before := toolAxis(tq0)
+	l.mu.Unlock()
+	w := a0.Mul(deg2rad(10))
+	l.SetVelocity([6]float64{0, 0, 0, w.X, w.Y, w.Z})
+	clockTicks(t, l, clk, 25)
+	l.mu.Lock()
+	tq1 := l.target.Orientation().Quaternion()
+	l.mu.Unlock()
+	after := toolAxis(tq1)
+	if ang := before.Angle(after).Radians() * 180 / math.Pi; ang > 0.01 {
+		t.Fatalf("roll twist moved the target axis by %.4f°, want < 0.01", ang)
+	}
+	// the axis alone can't tell a rolled target from an untouched one: the whole orientation must not move either
+	if rot := RotVec(tq1, tq0).Norm() * 180 / math.Pi; rot > 0.01 {
+		t.Fatalf("roll twist rotated the target by %.3f°, want it discarded", rot)
+	}
+	if s := l.Status(); s.ErrMM > 0.1 {
+		t.Fatalf("position error %.3f mm under a roll twist, want < 0.1", s.ErrMM)
+	}
+}
+
+func TestUR5ePointingConvergesFully(t *testing.T) {
+	l, _, m, clk := newClockLoop(t, home, LoopConfig{Task: TaskPointing})
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10)))
+	clockTicks(t, l, clk, 300)
+	if s := l.Status(); s.State != StateConverged || s.PointingResidualDeg > 0.5 {
+		t.Fatalf("state=%s residual=%.2f°", s.State, s.PointingResidualDeg)
+	}
+}
+
+// Pose mode with a dropped row on a 6-DOF arm (m=5 < n=6) uses dpinv and still converges on the active rows.
+func TestUR5ePoseDroppedRowConverges(t *testing.T) {
+	l, _, m, clk := newClockLoop(t, home, LoopConfig{TaskWeights: [6]float64{1, 1, 1, 1, 1, 0}})
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10)))
+	clockTicks(t, l, clk, 300)
+	if s := l.Status(); s.State != StateConverged {
+		t.Fatalf("state=%s err=%.2fmm %.2f°", s.State, s.ErrMM, s.ErrDeg)
+	}
+}
+
+// Weight 0 on z drops that row: Status.ErrMM covers x, y only, and the arm does not chase z.
+func TestUR5ePoseDroppedPositionRow(t *testing.T) {
+	l, _, m, clk := newClockLoop(t, home, LoopConfig{TaskWeights: [6]float64{1, 1, 0, 1, 1, 1}})
+	tgt := offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -200}, 0)
+	l.SetTarget(tgt)
+	// slow: the linear cap is taken over the full 3-vector, dropped z included, so x,y get ~¼ of the cap
+	clockTicks(t, l, clk, 300)
+	s := l.Status()
+	if s.State != StateConverged || s.ErrMM > 2 || s.Damping != 0 {
+		t.Fatalf("state=%s err=%.2f mm damping=%v, want converged on x,y, undamped", s.State, s.ErrMM, s.Damping)
+	}
+	p, _, _ := FK(m, s.QMeas)
+	if zerr := math.Abs(tgt.Point().Z - p.Z*mmPerM); zerr < 50 {
+		t.Fatalf("true z error %.1f mm, want large (z row must be dropped)", zerr)
+	}
+}
+
+// With m=5 < n=6 active rows the step is dpinv(W½J_active)·W½dx, undamped away from singularity.
+func TestUR5ePoseMLessThanNUsesDpinv(t *testing.T) {
+	w := [6]float64{1, 1, 1, 1, 1, 0}
+	l, sim, m, _ := newClockLoop(t, home, LoopConfig{TaskWeights: w})
+	tgt := offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10))
+	l.SetTarget(tgt)
+	runTicks(t, l, 1)
+	got := make([]float64, len(home))
+	for i := range got {
+		got[i] = sim.sends[0][i] - home[i]
+	}
+	cp, cq, _ := FK(m, home)
+	e := PoseError(tgt.Point().Mul(1/mmPerM), tgt.Orientation().Quaternion(), cp, cq)
+	c, dt := l.cfg, 1/l.cfg.RateHz
+	lin := capNorm(r3.Vector{X: c.Gain * e[0], Y: c.Gain * e[1], Z: c.Gain * e[2]}, c.MaxLinearMMPerS/mmPerM)
+	ang := capNorm(r3.Vector{X: c.Gain * e[3], Y: c.Gain * e[4], Z: c.Gain * e[5]}, deg2rad(c.MaxAngularDegPerS))
+	dx := [6]float64{lin.X * dt, lin.Y * dt, lin.Z * dt, ang.X * dt, ang.Y * dt, ang.Z * dt}
+	J, err := Jacobian(m, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	A := mat.NewDense(5, 6, nil)
+	b := make([]float64, 5)
+	for i := 0; i < 5; i++ {
+		A.SetRow(i, J.RawRowView(i))
+		b[i] = dx[i]
+	}
+	P, _, _, _, err := dpinv(A, c.SingularEps, c.MaxDamping, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nearVec(t, got, mulVec(P, b), 1e-12)
+	if d := l.Status().Damping; d != 0 {
+		t.Fatalf("damping %v away from singularity, want 0", d)
+	}
+	dls, _, _, err := dlsStep(J, w, dx, c.SingularEps, c.MaxDamping)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maxAbsDiff(dls, got) < 1e-9 {
+		t.Fatal("step equals the (singular-damped) dlsStep; the m<n path is not used")
+	}
+}
+
+// SingularEps above every singular value forces λ > 0; the step is then reported as limited.
+func TestPointingLimitedWhenDamped(t *testing.T) {
+	l, _, m, clk := newSO101Loop(t, q0a, LoopConfig{SingularEps: 1})
+	qt := []float64{q0a[0] + 0.12, q0a[1] - 0.1, q0a[2] + 0.15, q0a[3] - 0.15, q0a[4] + 0.1}
+	l.SetTarget(fkPose(t, m, qt))
+	clockTicks(t, l, clk, 5)
+	if s := l.Status(); s.Damping <= 0 || !s.Limited {
+		t.Fatalf("damping=%v limited=%v, want damped and limited", s.Damping, s.Limited)
+	}
+}
+
+// Pointing mode scales both priority levels by the ramp, and caps the position velocity.
+func TestPointingRampScalesAndCaps(t *testing.T) {
+	m := so101(t)
+	// (a) far reachable target: each tick's position step stays within the linear cap
+	l, sim, _, clk := newSO101Loop(t, q0a, LoopConfig{})
+	qt := []float64{q0a[0] + 0.6, q0a[1] - 0.5, q0a[2] + 0.5, q0a[3] - 0.3, q0a[4]}
+	far := fkPose(t, m, qt)
+	if d := far.Point().Sub(fkPose(t, m, q0a).Point()).Norm(); d < 100 {
+		t.Fatalf("test target only %.0f mm away", d)
+	}
+	l.SetTarget(far)
+	clockTicks(t, l, clk, 30)
+	prev := fkPose(t, m, q0a).Point()
+	maxStep := 0.0
+	for _, q := range sim.sends {
+		p := fkPose(t, m, q).Point()
+		maxStep = math.Max(maxStep, p.Sub(prev).Norm())
+		prev = p
+	}
+	// 0.2 mm of slack: the Jacobian is linear, the arm is not
+	if lim := l.cfg.MaxLinearMMPerS / l.cfg.RateHz; maxStep > lim+0.2 {
+		t.Fatalf("position step %.3f mm per tick, want ≤ %.3f", maxStep, lim)
+	} else if maxStep < 0.5*lim {
+		t.Fatalf("position step %.3f mm per tick never approached the cap %.3f", maxStep, lim)
+	}
+
+	// (b) pointing-dominant target (pitch only, same position): the ramp must scale the pointing level
+	l, sim, _, clk = newSO101Loop(t, q0a, LoopConfig{})
+	start := fkPose(t, m, q0a)
+	_, cq, _ := FK(m, q0a)
+	pitch := toolAxis(cq).Cross(r3.Vector{Z: 1}).Normalize()
+	tq := spatialmath.Quaternion(quat.Mul(ExpRot(pitch.Mul(deg2rad(40))), start.Orientation().Quaternion()))
+	l.SetTarget(spatialmath.NewPose(start.Point(), &tq))
+	clockTicks(t, l, clk, 5)
+	n0 := len(sim.sends)
+	l.RampStop(100*time.Millisecond, StateStopped)
+	if !clockTicks(t, l, clk, 10) {
+		t.Fatal("ramp did not complete")
+	}
+	steps := sim.sends[n0-1:]
+	first := maxAbsDiff(steps[1], steps[0])
+	if first < 1e-6 {
+		t.Fatal("no motion before the ramp; target is not pointing-dominant")
+	}
+	last := first
+	for k := 2; k < len(steps); k++ {
+		d := maxAbsDiff(steps[k], steps[k-1])
+		if d > last*1.02+1e-12 {
+			t.Fatalf("ramp step %d grew: %.3g > %.3g", k, d, last)
+		}
+		last = d
+	}
+	if last > 0.3*first {
+		t.Fatalf("last ramp step %.3g is not near zero (first %.3g)", last, first)
+	}
+}
+
+// Pose mode: an unreachable error on a dropped row (rz weight 0) must not leash the target (spec "Leash").
+func TestPoseLeashIgnoresDroppedRow(t *testing.T) {
+	l, _, m, clk := newClockLoop(t, home, LoopConfig{TaskWeights: [6]float64{1, 1, 1, 1, 1, 0}})
+	tgt := offsetTarget(t, m, home, r3.Vector{}, deg2rad(20)) // 20° yaw the dropped row can't fix
+	l.SetTarget(tgt)
+	clockTicks(t, l, clk, 100)
+	l.SetVelocity([6]float64{5: deg2rad(10)}) // yaw twist toward the dropped error
+	clockTicks(t, l, clk, 25)
+	l.mu.Lock()
+	got := RotVec(l.target.Orientation().Quaternion(), tgt.Orientation().Quaternion()).Norm() * 180 / math.Pi
+	l.mu.Unlock()
+	if math.Abs(got-5) > 0.25 {
+		t.Fatalf("target yawed %.2f° in 0.5 s at 10°/s, want 5 (dropped row must not leash)", got)
 	}
 }

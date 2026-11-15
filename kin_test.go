@@ -173,3 +173,141 @@ func TestExpRotInvertsRotVec(t *testing.T) {
 		}
 	}
 }
+
+// so101 loads the 5-DOF SO-101 test model (testdata/so101.urdf, meshes stripped).
+func so101(t *testing.T) referenceframe.Model {
+	t.Helper()
+	m, err := referenceframe.ParseModelXMLFile("testdata/so101.urdf", "arm", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(m.DoF()); n != 5 {
+		t.Fatalf("so101 DOF = %d, want 5", n)
+	}
+	return m
+}
+
+var (
+	q0a = []float64{0, 0.3, 0.3, 0.5, 0}
+	q0b = []float64{0.3, 0.5, -0.8, 0.4, 0.7}
+	q0c = []float64{0, 0.6, 0.6, 1.0, 0}
+)
+
+func mulVec(A mat.Matrix, x []float64) []float64 {
+	var y mat.VecDense
+	y.MulVec(A, mat.NewVecDense(len(x), x))
+	return y.RawVector().Data
+}
+
+func nearVec(t *testing.T, got, want []float64, tol float64) {
+	t.Helper()
+	for i := range want {
+		if math.Abs(got[i]-want[i]) > tol {
+			t.Fatalf("got %v, want %v (tol %g)", got, want, tol)
+		}
+	}
+}
+
+func TestDpinvMatchesClosedForms(t *testing.T) {
+	sq := mat.NewDense(2, 2, []float64{2, 1, 1, 3})
+	P, lam, _, r, err := dpinv(sq, 0.04, 0.1, true)
+	if err != nil || lam != 0 || r != 2 {
+		t.Fatalf("square: λ=%v r=%d err=%v", lam, r, err)
+	}
+	nearVec(t, mulVec(P, []float64{1, 2}), []float64{0.2, 0.6}, 1e-12) // inverse · b
+
+	tall := mat.NewDense(3, 2, []float64{1, 0, 0, 1, 1, 1})
+	P, _, _, _, _ = dpinv(tall, 0.04, 0.1, false)
+	var ata, inv, want mat.Dense
+	ata.Mul(tall.T(), tall)
+	_ = inv.Inverse(&ata)
+	want.Mul(&inv, tall.T())
+	if !mat.EqualApprox(P, &want, 1e-12) {
+		t.Fatalf("tall: dpinv ≠ (AᵀA)⁻¹Aᵀ")
+	}
+
+	wide := mat.NewDense(2, 3, []float64{1, 0, 1, 0, 1, 1})
+	P, _, _, _, _ = dpinv(wide, 0.04, 0.1, false)
+	var aat, inv2, want2 mat.Dense
+	aat.Mul(wide, wide.T())
+	_ = inv2.Inverse(&aat)
+	want2.Mul(wide.T(), &inv2)
+	if !mat.EqualApprox(P, &want2, 1e-12) {
+		t.Fatalf("wide: dpinv ≠ Aᵀ(AAᵀ)⁻¹")
+	}
+
+	zero := mat.NewDense(2, 3, nil)
+	P, lam, _, r, err = dpinv(zero, 0.04, 0.1, true)
+	if err != nil || r != 0 || lam != 0 || mat.Norm(P, 2) != 0 {
+		t.Fatalf("zero: r=%d λ=%v err=%v", r, lam, err)
+	}
+}
+
+// A rank-deficient system must not blow up, and must give the minimum-norm solution
+// (the SO-101 pointing stack has a structural null direction, spec "SO-101 kinematics").
+func TestDpinvRankDeficientIsMinimumNorm(t *testing.T) {
+	A := mat.NewDense(2, 3, []float64{1, 1, 0, 2, 2, 0}) // rank 1
+	P, lam, _, r, err := dpinv(A, 0.04, 0.1, true)
+	if err != nil || r != 1 || lam != 0 {
+		t.Fatalf("r=%d λ=%v err=%v", r, lam, err)
+	}
+	x := mulVec(P, []float64{1, 2})
+	nearVec(t, x, []float64{0.5, 0.5, 0}, 1e-12) // minimum-norm solution of x+y=1
+}
+
+// Chiaverini damping keys on the smallest *retained* singular value.
+func TestDpinvDampsOnlyWeakRetainedDirections(t *testing.T) {
+	A := mat.NewDense(2, 2, []float64{1, 0, 0, 0.02}) // σ = 1, 0.02 < ε
+	_, lam, sr, r, _ := dpinv(A, 0.04, 0.1, true)
+	want := 0.1 * math.Sqrt(1-(0.02/0.04)*(0.02/0.04))
+	if r != 2 || math.Abs(sr-0.02) > 1e-15 || math.Abs(lam-want) > 1e-12 {
+		t.Fatalf("r=%d σr=%v λ=%v, want λ=%v", r, sr, lam, want)
+	}
+	B := mat.NewDense(2, 2, []float64{1, 0, 0, 1e-9}) // below rank tolerance: dropped, not damped
+	_, lam, _, r, _ = dpinv(B, 0.04, 0.1, true)
+	if r != 1 || lam != 0 {
+		t.Fatalf("near-null direction: r=%d λ=%v, want r=1 λ=0", r, lam)
+	}
+}
+
+// m < n pose form vs the n×n form at λ > 0 (push-through identity).
+func TestDpinvMatchesNormalEquationsWhenDamped(t *testing.T) {
+	A := mat.NewDense(2, 3, []float64{1, 0.2, 0, 0, 0.03, 1})
+	P, lam, _, _, _ := dpinv(A, 2, 0.1, true) // ε above σmin = 1.0 so λ > 0
+	if lam == 0 {
+		t.Fatal("want λ > 0")
+	}
+	var ata mat.Dense
+	ata.Mul(A.T(), A)
+	for i := 0; i < 3; i++ {
+		ata.Set(i, i, ata.At(i, i)+lam*lam)
+	}
+	var rhs, x mat.VecDense
+	rhs.MulVec(A.T(), mat.NewVecDense(2, []float64{0.3, -0.1}))
+	if err := x.SolveVec(&ata, &rhs); err != nil {
+		t.Fatal(err)
+	}
+	nearVec(t, mulVec(P, []float64{0.3, -0.1}), x.RawVector().Data, 1e-12)
+}
+
+// Each rank-tolerance term is pinned separately: the relative one (rankTol·σmax) and the absolute
+// floor (rankAbs), plus the all-below-floor guard.
+func TestDpinvRankToleranceTerms(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		a, b float64
+		rank int
+	}{
+		{"relative term", 10, 5e-4, 1},    // 5e-4 > rankAbs but < 1e-4·10
+		{"absolute floor", 5e-5, 2e-6, 1}, // 2e-6 > 1e-4·5e-5 but < rankAbs
+		{"all below floor", 1e-6, 0, 0},
+	} {
+		P, _, _, rank, err := dpinv(mat.NewDiagDense(2, []float64{c.a, c.b}), 0.04, 0.1, false)
+		if err != nil || rank != c.rank {
+			t.Fatalf("%s: rank %d err %v, want %d", c.name, rank, err, c.rank)
+		}
+		if c.rank == 0 && mat.Norm(P, 1) != 0 {
+			t.Fatalf("%s: P not all zeros: %v", c.name, mat.Formatted(P))
+		}
+	}
+}

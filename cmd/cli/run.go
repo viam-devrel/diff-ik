@@ -66,7 +66,7 @@ func (r *recorder) len() int {
 	return len(r.rows)
 }
 
-func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario string, rate float64, csvPath string, wrist int, maxJointDegS, resyncDeg float64) (err error) {
+func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario string, rate float64, csvPath string, wrist int, maxJointDegS, resyncDeg float64, task string, singEps, maxDamp, singDeg float64) (err error) {
 	// Any error return (including the singular pre-move) must not leave the arm moving.
 	defer func() {
 		if err != nil {
@@ -78,9 +78,19 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 	var body func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error
 	switch scenario {
 	case "static":
-		body = static
+		q0, qerr := a.JointPositions(ctx, nil)
+		if qerr != nil {
+			return qerr
+		}
+		// the effective task is only known once the loop is built; the body runs after that
+		body = func(ctx context.Context, l *diffik.Loop, rec *recorder, start spatialmath.Pose) error {
+			if l.Config().Task == diffik.TaskPointing {
+				return staticReachable(model, q0)(ctx, l, rec, start)
+			}
+			return static(ctx, l, rec, start)
+		}
 	case "singular":
-		if body, err = singular(ctx, a, model, wrist); err != nil {
+		if body, err = singular(ctx, a, model, wrist, singDeg); err != nil {
 			return err
 		}
 	case "circle":
@@ -89,7 +99,7 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}
 
-	cfg := diffik.LoopConfig{RateHz: rate, ResyncDeg: resyncDeg}
+	cfg := diffik.LoopConfig{RateHz: rate, ResyncDeg: resyncDeg, Task: task, SingularEps: singEps, MaxDamping: maxDamp}
 	if maxJointDegS > 0 {
 		for range model.DoF() {
 			cfg.MaxJointDegPerS = append(cfg.MaxJointDegPerS, maxJointDegS)
@@ -171,6 +181,51 @@ func waitConverged(ctx context.Context, l *diffik.Loop, target spatialmath.Pose,
 	return time.Since(t0), false
 }
 
+// staticReachable is the pointing-mode static scenario: targets are FK of the start joints perturbed
+// by a seeded random offset (≤ 10° per joint), keeping those whose position is 20–60 mm away, so
+// every target is reachable by construction on any arm (spec "cmd/cli").
+func staticReachable(model referenceframe.Model, q0 []float64) func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error {
+	return func(ctx context.Context, l *diffik.Loop, _ *recorder, start spatialmath.Pose) error {
+		rng := rand.New(rand.NewSource(1))
+		lim := model.DoF()
+		failed := 0
+		for i, tries := 0, 0; i < 10; tries++ {
+			if tries >= 10000 {
+				return fmt.Errorf("no reachable target 20–60 mm from the start after %d samples (%d found)", tries, i)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			q := slices.Clone(q0)
+			for j := range q {
+				q[j] = math.Min(math.Max(q[j]+(rng.Float64()*2-1)*10*math.Pi/180, lim[j].Min), lim[j].Max)
+			}
+			target, err := model.Transform(q)
+			if err != nil {
+				return err
+			}
+			if d := target.Point().Sub(start.Point()).Norm(); d < 20 || d > 60 {
+				continue
+			}
+			l.SetTarget(target)
+			took, ok := waitConverged(ctx, l, target, 10*time.Second)
+			s := l.Status()
+			fmt.Printf("target %2d: %-9s in %5.2fs  err %.2f mm %.2f°  residual %.2f°  %s\n",
+				i, s.State, took.Seconds(), s.ErrMM, s.ErrDeg, s.PointingResidualDeg, pass(ok))
+			if !ok {
+				failed++
+			}
+			l.SetTarget(start)
+			waitConverged(ctx, l, start, 10*time.Second)
+			i++
+		}
+		if failed > 0 {
+			return fmt.Errorf("%d of 10 targets did not converge", failed)
+		}
+		return nil
+	}
+}
+
 // static: 10 targets 50 mm and ≤ 10° from start, returning to start between them.
 func static(ctx context.Context, l *diffik.Loop, _ *recorder, start spatialmath.Pose) error {
 	rng := rand.New(rand.NewSource(1))
@@ -198,9 +253,9 @@ func static(ctx context.Context, l *diffik.Loop, _ *recorder, start spatialmath.
 	return nil
 }
 
-// singular moves the arm so the wrist joint sits at +0.2 rad, then (once the loop runs) targets the
-// pose with the wrist at −0.2 rad, so the Cartesian path passes close to the wrist singularity.
-func singular(ctx context.Context, a arm.Arm, model referenceframe.Model, wrist int) (func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error, error) {
+// singular moves the arm so the joint sits at singDeg+0.2 rad, then (once the loop runs) targets the
+// pose with the joint at singDeg−0.2 rad, so the Cartesian path passes close to the singularity at singDeg.
+func singular(ctx context.Context, a arm.Arm, model referenceframe.Model, wrist int, singDeg float64) (func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error, error) {
 	q, err := a.JointPositions(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -209,7 +264,11 @@ func singular(ctx context.Context, a arm.Arm, model referenceframe.Model, wrist 
 		return nil, fmt.Errorf("wrist index %d out of range for %d joints", wrist, len(q))
 	}
 	qa, qb := slices.Clone(q), slices.Clone(q)
-	qa[wrist], qb[wrist] = 0.2, -0.2
+	c := singDeg * math.Pi / 180
+	if lim := model.DoF()[wrist]; c-0.2 < lim.Min || c+0.2 > lim.Max {
+		return nil, fmt.Errorf("singular sweep %.3f..%.3f rad outside joint %d limits [%.3f, %.3f]", c-0.2, c+0.2, wrist, lim.Min, lim.Max)
+	}
+	qa[wrist], qb[wrist] = c+0.2, c-0.2
 	if err := a.MoveToJointPositions(ctx, qa, nil); err != nil {
 		return nil, err
 	}

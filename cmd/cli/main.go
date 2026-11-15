@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 
+	"diffik"
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/robot/client"
@@ -35,11 +36,21 @@ func realMain() error {
 	spread := flag.Float64("spread", 0.1, "validate: fraction of each joint's half-range to sample around the start pose")
 	maxDegS := flag.Float64("max-joint-deg-s", 0, "run: per-joint velocity limit in deg/s (0 = loop default 90)")
 	resyncDeg := flag.Float64("resync-deg", 0, "run: q_cmd/q_meas divergence in deg before resync (0 = loop default 3 ticks at max speed)")
-	wrist := flag.Int("wrist", 4, "singular: index of the wrist joint whose zero is singular")
+	wrist := flag.Int("wrist", 4, "singular: index of the joint whose --singular-deg angle is singular (UR5e wrist: 4; SO-101 elbow: 2)")
+	task := flag.String("task", "", "run: task mode, pose|pointing (default: pointing if the arm has < 6 joints, else pose)")
+	singEps := flag.Float64("singular-eps", 0, "run: Chiaverini threshold ε (0 = loop default 0.04)")
+	maxDamp := flag.Float64("max-damping", 0, "run: maximum damping λmax (0 = loop default 0.1)")
+	singDeg := flag.Float64("singular-deg", 0, "singular: joint angle (deg) the scenario sweeps through, ±11.5° around it")
 	flag.Parse()
 	args := flag.Args()
 	if !(*spread > 0 && *spread <= 1) {
 		return errors.New("--spread must be in (0, 1]")
+	}
+	if *task != "" && *task != diffik.TaskPose && *task != diffik.TaskPointing {
+		return fmt.Errorf("--task must be %q or %q", diffik.TaskPose, diffik.TaskPointing) // before singular moves the arm
+	}
+	if *singEps < 0 || *maxDamp < 0 {
+		return errors.New("--singular-eps and --max-damping must be >= 0")
 	}
 	if *armName == "" || len(args) == 0 {
 		return errors.New(usage)
@@ -79,7 +90,7 @@ func realMain() error {
 	case args[0] == "validate":
 		return validate(ctx, a, model, *spread)
 	case args[0] == "run" && len(args) == 2:
-		return run(ctx, a, model, args[1], *rate, *csvPath, *wrist, *maxDegS, *resyncDeg)
+		return run(ctx, a, model, args[1], *rate, *csvPath, *wrist, *maxDegS, *resyncDeg, *task, *singEps, *maxDamp, *singDeg)
 	default:
 		return errors.New(usage)
 	}

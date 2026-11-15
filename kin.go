@@ -122,3 +122,47 @@ func ExpRot(v r3.Vector) quat.Number {
 	s := math.Sin(th/2) / th
 	return quat.Number{Real: math.Cos(th / 2), Imag: s * v.X, Jmag: s * v.Y, Kmag: s * v.Z}
 }
+
+// rankTol is the relative singular-value cutoff for dpinv. It is 1e-4, not tighter, because
+// so101.urdf/so101.json write angles as rounded constants (3.14159, 1.5708): structurally zero
+// singular values come out near 4e-6·σmax (spec "Damped pseudo-inverse with rank tolerance").
+const rankTol = 1e-4
+
+// rankAbs is an absolute floor: near the SO-101 elbow singularity σmax itself collapses, and a purely
+// relative cutoff would then keep the ≈2e-6 structural zero (flipping the reachable/residual split).
+const rankAbs = 1e-5
+
+// dpinv returns the damped pseudo-inverse Σ σᵢ/(σᵢ²+λ²)·vᵢuᵢᵀ of A (m×n → n×m), keeping only
+// σᵢ > rankTol·σmax. With damp, λ is Chiaverini damping on σr, the smallest retained singular value.
+func dpinv(A mat.Matrix, eps, maxDamping float64, damp bool) (P *mat.Dense, lambda, sigmaR float64, rank int, err error) {
+	m, n := A.Dims()
+	P = mat.NewDense(n, m, nil)
+	var svd mat.SVD
+	if !svd.Factorize(A, mat.SVDThin) {
+		return nil, 0, 0, 0, errSVD
+	}
+	vals := svd.Values(nil)
+	if len(vals) == 0 || vals[0] <= rankAbs {
+		return P, 0, 0, 0, nil
+	}
+	for _, s := range vals {
+		if s > max(rankTol*vals[0], rankAbs) {
+			rank++
+		}
+	}
+	sigmaR = vals[rank-1]
+	l2 := 0.0
+	if damp && sigmaR < eps {
+		r := sigmaR / eps
+		l2 = maxDamping * maxDamping * (1 - r*r)
+	}
+	var U, V mat.Dense
+	svd.UTo(&U)
+	svd.VTo(&V)
+	for i := 0; i < rank; i++ {
+		var o mat.Dense
+		o.Outer(vals[i]/(vals[i]*vals[i]+l2), V.ColView(i), U.ColView(i))
+		P.Add(P, &o)
+	}
+	return P, math.Sqrt(l2), sigmaR, rank, nil
+}

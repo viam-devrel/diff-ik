@@ -108,7 +108,7 @@ func TestDoCommandErrors(t *testing.T) {
 		{start("limits", map[string]interface{}{"linear_mm_s": -5.0}), "linear_mm_s"},
 		{start("limits", "slow"), "limits"},
 		{start("task_weights", []interface{}{1.0, 1.0, 1.0, 1.0, 1.0}), "task_weights"},
-		{start("task_weights", []interface{}{1.0, 1.0, 1.0, 0.0, 1.0, 1.0}), "task_weights"},
+		{start("task_weights", []interface{}{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}), "task_weights"},
 		{map[string]interface{}{"command": "servo_status"}, "session_id is required"},
 		{map[string]interface{}{"command": "servo_status", "session_id": "nope"}, "unknown session_id"},
 	} {
@@ -255,5 +255,86 @@ func TestServoStartWorldFrameIntsAndLists(t *testing.T) {
 	got := st["limits"].(map[string]interface{})["joint_deg_s"].([]interface{})
 	if !slices.Equal(got, js) {
 		t.Fatalf("joint_deg_s = %v, want %v", got, js)
+	}
+}
+
+func TestServoStartTaskWeightsAndDamping(t *testing.T) {
+	m, _, clk := newTestManager(t, spatialmath.NewZeroPose())
+	s := testServo(t, m)
+	start := func(kv ...interface{}) (map[string]interface{}, error) {
+		c := map[string]interface{}{"command": "servo_start", "component_name": "arm", "frame": "arm_origin"}
+		for i := 0; i < len(kv); i += 2 {
+			c[kv[i].(string)] = kv[i+1]
+		}
+		return s.DoCommand(context.Background(), c)
+	}
+	for _, tc := range []struct {
+		kv   []interface{}
+		want string
+	}{
+		{[]interface{}{"task", "fly"}, "unsupported task"},
+		{[]interface{}{"task_weights", []interface{}{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}}, "task_weights"},
+		{[]interface{}{"task_weights", []interface{}{1.0, 1.0, 1.0, -1.0, 1.0, 1.0}}, "task_weights"},
+		{[]interface{}{"limits", map[string]interface{}{"singular_eps": 0.0}}, "singular_eps"},
+		{[]interface{}{"limits", map[string]interface{}{"max_damping": -1.0}}, "max_damping"},
+	} {
+		if _, err := start(tc.kv...); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: err = %v, want containing %q", tc.kv, err, tc.want)
+		}
+	}
+	r, err := start("task", "pointing", "task_weights", []interface{}{1.0, 1.0, 1.0, 0.0, 0.0, 1.0},
+		"limits", map[string]interface{}{"singular_eps": 0.02, "max_damping": 0.05})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := m.get(r["session_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	step(t, sess, clk, 1)
+	st := do(t, s, map[string]interface{}{"command": "servo_status", "session_id": r["session_id"]})
+	lim := st["limits"].(map[string]interface{})
+	if st["task"] != "pointing" || lim["singular_eps"] != 0.02 || lim["max_damping"] != 0.05 {
+		t.Fatalf("status task=%v limits=%v", st["task"], lim)
+	}
+	if _, ok := st["pointing_residual_deg"].(float64); !ok {
+		t.Fatalf("pointing_residual_deg missing: %v", st)
+	}
+}
+
+func TestServoTwistRollIgnoredAndTaskStatus(t *testing.T) {
+	m, _, clk := newTestManager(t, spatialmath.NewZeroPose())
+	s := testServo(t, m)
+	id := do(t, s, map[string]interface{}{"command": "servo_start", "component_name": "arm",
+		"frame": "arm_origin", "mode": "twist", "task": "pointing"})["session_id"].(string)
+	sess, err := m.get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step(t, sess, clk, 1)
+	a := sess.loop.Status().ToolAxis.Mul(10) // deg/s about the tool axis
+	r := do(t, s, map[string]interface{}{"command": "servo_twist", "session_id": id,
+		"linear": []interface{}{0.0, 0.0, 0.0}, "angular": []interface{}{a.X, a.Y, a.Z}})
+	if r["roll_ignored"] != true {
+		t.Fatalf("roll twist response %v, want roll_ignored", r)
+	}
+	r = do(t, s, map[string]interface{}{"command": "servo_twist", "session_id": id,
+		"linear": []interface{}{5.0, 0.0, 0.0}, "angular": []interface{}{0.0, 0.0, 0.0}})
+	if _, ok := r["roll_ignored"]; ok {
+		t.Fatalf("linear twist response %v, want no roll_ignored", r)
+	}
+
+	m, _, clk = newTestManager(t, spatialmath.NewZeroPose())
+	s = testServo(t, m)
+	id = do(t, s, map[string]interface{}{"command": "servo_start", "component_name": "arm",
+		"frame": "arm_origin", "task": "pose"})["session_id"].(string)
+	sess, err = m.get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step(t, sess, clk, 1)
+	st := do(t, s, map[string]interface{}{"command": "servo_status", "session_id": id})
+	if _, ok := st["pointing_residual_deg"]; st["task"] != "pose" || ok {
+		t.Fatalf("pose status task=%v pointing_residual_deg present=%v", st["task"], ok)
 	}
 }
