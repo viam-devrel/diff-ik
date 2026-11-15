@@ -108,12 +108,46 @@ func moveAndMeasure(ctx context.Context, a arm.Arm, q []float64) ([]float64, spa
 	if err := a.MoveToJointPositions(ctx, q, nil); err != nil {
 		return nil, nil, err
 	}
-	qm, err := a.JointPositions(ctx, nil)
-	if err != nil {
-		return nil, nil, err
+	// A physics arm is still settling when the move returns (within its path tolerance), so
+	// joints and end pose read in two calls can disagree. Bracket the pose read with two joint
+	// reads and accept only when the joints didn't move in between.
+	const still = 1e-4 // rad (0.006°)
+	deadline := time.Now().Add(3 * time.Second)
+	// ponytail: on hardware a holding servo can flicker ±1 encoder count (STS3215 ≈ 1.5e-3 rad)
+	// forever, so a timeout keeps the best-settled sample with a warning instead of failing.
+	var bestQ []float64
+	var bestEP spatialmath.Pose
+	bestMove := math.Inf(1)
+	for {
+		q1, err := a.JointPositions(ctx, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		ep, err := a.EndPosition(ctx, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		q2, err := a.JointPositions(ctx, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		moved := 0.0
+		for i := range q1 {
+			moved = math.Max(moved, math.Abs(q2[i]-q1[i]))
+		}
+		if moved <= still {
+			return q2, ep, nil
+		}
+		if moved < bestMove {
+			bestQ, bestEP, bestMove = q2, ep, moved
+		}
+		if time.Now().After(deadline) {
+			fmt.Printf("warning: joints still moving %.4f° between reads 3 s after reaching %v; using the stillest sample\n",
+				bestMove*180/math.Pi, q)
+			return bestQ, bestEP, nil
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	ep, err := a.EndPosition(ctx, nil)
-	return qm, ep, err
 }
 
 func clamp(v, lo, hi float64) float64    { return math.Min(math.Max(v, lo), hi) }

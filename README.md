@@ -22,3 +22,9 @@ Then, from another shell:
     uv run clients/python/servo_bench.py --address localhost:8080 --insecure --arm arm --task pointing
 
 The paths in `dev/so101-sim.json` are absolute for one laptop; edit `executable_path` for yours.
+
+For physics (Phase 3b), use the MuJoCo SO-101 from viam-mujoco-sim's `so101-asset` worktree:
+
+    make -C ~/src/viam-mujoco-sim-so101 run.sh   # generated, gitignored
+    viam-server -config dev/so101-mujoco.json   # serves plaintext localhost:8082
+    go run ./cmd/cli --address localhost:8082 --insecure --arm arm --task pointing run static

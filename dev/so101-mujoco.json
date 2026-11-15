@@ -1,0 +1,22 @@
+{
+  "network": {"bind_address": "localhost:8082"},
+  "modules": [
+    {"type": "local", "name": "mujoco-sim", "executable_path": "/Users/nick.hehr/src/viam-mujoco-sim-so101/run.sh"},
+    {"type": "local", "name": "diff-ik", "executable_path": "/Users/nick.hehr/src/diff-ik/bin/diff-ik"}
+  ],
+  "components": [
+    {"name": "sim-world", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:world", "attributes": {}},
+    {"name": "table", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:obstacle",
+     "attributes": {"world": "sim-world"},
+     "frame": {"parent": "world", "translation": {"x": 250, "y": 0, "z": -10},
+               "geometry": {"type": "box", "x": 600, "y": 600, "z": 20}}},
+    {"name": "arm", "api": "rdk:component:arm", "model": "viam-labs:mujoco-sim:arm",
+     "attributes": {"world": "sim-world", "asset": "so101"},
+     "frame": {"parent": "world", "translation": {"x": 0, "y": 0, "z": 100}}},
+    {"name": "gripper", "api": "rdk:component:gripper", "model": "viam-labs:mujoco-sim:gripper",
+     "attributes": {"world": "sim-world", "mount": "arm", "asset": "so101"}, "frame": {"parent": "arm"}}
+  ],
+  "services": [
+    {"name": "servo", "api": "rdk:service:motion", "model": "devrel:diff-ik:servo", "attributes": {"arms": ["arm"]}}
+  ]
+}
