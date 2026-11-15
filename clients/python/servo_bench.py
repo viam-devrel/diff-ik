@@ -240,10 +240,14 @@ async def deadman(svc, arm2, args) -> None:
     report("last cmd → arm stationary", "never" if still is None else f"{(still - t_last) * 1000:.0f} ms")
 
 
-async def circle(svc, arm2, args, resync: float | None) -> None:
+async def circle(svc, arm2, args, resync: float | None, home=None) -> None:
     limits = {"joint_deg_s": args.joint_deg_s}
     if resync:
         limits["resync_deg"] = resync
+    if home is not None:
+        # start every circle from the same joints: the previous run leaves the arm 50 mm out,
+        # so chaining circles walks toward the edge of a small arm's reach
+        await arm2.move_to_joint_positions(home)
     r = await svc.do_command(start_kw(args, mode="pose", limits=limits))
     sid, c = r["session_id"], r["pose"]
     radius, speed = 50.0, 50.0
@@ -304,6 +308,7 @@ async def main() -> int:
     try:
         svc = MotionClient.from_robot(robot, args.service)
         arm2 = Arm.from_robot(robot2, args.arm)
+        home = await arm2.get_joint_positions()  # the start pose every circle returns to
         steps = args.steps.split(",")
         if "smoke" in steps:
             await smoke(svc, args)
@@ -314,8 +319,8 @@ async def main() -> int:
         if "deadman" in steps:
             await deadman(svc, arm2, args)
         if "circle" in steps:
-            await circle(svc, arm2, args, None)
-            await circle(svc, arm2, args, 15)
+            await circle(svc, arm2, args, None, home)
+            await circle(svc, arm2, args, 15, home)
     finally:
         await robot.close()
         await robot2.close()
