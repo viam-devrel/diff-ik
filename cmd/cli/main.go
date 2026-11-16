@@ -54,6 +54,7 @@ func realMain() error {
 	maxLin := flag.Float64("max-linear-mm-s", 0, "run: linear speed limit (0 = loop default 100)")
 	maxAng := flag.Float64("max-angular-deg-s", 0, "run: angular speed limit (0 = loop default 45)")
 	tolMM := flag.Float64("tol-mm", 0, "run: convergence position tolerance (0 = loop default 2)")
+	tolDeg := flag.Float64("tol-deg", 0, "run: convergence angle tolerance (0 = loop default 2)")
 	circleMMs := flag.Float64("circle-mm-s", 50, "circle: speed around the circle (mm/s)")
 	leadMS := flag.Float64("lead-ms", 0, "run/probe: stamp each streamed point this far ahead (ms; 0 = diffik.DefaultLead, 5 ms; capped at one tick)")
 	startJoints := flag.String("start-joints", "", "comma-separated joint angles (rad): run/validate/probe first make a guarded profiled move here")
@@ -68,7 +69,7 @@ func realMain() error {
 	if minZSet && *startJoints == "" {
 		return errors.New("--start-joints is required with --min-z-mm")
 	}
-	if !(*tipMM > 0) || !(*settleTol > 0) || !(*circleMMs > 0) || *hold < 0 || *maxLin < 0 || *maxAng < 0 || *tolMM < 0 {
+	if !(*tipMM > 0) || !(*settleTol > 0) || !(*circleMMs > 0) || *hold < 0 || *maxLin < 0 || *maxAng < 0 || *tolMM < 0 || *tolDeg < 0 {
 		return errors.New("--tip-mm, --settle-tol and --circle-mm-s must be > 0; --hold, --max-linear-mm-s, --max-angular-deg-s and --tol-mm must be >= 0")
 	}
 	if !(*spread > 0 && *spread <= 1) {
@@ -148,7 +149,7 @@ func realMain() error {
 	case args[0] == "run" && len(args) == 2:
 		return run(ctx, sa, model, args[1], runOpts{
 			rate: *rate, csvPath: *csvPath, wrist: *wrist, maxJointDegS: *maxDegS, maxLinear: *maxLin, maxAngular: *maxAng,
-			resync: *resyncDeg, tolMM: *tolMM, task: *task, singEps: *singEps, maxDamp: *maxDamp, singDeg: *singDeg,
+			resync: *resyncDeg, tolMM: *tolMM, tolDeg: *tolDeg, task: *task, singEps: *singEps, maxDamp: *maxDamp, singDeg: *singDeg,
 			hold: *hold, circleMMs: *circleMMs, guard: guard, lead: msDur(*leadMS),
 		})
 	default:

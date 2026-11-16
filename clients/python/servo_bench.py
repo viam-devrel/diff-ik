@@ -109,7 +109,8 @@ def level_limits(args) -> dict:
     lim = {"joint_deg_s": args.joint_deg_s}
     for key, val in (("linear_mm_s", args.linear_mm_s), ("angular_deg_s", args.angular_deg_s),
                      ("resync_deg", args.resync_deg), ("singular_eps", args.singular_eps),
-                     ("max_damping", args.max_damping), ("tol_mm", args.tol_mm)):
+                     ("max_damping", args.max_damping), ("tol_mm", args.tol_mm),
+                     ("tol_deg", args.tol_deg)):
         if val is not None:
             lim[key] = val
     return lim
@@ -316,6 +317,7 @@ async def main() -> int:
     ap.add_argument("--singular-eps", type=float, default=None)
     ap.add_argument("--max-damping", type=float, default=None)
     ap.add_argument("--tol-mm", type=float, default=None)
+    ap.add_argument("--tol-deg", type=float, default=None)
     ap.add_argument("--twist-mm-s", type=float, default=50, help="stop and dead-man twist speed")
     ap.add_argument("--circle-mm-s", type=float, default=50)
     ap.add_argument("--motion-eps-deg", type=float, default=0.05,

@@ -71,7 +71,7 @@ type runOpts struct {
 	csvPath                                     string
 	wrist                                       int
 	maxJointDegS, maxLinear, maxAngular, resync float64
-	tolMM                                       float64
+	tolMM, tolDeg                               float64
 	task                                        string
 	singEps, maxDamp, singDeg                   float64
 	hold                                        time.Duration
@@ -115,7 +115,7 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 	}
 
 	cfg := diffik.LoopConfig{RateHz: o.rate, ResyncDeg: o.resync, Task: o.task, SingularEps: o.singEps, MaxDamping: o.maxDamp,
-		MaxLinearMMPerS: o.maxLinear, MaxAngularDegPerS: o.maxAngular, TolMM: o.tolMM}
+		MaxLinearMMPerS: o.maxLinear, MaxAngularDegPerS: o.maxAngular, TolMM: o.tolMM, TolDeg: o.tolDeg}
 	if o.maxJointDegS > 0 {
 		for range model.DoF() {
 			cfg.MaxJointDegPerS = append(cfg.MaxJointDegPerS, o.maxJointDegS)
