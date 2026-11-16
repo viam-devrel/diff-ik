@@ -9,16 +9,21 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 
 	"diffik"
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
+	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/robot/client"
 	"go.viam.com/utils/rpc"
 )
 
 const usage = `usage: cli [flags] validate
-       cli [flags] run static|singular|circle`
+       cli [flags] run static|singular|circle
+       cli [flags] probe
+       cli [flags] pose`
 
 func main() {
 	if err := realMain(); err != nil {
@@ -41,8 +46,29 @@ func realMain() error {
 	singEps := flag.Float64("singular-eps", 0, "run: Chiaverini threshold ε (0 = loop default 0.04)")
 	maxDamp := flag.Float64("max-damping", 0, "run: maximum damping λmax (0 = loop default 0.1)")
 	singDeg := flag.Float64("singular-deg", 0, "singular: joint angle (deg) the scenario sweeps through, ±11.5° around it")
+	minZ := flag.Float64("min-z-mm", 0, "floor guard: lowest allowed base-frame z (mm) for the end effector and jaw box; enabled whenever the flag is given (it can be 0 or negative)")
+	tipMM := flag.Float64("tip-mm", 105, "floor guard: jaw tip distance along the tool z axis (mm)")
+	settleTol := flag.Float64("settle-tol", 1e-4, "validate: max joint change (rad) between bracketing reads to accept a settled sample")
+	hold := flag.Duration("hold", 0, "static: hold each target this long after convergence and report the drift")
+	maxLin := flag.Float64("max-linear-mm-s", 0, "run: linear speed limit (0 = loop default 100)")
+	maxAng := flag.Float64("max-angular-deg-s", 0, "run: angular speed limit (0 = loop default 45)")
+	tolMM := flag.Float64("tol-mm", 0, "run: convergence position tolerance (0 = loop default 2)")
+	circleMMs := flag.Float64("circle-mm-s", 50, "circle: speed around the circle (mm/s)")
+	startJoints := flag.String("start-joints", "", "comma-separated joint angles (rad): run/validate/probe first make a guarded profiled move here")
 	flag.Parse()
 	args := flag.Args()
+	minZSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "min-z-mm" {
+			minZSet = true
+		}
+	})
+	if minZSet && *startJoints == "" {
+		return errors.New("--start-joints is required with --min-z-mm")
+	}
+	if !(*tipMM > 0) || !(*settleTol > 0) || !(*circleMMs > 0) || *hold < 0 || *maxLin < 0 || *maxAng < 0 || *tolMM < 0 {
+		return errors.New("--tip-mm, --settle-tol and --circle-mm-s must be > 0; --hold, --max-linear-mm-s, --max-angular-deg-s and --tol-mm must be >= 0")
+	}
 	if !(*spread > 0 && *spread <= 1) {
 		return errors.New("--spread must be in (0, 1]")
 	}
@@ -52,7 +78,12 @@ func realMain() error {
 	if *singEps < 0 || *maxDamp < 0 {
 		return errors.New("--singular-eps and --max-damping must be >= 0")
 	}
-	if *armName == "" || len(args) == 0 {
+	if !(*rate >= 1) {
+		return errors.New("--rate must be >= 1")
+	}
+	validCmd := len(args) == 1 && (args[0] == "validate" || args[0] == "probe" || args[0] == "pose") ||
+		len(args) == 2 && args[0] == "run" && (args[1] == "static" || args[1] == "singular" || args[1] == "circle")
+	if *armName == "" || !validCmd {
 		return errors.New(usage)
 	}
 
@@ -70,7 +101,9 @@ func realMain() error {
 			dial = append(dial, rpc.WithAllowInsecureWithCredentialsDowngrade())
 		}
 	}
-	opts := []client.RobotClientOption{client.WithDialOptions(dial...)}
+	opts := []client.RobotClientOption{client.WithDialOptions(dial...),
+		// Sessions off: a lapsed session heartbeat makes viam-server call arm.Stop, which on the SO-101 speeds up a profiled move (spec 3c1).
+		client.WithDisableSessions()}
 	machine, err := client.New(ctx, *address, logger, opts...)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", *address, err)
@@ -86,12 +119,57 @@ func realMain() error {
 		return fmt.Errorf("getting kinematics: %w", err)
 	}
 
+	var guard *floorGuard
+	if minZSet {
+		guard = &floorGuard{model: model, minZ: *minZ, tipMM: *tipMM}
+	}
+	var sa arm.Arm = &safeArm{Arm: a, guard: guard}
+
+	var startQ []float64
+	if *startJoints != "" {
+		if startQ, err = parseJoints(*startJoints, model.DoF()); err != nil {
+			return err
+		}
+		fmt.Printf("moving to start joints %v (profiled, 30°/s on the SO-101 driver)\n", startQ)
+		if err := sa.MoveToJointPositions(ctx, startQ, nil); err != nil {
+			return err
+		}
+	}
+
 	switch {
+	case args[0] == "pose":
+		return showPose(ctx, sa, model, guard, startQ, *hold)
 	case args[0] == "validate":
-		return validate(ctx, a, model, *spread)
+		return validate(ctx, sa, model, *spread, *settleTol, guard)
+	case args[0] == "probe" && len(args) == 1:
+		return probe(ctx, sa, *rate)
 	case args[0] == "run" && len(args) == 2:
-		return run(ctx, a, model, args[1], *rate, *csvPath, *wrist, *maxDegS, *resyncDeg, *task, *singEps, *maxDamp, *singDeg)
+		return run(ctx, sa, model, args[1], runOpts{
+			rate: *rate, csvPath: *csvPath, wrist: *wrist, maxJointDegS: *maxDegS, maxLinear: *maxLin, maxAngular: *maxAng,
+			resync: *resyncDeg, tolMM: *tolMM, task: *task, singEps: *singEps, maxDamp: *maxDamp, singDeg: *singDeg,
+			hold: *hold, circleMMs: *circleMMs, guard: guard,
+		})
 	default:
 		return errors.New(usage)
 	}
+}
+
+// parseJoints parses a comma-separated list of joint angles (rad), one per limit, each within its limits.
+func parseJoints(s string, limits []referenceframe.Limit) ([]float64, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != len(limits) {
+		return nil, fmt.Errorf("--start-joints has %d values, the arm has %d joints", len(parts), len(limits))
+	}
+	q := make([]float64, len(parts))
+	for i, p := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil {
+			return nil, fmt.Errorf("--start-joints value %d: %w", i, err)
+		}
+		if !(v >= limits[i].Min && v <= limits[i].Max) {
+			return nil, fmt.Errorf("--start-joints value %d: %v outside [%.3f, %.3f]", i, v, limits[i].Min, limits[i].Max)
+		}
+		q[i] = v
+	}
+	return q, nil
 }

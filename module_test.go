@@ -277,6 +277,8 @@ func TestServoStartTaskWeightsAndDamping(t *testing.T) {
 		{[]interface{}{"task_weights", []interface{}{1.0, 1.0, 1.0, -1.0, 1.0, 1.0}}, "task_weights"},
 		{[]interface{}{"limits", map[string]interface{}{"singular_eps": 0.0}}, "singular_eps"},
 		{[]interface{}{"limits", map[string]interface{}{"max_damping": -1.0}}, "max_damping"},
+		{[]interface{}{"limits", map[string]interface{}{"tol_mm": 0.0}}, "tol_mm"},
+		{[]interface{}{"limits", map[string]interface{}{"tol_deg": -1.0}}, "tol_deg"},
 	} {
 		if _, err := start(tc.kv...); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%v: err = %v, want containing %q", tc.kv, err, tc.want)
@@ -336,5 +338,22 @@ func TestServoTwistRollIgnoredAndTaskStatus(t *testing.T) {
 	st := do(t, s, map[string]interface{}{"command": "servo_status", "session_id": id})
 	if _, ok := st["pointing_residual_deg"]; st["task"] != "pose" || ok {
 		t.Fatalf("pose status task=%v pointing_residual_deg present=%v", st["task"], ok)
+	}
+}
+
+func TestServoStartTolLimits(t *testing.T) {
+	m, _, clk := newTestManager(t, spatialmath.NewZeroPose())
+	s := testServo(t, m)
+	r := do(t, s, map[string]interface{}{"command": "servo_start", "component_name": "arm",
+		"frame": "arm_origin", "limits": map[string]interface{}{"tol_mm": 3.5, "tol_deg": 4.0}})
+	sess, err := m.get(r["session_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	step(t, sess, clk, 1)
+	st := do(t, s, map[string]interface{}{"command": "servo_status", "session_id": r["session_id"]})
+	lim := st["limits"].(map[string]interface{})
+	if lim["tol_mm"] != 3.5 || lim["tol_deg"] != 4.0 {
+		t.Fatalf("limits = %v, want tol_mm 3.5 tol_deg 4", lim)
 	}
 }

@@ -91,17 +91,34 @@ func (io *armIO) open() {
 	}()
 }
 
+// drainWait is how long Stop lets an open stream finish on its own after the batch channel
+// closes. A normally ended stream lets the driver log its late-point count (so-101 logs it
+// only then); a cancelled one returns without it. Every Stop pays this, fault and dead-man stops
+// included: that's safe because once the channel closes no new points go out and the servos hold
+// the last goal, at most one tick ahead.
+const drainWait = 100 * time.Millisecond
+
 func (io *armIO) Stop(ctx context.Context) error {
 	var wait chan struct{}
 	if io.batches != nil {
-		// Close batches as well as cancel: drivers may only watch the channel (the fake arm does).
+		// Close batches first: drivers may only watch the channel (the fake arm does).
 		// Send and Stop both run on the loop goroutine, so nothing can send after this close.
 		close(io.batches)
-		io.cancel()
 		wait = io.s.done
+		d := drainWait
+		if dl, ok := ctx.Deadline(); ok {
+			d = min(d, time.Until(dl)/2) // leave arm.Stop at least half the caller's budget
+		}
+		select {
+		case <-wait:
+		case <-time.After(d):
+		case <-ctx.Done():
+		}
+		io.cancel()
 		io.batches = nil
 	}
-	// Stop the arm first: a hung stream must not eat the caller's deadline.
+	// Stop the arm before waiting on the stream; the drain above is capped at half the budget so a
+	// hung stream can't eat the caller's deadline.
 	err := io.a.Stop(ctx, nil)
 	if wait != nil {
 		select {

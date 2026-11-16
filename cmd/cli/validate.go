@@ -18,7 +18,7 @@ import (
 )
 
 // validate is Phase 0: our FK vs the arm's EndPosition, and J·Δq vs the measured motion.
-func validate(ctx context.Context, a arm.Arm, model referenceframe.Model, spread float64) (err error) {
+func validate(ctx context.Context, a arm.Arm, model referenceframe.Model, spread, settleTol float64, guard *floorGuard) (err error) {
 	// Any early exit (error or Ctrl-C) must not leave the arm moving.
 	defer func() {
 		if err != nil {
@@ -38,13 +38,24 @@ func validate(ctx context.Context, a arm.Arm, model referenceframe.Model, spread
 	rng := rand.New(rand.NewSource(1))
 	var worstMM, worstDeg, worstLin, worstAng float64
 	const configs = 100
-	for k := 0; k < configs; k++ {
+	for k, tries := 0, 0; k < configs; tries++ {
+		if tries >= 10000 {
+			return fmt.Errorf("floor guard rejected too many validate samples (%d accepted)", k)
+		}
 		q := make([]float64, len(start))
 		for i, lim := range limits {
 			half := spread * (lim.Max - lim.Min) / 2
 			q[i] = clamp(start[i]+(rng.Float64()*2-1)*half, lim.Min, lim.Max)
 		}
-		qm, ep, err := moveAndMeasure(ctx, a, q)
+		cur, err := a.JointPositions(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if err := guard.checkPath(cur, q); err != nil {
+			fmt.Printf("skipping sample: %v\n", err)
+			continue
+		}
+		qm, ep, err := moveAndMeasure(ctx, a, q, settleTol)
 		if err != nil {
 			return fmt.Errorf("config %d: %w", k, err)
 		}
@@ -64,7 +75,12 @@ func validate(ctx context.Context, a arm.Arm, model referenceframe.Model, spread
 			step = -step
 		}
 		q2[j] = clamp(q2[j]+step, limits[j].Min, limits[j].Max)
-		qm2, ep2, err := moveAndMeasure(ctx, a, q2)
+		if err := guard.checkPath(qm, q2); err != nil {
+			fmt.Printf("skipping nudge: %v\n", err)
+			k++
+			continue
+		}
+		qm2, ep2, err := moveAndMeasure(ctx, a, q2, settleTol)
 		if err != nil {
 			return fmt.Errorf("config %d nudge: %w", k, err)
 		}
@@ -88,8 +104,9 @@ func validate(ctx context.Context, a arm.Arm, model referenceframe.Model, spread
 		if actAng.Norm() > 1e-6 {
 			worstAng = math.Max(worstAng, relErr(actAng, r3.Vector{X: pred.AtVec(3), Y: pred.AtVec(4), Z: pred.AtVec(5)}))
 		}
+		k++
 	}
-	if _, _, err := moveAndMeasure(ctx, a, start); err != nil {
+	if _, _, err := moveAndMeasure(ctx, a, start, settleTol); err != nil {
 		return err
 	}
 
@@ -104,14 +121,13 @@ func validate(ctx context.Context, a arm.Arm, model referenceframe.Model, spread
 	return nil
 }
 
-func moveAndMeasure(ctx context.Context, a arm.Arm, q []float64) ([]float64, spatialmath.Pose, error) {
+func moveAndMeasure(ctx context.Context, a arm.Arm, q []float64, settleTol float64) ([]float64, spatialmath.Pose, error) {
 	if err := a.MoveToJointPositions(ctx, q, nil); err != nil {
 		return nil, nil, err
 	}
 	// A physics arm is still settling when the move returns (within its path tolerance), so
 	// joints and end pose read in two calls can disagree. Bracket the pose read with two joint
 	// reads and accept only when the joints didn't move in between.
-	const still = 1e-4 // rad (0.006°)
 	deadline := time.Now().Add(3 * time.Second)
 	// ponytail: on hardware a holding servo can flicker ±1 encoder count (STS3215 ≈ 1.5e-3 rad)
 	// forever, so a timeout keeps the best-settled sample with a warning instead of failing.
@@ -135,7 +151,7 @@ func moveAndMeasure(ctx context.Context, a arm.Arm, q []float64) ([]float64, spa
 		for i := range q1 {
 			moved = math.Max(moved, math.Abs(q2[i]-q1[i]))
 		}
-		if moved <= still {
+		if moved <= settleTol {
 			return q2, ep, nil
 		}
 		if moved < bestMove {

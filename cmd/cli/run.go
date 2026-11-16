@@ -66,7 +66,20 @@ func (r *recorder) len() int {
 	return len(r.rows)
 }
 
-func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario string, rate float64, csvPath string, wrist int, maxJointDegS, resyncDeg float64, task string, singEps, maxDamp, singDeg float64) (err error) {
+type runOpts struct {
+	rate                                        float64
+	csvPath                                     string
+	wrist                                       int
+	maxJointDegS, maxLinear, maxAngular, resync float64
+	tolMM                                       float64
+	task                                        string
+	singEps, maxDamp, singDeg                   float64
+	hold                                        time.Duration
+	circleMMs                                   float64
+	guard                                       *floorGuard
+}
+
+func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario string, o runOpts) (err error) {
 	// Any error return (including the singular pre-move) must not leave the arm moving.
 	defer func() {
 		if err != nil {
@@ -85,33 +98,35 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 		// the effective task is only known once the loop is built; the body runs after that
 		body = func(ctx context.Context, l *diffik.Loop, rec *recorder, start spatialmath.Pose) error {
 			if l.Config().Task == diffik.TaskPointing {
-				return staticReachable(model, q0)(ctx, l, rec, start)
+				return staticReachable(model, q0, o.guard, o.hold)(ctx, l, rec, start)
 			}
-			return static(ctx, l, rec, start)
+			return static(o.guard, o.hold)(ctx, l, rec, start)
 		}
 	case "singular":
-		if body, err = singular(ctx, a, model, wrist, singDeg); err != nil {
+		if body, err = singular(ctx, a, model, o.wrist, o.singDeg, o.guard); err != nil {
 			return err
 		}
 	case "circle":
-		body = circle
+		fmt.Printf("circle: %.0f mm/s\n", o.circleMMs)
+		body = circleAt(o.circleMMs, o.guard)
 	default:
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}
 
-	cfg := diffik.LoopConfig{RateHz: rate, ResyncDeg: resyncDeg, Task: task, SingularEps: singEps, MaxDamping: maxDamp}
-	if maxJointDegS > 0 {
+	cfg := diffik.LoopConfig{RateHz: o.rate, ResyncDeg: o.resync, Task: o.task, SingularEps: o.singEps, MaxDamping: o.maxDamp,
+		MaxLinearMMPerS: o.maxLinear, MaxAngularDegPerS: o.maxAngular, TolMM: o.tolMM}
+	if o.maxJointDegS > 0 {
 		for range model.DoF() {
-			cfg.MaxJointDegPerS = append(cfg.MaxJointDegPerS, maxJointDegS)
+			cfg.MaxJointDegPerS = append(cfg.MaxJointDegPerS, o.maxJointDegS)
 		}
 	}
-	l, err := diffik.NewLoop(model, diffik.NewArmIO(a, rate), cfg)
+	l, err := diffik.NewLoop(model, diffik.NewArmIO(a, o.rate), cfg)
 	if err != nil {
 		return err
 	}
 	rec := &recorder{start: time.Now()}
-	if csvPath != "" {
-		f, ferr := os.Create(csvPath) // not :=err, the deferred flush below must set the named result
+	if o.csvPath != "" {
+		f, ferr := os.Create(o.csvPath) // not :=err, the deferred flush below must set the named result
 		if ferr != nil {
 			return ferr
 		}
@@ -138,11 +153,11 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 	if err != nil {
 		return err
 	}
-	p, o, err := diffik.FK(model, q)
+	p, ori, err := diffik.FK(model, q)
 	if err != nil {
 		return err
 	}
-	start := poseMM(p, o)
+	start := poseMM(p, ori)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -157,13 +172,13 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 	}
 
 	s := l.Status()
-	// 1% tolerance: a 50 Hz ticker's measured average straddles 50 from first/last tick jitter.
-	const minRate = 49.5
-	fmt.Printf("rate:     %.2f Hz (pass ≥ %.1f) %s\n", s.RateHz, minRate, pass(s.RateHz >= minRate))
+	// 1% tolerance: a ticker's measured average straddles the rate from first/last tick jitter.
+	minRate := 0.99 * o.rate
+	fmt.Printf("rate:     %.2f Hz (pass ≥ %.2f) %s\n", s.RateHz, minRate, pass(s.RateHz >= minRate))
 	fmt.Printf("tick:     p50 %v  p99 %v\n", s.TickP50, s.TickP99)
 	fmt.Printf("overruns: %d   resyncs: %d\n", s.Overruns, s.Resyncs)
 	if !(s.RateHz >= minRate) { // NaN-safe
-		scenarioErr = errors.Join(scenarioErr, fmt.Errorf("loop rate %.2f Hz below %.1f", s.RateHz, minRate))
+		scenarioErr = errors.Join(scenarioErr, fmt.Errorf("loop rate %.2f Hz below %.2f", s.RateHz, minRate))
 	}
 	return scenarioErr
 }
@@ -184,7 +199,7 @@ func waitConverged(ctx context.Context, l *diffik.Loop, target spatialmath.Pose,
 // staticReachable is the pointing-mode static scenario: targets are FK of the start joints perturbed
 // by a seeded random offset (≤ 10° per joint), keeping those whose position is 20–60 mm away, so
 // every target is reachable by construction on any arm (spec "cmd/cli").
-func staticReachable(model referenceframe.Model, q0 []float64) func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error {
+func staticReachable(model referenceframe.Model, q0 []float64, guard *floorGuard, hold time.Duration) func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error {
 	return func(ctx context.Context, l *diffik.Loop, _ *recorder, start spatialmath.Pose) error {
 		rng := rand.New(rand.NewSource(1))
 		lim := model.DoF()
@@ -207,11 +222,18 @@ func staticReachable(model referenceframe.Model, q0 []float64) func(context.Cont
 			if d := target.Point().Sub(start.Point()).Norm(); d < 20 || d > 60 {
 				continue
 			}
+			if err := guard.checkPose(target); err != nil {
+				fmt.Printf("skipping target: %v\n", err)
+				continue
+			}
 			l.SetTarget(target)
 			took, ok := waitConverged(ctx, l, target, 10*time.Second)
 			s := l.Status()
 			fmt.Printf("target %2d: %-9s in %5.2fs  err %.2f mm %.2f°  residual %.2f°  %s\n",
 				i, s.State, took.Seconds(), s.ErrMM, s.ErrDeg, s.PointingResidualDeg, pass(ok))
+			if ok && hold > 0 {
+				holdTarget(ctx, l, hold)
+			}
 			if !ok {
 				failed++
 			}
@@ -227,35 +249,62 @@ func staticReachable(model referenceframe.Model, q0 []float64) func(context.Cont
 }
 
 // static: 10 targets 50 mm and ≤ 10° from start, returning to start between them.
-func static(ctx context.Context, l *diffik.Loop, _ *recorder, start spatialmath.Pose) error {
-	rng := rand.New(rand.NewSource(1))
-	failed := 0
-	for i := 0; i < 10; i++ {
-		if ctx.Err() != nil {
-			return ctx.Err()
+func static(guard *floorGuard, hold time.Duration) func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error {
+	return func(ctx context.Context, l *diffik.Loop, _ *recorder, start spatialmath.Pose) error {
+		rng := rand.New(rand.NewSource(1))
+		failed := 0
+		for i, tries := 0, 0; i < 10; tries++ {
+			if tries >= 1000 {
+				return fmt.Errorf("no target above the floor after %d samples (%d found)", tries, i)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			dir := randUnit(rng)
+			rot := axisAngle(randUnit(rng), rng.Float64()*10*math.Pi/180)
+			target := spatialmath.NewPose(start.Point().Add(dir.Mul(50)), quatOrient(quat.Mul(rot, start.Orientation().Quaternion())))
+			if err := guard.checkPose(target); err != nil {
+				fmt.Printf("skipping target: %v\n", err)
+				continue
+			}
+			l.SetTarget(target)
+			took, ok := waitConverged(ctx, l, target, 10*time.Second)
+			s := l.Status()
+			fmt.Printf("target %2d: %-9s in %5.2fs  err %.2f mm %.2f°  %s\n", i, s.State, took.Seconds(), s.ErrMM, s.ErrDeg, pass(ok))
+			if ok && hold > 0 {
+				holdTarget(ctx, l, hold)
+			}
+			if !ok {
+				failed++
+			}
+			l.SetTarget(start)
+			waitConverged(ctx, l, start, 10*time.Second)
+			i++
 		}
-		dir := randUnit(rng)
-		rot := axisAngle(randUnit(rng), rng.Float64()*10*math.Pi/180)
-		target := spatialmath.NewPose(start.Point().Add(dir.Mul(50)), quatOrient(quat.Mul(rot, start.Orientation().Quaternion())))
-		l.SetTarget(target)
-		took, ok := waitConverged(ctx, l, target, 10*time.Second)
+		if failed > 0 {
+			return fmt.Errorf("%d of 10 targets did not converge", failed)
+		}
+		return nil
+	}
+}
+
+// holdTarget keeps the current target for d and reports the worst and final error: on the
+// real arm this is settling and gravity sag (spec 3c1 "Settling and sag").
+func holdTarget(ctx context.Context, l *diffik.Loop, d time.Duration) {
+	var maxMM, maxDeg float64
+	end := time.Now().Add(d)
+	for time.Now().Before(end) && ctx.Err() == nil {
 		s := l.Status()
-		fmt.Printf("target %2d: %-9s in %5.2fs  err %.2f mm %.2f°  %s\n", i, s.State, took.Seconds(), s.ErrMM, s.ErrDeg, pass(ok))
-		if !ok {
-			failed++
-		}
-		l.SetTarget(start)
-		waitConverged(ctx, l, start, 10*time.Second)
+		maxMM, maxDeg = math.Max(maxMM, s.ErrMM), math.Max(maxDeg, s.ErrDeg)
+		time.Sleep(10 * time.Millisecond)
 	}
-	if failed > 0 {
-		return fmt.Errorf("%d of 10 targets did not converge", failed)
-	}
-	return nil
+	s := l.Status()
+	fmt.Printf("           hold %v: worst %.2f mm %.2f°  final %.2f mm %.2f°\n", d, maxMM, maxDeg, s.ErrMM, s.ErrDeg)
 }
 
 // singular moves the arm so the joint sits at singDeg+0.2 rad, then (once the loop runs) targets the
 // pose with the joint at singDeg−0.2 rad, so the Cartesian path passes close to the singularity at singDeg.
-func singular(ctx context.Context, a arm.Arm, model referenceframe.Model, wrist int, singDeg float64) (func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error, error) {
+func singular(ctx context.Context, a arm.Arm, model referenceframe.Model, wrist int, singDeg float64, guard *floorGuard) (func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error, error) {
 	q, err := a.JointPositions(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -269,6 +318,9 @@ func singular(ctx context.Context, a arm.Arm, model referenceframe.Model, wrist 
 		return nil, fmt.Errorf("singular sweep %.3f..%.3f rad outside joint %d limits [%.3f, %.3f]", c-0.2, c+0.2, wrist, lim.Min, lim.Max)
 	}
 	qa[wrist], qb[wrist] = c+0.2, c-0.2
+	if err := guard.checkJoints(qb); err != nil {
+		return nil, fmt.Errorf("singular target: %w", err)
+	}
 	if err := a.MoveToJointPositions(ctx, qa, nil); err != nil {
 		return nil, err
 	}
@@ -315,8 +367,19 @@ func singular(ctx context.Context, a arm.Arm, model referenceframe.Model, wrist 
 		}
 		seconds := float64(len(qs)-1) * dt
 		oscOK := true
-		for i, n := range diffik.Oscillations(qs, minStep) {
-			fmt.Printf("joint %d: %d oscillations in %.1fs\n", i, n, seconds)
+		// The bar is on the commanded joints, which is what the loop controls. On hardware, the measured
+		// joints flicker by single encoder counts (0.088°, above minStep at low limits), and an
+		// unloaded joint wobbles inside its servo deadband under the arm's reaction forces; that's
+		// reported, not judged (spec 3c1 hardware log).
+		qc := [][]float64{qa}
+		for _, r := range rows {
+			if r.QCmd != nil {
+				qc = append(qc, r.QCmd)
+			}
+		}
+		meas := diffik.Oscillations(qs, minStep)
+		for i, n := range diffik.Oscillations(qc, minStep) {
+			fmt.Printf("joint %d: %d oscillations in %.1fs commanded (%d measured)\n", i, n, seconds, meas[i])
 			oscOK = oscOK && float64(n) <= 2*seconds
 		}
 		fmt.Printf("reached target: %s   velocity limits: %s   oscillation: %s\n", pass(reached), pass(peakOK), pass(oscOK))
@@ -327,9 +390,18 @@ func singular(ctx context.Context, a arm.Arm, model referenceframe.Model, wrist 
 	}, nil
 }
 
-// circle: converge to a point 50 mm from start, then trace a 50 mm-radius circle at 50 mm/s for 2 laps.
-func circle(ctx context.Context, l *diffik.Loop, rec *recorder, start spatialmath.Pose) error {
-	const radius, speed = 50.0, 50.0 // mm, mm/s
+// circleAt: converge to a point 50 mm from start, then trace a 50 mm-radius circle at speed mm/s for 2 laps.
+func circleAt(speed float64, guard *floorGuard) func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error {
+	return func(ctx context.Context, l *diffik.Loop, rec *recorder, start spatialmath.Pose) error {
+		return circle(ctx, l, rec, start, speed, guard)
+	}
+}
+
+func circle(ctx context.Context, l *diffik.Loop, rec *recorder, start spatialmath.Pose, speed float64, guard *floorGuard) error {
+	const radius = 50.0 // mm
+	if err := guard.checkCircle(start, radius); err != nil {
+		return err
+	}
 	omega := speed / radius
 	at := func(theta float64) spatialmath.Pose {
 		return spatialmath.NewPose(start.Point().Add(r3.Vector{X: radius * math.Cos(theta), Y: radius * math.Sin(theta)}), start.Orientation())

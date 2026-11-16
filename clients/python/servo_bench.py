@@ -6,6 +6,8 @@
 
 Usage (sim, local plaintext listener):
   uv run clients/python/servo_bench.py --address 127.0.0.1:<port> --insecure --arm pick-arm --joint-deg-s 60
+Level 1 (hardware):
+  uv run clients/python/servo_bench.py --address … --arm follower-arm --task pointing --joint-deg-s 30 --linear-mm-s 40 --angular-deg-s 20 --timeout-ms 300 --twist-mm-s 30 --circle-mm-s 32 --resync-deg <from check 4> --singular-eps 0.03 --max-damping 0.05
 With API keys instead: export VIAM_API_KEY_ID / VIAM_API_KEY and drop --insecure.
 Spec: docs/superpowers/specs/2026-11-15-diff-ik-phase2-design.md, "Measurements".
 """
@@ -19,6 +21,7 @@ import sys
 import time
 
 FAILS: list[str] = []
+MOTION_EPS = 0.05  # deg; --motion-eps-deg. Use ≥ 2 encoder counts on hardware (STS3215 count = 0.088°).
 
 
 def report(metric: str, value: str, bar: str = "report", ok: bool | None = None) -> None:
@@ -28,16 +31,18 @@ def report(metric: str, value: str, bar: str = "report", ok: bool | None = None)
     print(f"{metric:<38} {value:<26} {bar:<20} {mark}", flush=True)
 
 
-def moved(q0: list[float], q: list[float], eps: float = 0.05) -> bool:
+def moved(q0: list[float], q: list[float], eps: float | None = None) -> bool:
+    eps = MOTION_EPS if eps is None else eps
     return any(abs(a - b) > eps for a, b in zip(q0, q))
 
 
-def first_stationary(samples: list[tuple[float, list[float]]], after: float, eps: float = 0.05,
+def first_stationary(samples: list[tuple[float, list[float]]], after: float, eps: float | None = None,
                      window: float = 0.1) -> float | None:
     """Time of the first sample after `after` from which every joint stays within eps for `window` seconds.
 
     A time window, not a sample count: polls over loopback arrive ~1 ms apart, so consecutive
     samples of a moving arm differ by far less than eps."""
+    eps = MOTION_EPS if eps is None else eps
     s = [x for x in samples if x[0] >= after]
     for i, (t, q) in enumerate(s):
         if s[-1][0] < t + window:
@@ -100,9 +105,19 @@ class Poller:
                 pass
 
 
+def level_limits(args) -> dict:
+    lim = {"joint_deg_s": args.joint_deg_s}
+    for key, val in (("linear_mm_s", args.linear_mm_s), ("angular_deg_s", args.angular_deg_s),
+                     ("resync_deg", args.resync_deg), ("singular_eps", args.singular_eps),
+                     ("max_damping", args.max_damping), ("tol_mm", args.tol_mm)):
+        if val is not None:
+            lim[key] = val
+    return lim
+
+
 def start_kw(args, **kw):
     base = {"command": "servo_start", "component_name": args.arm, "frame": f"{args.arm}_origin",
-            "limits": {"joint_deg_s": args.joint_deg_s}}
+            "rate_hz": args.rate, "limits": level_limits(args)}
     if args.task:
         base["task"] = args.task
     base.update(kw)
@@ -201,7 +216,7 @@ async def stop_latency(svc, arm2, args) -> None:
     sid = (await svc.do_command(start_kw(args, mode="twist")))["session_id"]
     poll = Poller(arm2)
     poll.start()
-    await twist_for(svc, sid, [50, 0, 0], 1.0)
+    await twist_for(svc, sid, [args.twist_mm_s, 0, 0], 1.0)
     p_before = await arm2.get_end_position()
     t0 = time.monotonic()
     fin = await cmd(svc, command="servo_stop", session_id=sid)
@@ -215,15 +230,16 @@ async def stop_latency(svc, arm2, args) -> None:
     d = math.dist((p_before.x, p_before.y, p_before.z), (p_after.x, p_after.y, p_after.z))
     report("travel after stop sent", f"{d:.1f} mm")
     report("stop final state", fin["state"], "stopped", fin["state"] == "stopped")
+    report("ideal ramp travel", f"{args.twist_mm_s * 0.2 / 2:.1f} mm")  # ramp_ms default 200 (module.go)
 
 
 async def deadman(svc, arm2, args) -> None:
-    timeout_ms, ramp_ms, rate = 500, 200, 50
+    timeout_ms, ramp_ms, rate = args.timeout_ms, 200, args.rate
     sid = (await svc.do_command(start_kw(args, mode="twist", timeout_ms=timeout_ms, ramp_ms=ramp_ms,
                                          rate_hz=rate)))["session_id"]
     poll = Poller(arm2)
     poll.start()
-    t_last = await twist_for(svc, sid, [-50, 0, 0], 1.0)
+    t_last = await twist_for(svc, sid, [-args.twist_mm_s, 0, 0], 1.0)
     t_to = None
     while time.monotonic() - t_last < 3:
         st = await cmd(svc, command="servo_status", session_id=sid)
@@ -240,21 +256,18 @@ async def deadman(svc, arm2, args) -> None:
     report("last cmd → arm stationary", "never" if still is None else f"{(still - t_last) * 1000:.0f} ms")
 
 
-async def circle(svc, arm2, args, resync: float | None, home=None) -> None:
-    limits = {"joint_deg_s": args.joint_deg_s}
-    if resync:
-        limits["resync_deg"] = resync
+async def circle(svc, arm2, args, home=None) -> None:
     if home is not None:
         # start every circle from the same joints: the previous run leaves the arm 50 mm out,
         # so chaining circles walks toward the edge of a small arm's reach
         await arm2.move_to_joint_positions(home)
-    r = await svc.do_command(start_kw(args, mode="pose", limits=limits))
+    r = await svc.do_command(start_kw(args, mode="pose"))
     sid, c = r["session_id"], r["pose"]
-    radius, speed = 50.0, 50.0
+    radius, speed = 50.0, args.circle_mm_s
     omega = speed / radius
     laps_t = 2 * 2 * math.pi / omega
     if not await hold_until_converged(svc, sid, dict(c, x=c["x"] + radius)):
-        report(f"circle (resync {resync or 'default'})", "no convergence at start", "converged", False)
+        report(f"circle {speed:.0f} mm/s", "no convergence at start", "converged", False)
         await cmd(svc, command="servo_stop", session_id=sid)
         return
     poll = Poller(arm2, end=True)
@@ -265,7 +278,7 @@ async def circle(svc, arm2, args, resync: float | None, home=None) -> None:
         await cmd(svc, command="servo_target", session_id=sid,
                   pose=dict(c, x=c["x"] + radius * math.cos(th), y=c["y"] + radius * math.sin(th)))
         n += 1
-        await asyncio.sleep(max(0.0, t0 + n / 50 - time.monotonic()))
+        await asyncio.sleep(max(0.0, t0 + n / args.rate - time.monotonic()))
     await poll.stop()
     st = await cmd(svc, command="servo_status", session_id=sid)
     await cmd(svc, command="servo_stop", session_id=sid)
@@ -274,15 +287,12 @@ async def circle(svc, arm2, args, resync: float | None, home=None) -> None:
         th = omega * (ts - t0)
         if 0 <= ts - t0 <= laps_t:
             errs.append(math.dist((x, y, z), (c["x"] + radius * math.cos(th), c["y"] + radius * math.sin(th), c["z"])))
-    label = f"circle resync={resync or 'default'}"
+    label = f"circle {speed:.0f} mm/s"
     if not errs:
         report(f"{label}: samples", "none", "> 0", False)
         return
     mean = statistics.mean(errs)
-    if resync == 15:
-        report(f"{label}: mean error", f"{mean:.1f} mm", "≤ 22.1 mm", mean <= 22.1)
-    else:
-        report(f"{label}: mean error", f"{mean:.1f} mm", "report (P1: 45.8)")
+    report(f"{label}: mean error", f"{mean:.1f} mm", "≤ 22.1 mm", mean <= 22.1)
     report(f"{label}: max error", f"{max(errs):.1f} mm")
     report(f"{label}: resyncs / overruns", f"{st['resyncs']:.0f} / {st['overruns']:.0f}")
     if "pointing_residual_deg" in st:
@@ -298,8 +308,22 @@ async def main() -> int:
     ap.add_argument("--arm", required=True)
     ap.add_argument("--task", default=None, help="pose|pointing (default: the server's default for the arm)")
     ap.add_argument("--joint-deg-s", type=float, default=90)
+    ap.add_argument("--linear-mm-s", type=float, default=None)
+    ap.add_argument("--angular-deg-s", type=float, default=None)
+    ap.add_argument("--rate", type=float, default=50)
+    ap.add_argument("--timeout-ms", type=float, default=500, help="dead-man step's timeout")
+    ap.add_argument("--resync-deg", type=float, default=None)
+    ap.add_argument("--singular-eps", type=float, default=None)
+    ap.add_argument("--max-damping", type=float, default=None)
+    ap.add_argument("--tol-mm", type=float, default=None)
+    ap.add_argument("--twist-mm-s", type=float, default=50, help="stop and dead-man twist speed")
+    ap.add_argument("--circle-mm-s", type=float, default=50)
+    ap.add_argument("--motion-eps-deg", type=float, default=0.05,
+                    help="joint change that counts as motion (latency, stationary); ≥ 0.2 on the real SO-101")
     ap.add_argument("--steps", default="smoke,latency,stop,deadman,circle")
     args = ap.parse_args()
+    global MOTION_EPS
+    MOTION_EPS = args.motion_eps_deg
 
     from viam.components.arm import Arm
     from viam.services.motion import MotionClient
@@ -319,8 +343,7 @@ async def main() -> int:
         if "deadman" in steps:
             await deadman(svc, arm2, args)
         if "circle" in steps:
-            await circle(svc, arm2, args, None, home)
-            await circle(svc, arm2, args, 15, home)
+            await circle(svc, arm2, args, home)
     finally:
         await robot.close()
         await robot2.close()

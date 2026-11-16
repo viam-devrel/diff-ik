@@ -233,6 +233,8 @@ func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}
 			{"resync_deg", &lc.ResyncDeg},
 			{"singular_eps", &lc.SingularEps},
 			{"max_damping", &lc.MaxDamping},
+			{"tol_mm", &lc.TolMM},
+			{"tol_deg", &lc.TolDeg},
 		} {
 			if v, ok := lm[f.key]; ok {
 				n, err := num(v, "limits."+f.key)
@@ -403,6 +405,7 @@ func statusMap(st SessionStatus) map[string]interface{} {
 			"joint_deg_s": js, "linear_mm_s": st.Config.MaxLinearMMPerS,
 			"angular_deg_s": st.Config.MaxAngularDegPerS, "resync_deg": st.Config.ResyncDeg,
 			"singular_eps": st.Config.SingularEps, "max_damping": st.Config.MaxDamping,
+			"tol_mm": st.Config.TolMM, "tol_deg": st.Config.TolDeg,
 		},
 		"tick_p50_ms": ms(st.TickP50), "tick_p99_ms": ms(st.TickP99),
 		"overruns": float64(st.Overruns), "resyncs": float64(st.Resyncs), "damping": st.Damping,
