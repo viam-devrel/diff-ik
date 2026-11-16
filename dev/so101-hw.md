@@ -1,4 +1,4 @@
-# SO-101 hardware runbook — Phase 3c stage 1
+# SO-101 hardware runbook — Phase 3c stages 1 and 2
 
 Spec: `docs/superpowers/specs/2026-11-15-diff-ik-phase3c1-design.md`. Plan: `docs/superpowers/plans/2026-11-15-diff-ik-phase3c1.md`, Part C.
 
@@ -200,3 +200,77 @@ Driver `streamed` lines: all 25 streams in L1 and L2 report late 0 (max 0s). Ser
 | Unreachable pointing | **PASS.** 6.58° against 6.59° predicted; 0.21 mm. |
 
 **Stage 1 complete.** Results: `docs/results/2026-11-phase3c1.md`.
+
+## Stage 2: leader-arm teleop
+
+Spec: `docs/superpowers/specs/2026-11-15-diff-ik-phase3c2-design.md`. Plan: `docs/superpowers/plans/2026-11-15-diff-ik-phase3c2.md`, Part C. The client is `clients/python/teleop.py`. It reads the leader arm's end pose and streams it to the follower through the `servo` service's pose task.
+
+### Setup
+
+- Enable `leader-arm` and `leader-gripper` on `laptop-main`. This is a config change, so get the user's OK and back up the config first.
+- Find the plaintext listener as in stage 1 (section 1). The port changes when the server restarts.
+- **Before every run, park the follower at `q_start`:** `bin/cli --address $ADDR --insecure --arm follower-arm --min-z-mm 30 --start-joints 0,-0.61,0.46,1.39,0 pose`. This is a profiled move, so the stage-1 rules apply: hands ready, and Ctrl-C won't stop it. The client refuses to start if the follower is below the floor. Put the leader roughly in the same pose too, so the engage move is short.
+- Check that both arms' calibrated limits match. Run `bin/cli … --arm leader-arm pose` and `bin/cli … --arm follower-arm pose` without `--start-joints`, so nothing moves. Record both outputs here.
+
+### Safety
+
+- **The leader goes limp when the client releases it.** Hold it, or rest it on a support, before pressing Enter.
+- **Keep a hand near the follower's power switch** for every run.
+- **Ctrl-C stops the follower** through `servo_stop`. The client prints "stopping, wait…", re-torques the leader, and ignores a second Ctrl-C until that is done.
+- **If the client crashes,** the follower stops within 300 ms (the dead-man timeout), but the leader falls because nothing re-torques it. SIGTERM (a plain `kill`) takes the same clean exit as Ctrl-C. A hung RPC becomes an error after 0.5 s and also exits cleanly.
+- **Keep the fast move bounded:** at or under about 300 mm/s, and for no more than about 0.5 s.
+
+### Commands
+
+Set `ADDR=127.0.0.1:<port>`. Check the read timing first. This only reads the leader, and the follower doesn't move.
+
+```
+uv run clients/python/teleop.py --address $ADDR --insecure --dry-run
+```
+
+If it reports "DOES NOT FIT", add `--rate 40` (or 30) to every session command, record the rate here, and judge "tick p99 < period" against the new period.
+
+Smoke run (10 s) with the leader still torqued, so it never goes limp. It checks engage and rest convergence on the real follower. The gripper mirror is off in this mode.
+
+```
+uv run clients/python/teleop.py --address $ADDR --insecure --no-release --duration 10 --csv .runs/3c2-smoke
+```
+
+The tuned-profile session (60 s):
+
+```
+uv run clients/python/teleop.py --address $ADDR --insecure --csv .runs/3c2-tuned --duration 60
+```
+
+The smooth-profile session (60 s), after switching `follower-arm` to `servo_gain_profile: "smooth"`:
+
+```
+uv run clients/python/teleop.py --address $ADDR --insecure --csv .runs/3c2-smooth --duration 60 --tol-mm 13 --tol-deg 5
+```
+
+Analyse a run:
+
+```
+uv run clients/python/teleop_lag.py .runs/3c2-tuned
+```
+
+### Protocol
+
+Each run lasts about 60 s: slow sweeps, one bounded fast move, pick-like motions with the gripper, then rest the leader on a support above the floor for at least 2 s.
+
+- **Engage:** rest the leader on a support. Engage ends once the follower is within 10 mm and 5° of the leader for 0.2 s (30 s timeout). Keep the leader roughly still until it has caught up.
+- **Smooth profile:** about 11 mm of droop at a target clamped to floor + 15 mm leaves only about 4 mm before the floor watchdog trips. Keep the leader well above the table.
+- **Ctrl-C:** the client prints "stopping, wait…" and ignores a second Ctrl-C until the leader is re-torqued.
+
+### After every run
+
+Read the driver's `streamed … late` lines with `read_machine_logs`. The bar is 0 late.
+
+### Results log
+
+(Filled in during Part C.)
+
+**Hardware log (2026-11-15).** Full results are in `docs/results/2026-11-phase3c2.md`.
+- **Calibrated limits** (leader / follower, deg): j0 −101.6…134.9 / −116.0…109.2; j1 −105.8…102.9 / −98.5…106.1; j2 −98.3…95.6 / −110.2…84.8; j3 −111.3…93.5 / −108.2…107.4; j4 −167.6…169.6 / −172.6…176.5. The leader's folded rest pose is outside the follower's range.
+- **Dry run:** leader read p50 1.8 ms, p99 2.6 ms, so 50 Hz fits.
+- **Settings used:** `--linear-mm-s 150 --joint-deg-s 90 --angular-deg-s 45 --resync-deg 16.2 --min-z-mm -10`, plus `--tol-mm 13 --tol-deg 5` for `smooth`.
