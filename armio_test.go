@@ -140,3 +140,47 @@ func TestArmIOStopCancelsAfterDrainWindow(t *testing.T) {
 		t.Fatal("hung stream was not cancelled")
 	}
 }
+
+// leadArm records the first batch's point times.
+type leadArm struct {
+	arm.Arm
+	times chan []time.Duration
+}
+
+func (l *leadArm) MoveThroughJointPositionsStreamed(ctx context.Context, b <-chan []arm.TrajectoryPoint, r chan<- arm.Response, extra map[string]interface{}) error {
+	batch := <-b
+	ts := make([]time.Duration, len(batch))
+	for i, p := range batch {
+		ts[i] = p.Time
+	}
+	l.times <- ts
+	for range b {
+	}
+	return nil
+}
+
+func (l *leadArm) Stop(context.Context, map[string]interface{}) error { return nil }
+
+func TestArmIOLeadSetsPointTime(t *testing.T) {
+	l := &leadArm{Arm: fakeUR5e(t), times: make(chan []time.Duration, 1)}
+	io := NewArmIOLead(l, 50, 5*time.Millisecond)
+	if err := io.Send(context.Background(), []float64{0, -1.2, 1.5, -1.9, -1.57, 0}); err != nil {
+		t.Fatal(err)
+	}
+	ts := <-l.times
+	if len(ts) != 2 || ts[0] != 0 || ts[1] < 5*time.Millisecond || ts[1] > 15*time.Millisecond {
+		t.Fatalf("point times %v, want [0, ~5ms] (lead 5 ms, not the 20 ms tick)", ts)
+	}
+	if err := io.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArmIODefaultLeadIsCappedAtOneTick(t *testing.T) {
+	if got := NewArmIO(nil, 50).(*armIO).lead; got != DefaultLead {
+		t.Fatalf("50 Hz lead %v, want DefaultLead %v", got, DefaultLead)
+	}
+	if got := NewArmIO(nil, 1000).(*armIO).lead; got != time.Millisecond {
+		t.Fatalf("1 kHz lead %v, want one tick (1 ms)", got)
+	}
+}

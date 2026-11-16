@@ -55,7 +55,7 @@ func (p *pacedArm) Stop(context.Context, map[string]interface{}) error {
 
 func TestProbeHoldsFixedQ0AndPaces(t *testing.T) {
 	p := &pacedArm{}
-	res, err := probeRun(context.Background(), p, 50, 500*time.Millisecond, 20)
+	res, err := probeRun(context.Background(), p, 50, 0, 500*time.Millisecond, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestProbeHoldsFixedQ0AndPaces(t *testing.T) {
 }
 
 func TestProbeRejectsBadRate(t *testing.T) {
-	if _, err := probeRun(context.Background(), &pacedArm{}, 0, time.Second, 1); err == nil {
+	if _, err := probeRun(context.Background(), &pacedArm{}, 0, 0, time.Second, 1); err == nil {
 		t.Fatal("rate 0 accepted")
 	}
 }
@@ -88,7 +88,7 @@ func TestProbeCancelStopsOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(100*time.Millisecond, cancel)
 	t0 := time.Now()
-	_, err := probeRun(ctx, p, 50, 2*time.Second, 5)
+	_, err := probeRun(ctx, p, 50, 0, 2*time.Second, 5)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}

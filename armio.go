@@ -20,8 +20,8 @@ type stream struct {
 // armIO drives a real arm through MoveThroughJointPositionsStreamed.
 // The stream opens on the first Send; each Send adds one waypoint due one tick later.
 type armIO struct {
-	a  arm.Arm
-	dt time.Duration
+	a    arm.Arm
+	lead time.Duration // how far ahead of now each point is stamped
 
 	batches chan []arm.TrajectoryPoint
 	s       *stream
@@ -30,9 +30,25 @@ type armIO struct {
 	lastT   time.Duration
 }
 
-// NewArmIO returns a JointIO for a, pacing waypoints at rateHz.
+// DefaultLead is how far ahead of now each streamed waypoint is stamped. On the real SO-101
+// (laptop-local client, 50 Hz) 5 ms took ~15 ms off the lag of a one-tick lead with 0 late
+// points (docs/results/2026-11-phase3c1.md). ponytail: a global default from one setup; if a
+// slower host or remote client logs late points, make it a servo_start option.
+const DefaultLead = 5 * time.Millisecond
+
+// NewArmIO returns a JointIO for a, stamping each waypoint DefaultLead ahead (at most one tick).
 func NewArmIO(a arm.Arm, rateHz float64) JointIO {
-	return &armIO{a: a, dt: time.Duration(float64(time.Second) / rateHz)}
+	return NewArmIOLead(a, rateHz, 0)
+}
+
+// NewArmIOLead is NewArmIO with each waypoint stamped lead ahead of now; lead <= 0 means
+// DefaultLead. The lead is capped at one tick (1/rateHz). A shorter lead cuts streaming lag,
+// at the risk of the driver receiving points late (the so-101 driver logs them).
+func NewArmIOLead(a arm.Arm, rateHz float64, lead time.Duration) JointIO {
+	if lead <= 0 {
+		lead = DefaultLead
+	}
+	return &armIO{a: a, lead: min(lead, time.Duration(float64(time.Second)/rateHz))}
 }
 
 func (io *armIO) Read(ctx context.Context) ([]referenceframe.Input, error) {
@@ -49,7 +65,7 @@ func (io *armIO) Send(ctx context.Context, q []referenceframe.Input) error {
 		io.open()
 		batch = append(batch, arm.TrajectoryPoint{Time: 0, Positions: cur}) // first point must be t=0
 	}
-	t := time.Since(io.start) + io.dt
+	t := time.Since(io.start) + io.lead
 	if t <= io.lastT {
 		t = io.lastT + time.Microsecond // times must strictly increase
 	}

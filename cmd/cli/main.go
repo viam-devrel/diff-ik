@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"time"
 
 	"diffik"
 	"go.viam.com/rdk/components/arm"
@@ -54,6 +55,7 @@ func realMain() error {
 	maxAng := flag.Float64("max-angular-deg-s", 0, "run: angular speed limit (0 = loop default 45)")
 	tolMM := flag.Float64("tol-mm", 0, "run: convergence position tolerance (0 = loop default 2)")
 	circleMMs := flag.Float64("circle-mm-s", 50, "circle: speed around the circle (mm/s)")
+	leadMS := flag.Float64("lead-ms", 0, "run/probe: stamp each streamed point this far ahead (ms; 0 = diffik.DefaultLead, 5 ms; capped at one tick)")
 	startJoints := flag.String("start-joints", "", "comma-separated joint angles (rad): run/validate/probe first make a guarded profiled move here")
 	flag.Parse()
 	args := flag.Args()
@@ -142,12 +144,12 @@ func realMain() error {
 	case args[0] == "validate":
 		return validate(ctx, sa, model, *spread, *settleTol, guard)
 	case args[0] == "probe" && len(args) == 1:
-		return probe(ctx, sa, *rate)
+		return probe(ctx, sa, *rate, msDur(*leadMS))
 	case args[0] == "run" && len(args) == 2:
 		return run(ctx, sa, model, args[1], runOpts{
 			rate: *rate, csvPath: *csvPath, wrist: *wrist, maxJointDegS: *maxDegS, maxLinear: *maxLin, maxAngular: *maxAng,
 			resync: *resyncDeg, tolMM: *tolMM, task: *task, singEps: *singEps, maxDamp: *maxDamp, singDeg: *singDeg,
-			hold: *hold, circleMMs: *circleMMs, guard: guard,
+			hold: *hold, circleMMs: *circleMMs, guard: guard, lead: msDur(*leadMS),
 		})
 	default:
 		return errors.New(usage)
@@ -173,3 +175,5 @@ func parseJoints(s string, limits []referenceframe.Limit) ([]float64, error) {
 	}
 	return q, nil
 }
+
+func msDur(ms float64) time.Duration { return time.Duration(ms * float64(time.Millisecond)) }

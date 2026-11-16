@@ -76,6 +76,7 @@ type runOpts struct {
 	singEps, maxDamp, singDeg                   float64
 	hold                                        time.Duration
 	circleMMs                                   float64
+	lead                                        time.Duration
 	guard                                       *floorGuard
 }
 
@@ -120,7 +121,7 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 			cfg.MaxJointDegPerS = append(cfg.MaxJointDegPerS, o.maxJointDegS)
 		}
 	}
-	l, err := diffik.NewLoop(model, diffik.NewArmIO(a, o.rate), cfg)
+	l, err := diffik.NewLoop(model, diffik.NewArmIOLead(a, o.rate, o.lead), cfg)
 	if err != nil {
 		return err
 	}

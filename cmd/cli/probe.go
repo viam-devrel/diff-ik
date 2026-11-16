@@ -32,7 +32,7 @@ type probeResult struct {
 
 // probeRun times nReads back-to-back joint reads, then a ticker-paced read+send loop at rateHz
 // for dur that holds a fixed q0 read once at the start (spec 3c1 "probe").
-func probeRun(ctx context.Context, a arm.Arm, rateHz float64, dur time.Duration, nReads int) (probeResult, error) {
+func probeRun(ctx context.Context, a arm.Arm, rateHz float64, lead, dur time.Duration, nReads int) (probeResult, error) {
 	var res probeResult
 	if !(rateHz > 0) {
 		return res, fmt.Errorf("rate must be > 0, got %v", rateHz)
@@ -51,7 +51,7 @@ func probeRun(ctx context.Context, a arm.Arm, rateHz float64, dur time.Duration,
 	if err != nil {
 		return res, err
 	}
-	io := diffik.NewArmIO(a, rateHz)
+	io := diffik.NewArmIOLead(a, rateHz, lead)
 	period := time.Duration(float64(time.Second) / rateHz)
 	tk := time.NewTicker(period)
 	defer tk.Stop()
@@ -94,8 +94,8 @@ func probeRun(ctx context.Context, a arm.Arm, rateHz float64, dur time.Duration,
 	return res, stopErr
 }
 
-func probe(ctx context.Context, a arm.Arm, rateHz float64) error {
-	res, err := probeRun(ctx, a, rateHz, 10*time.Second, 500)
+func probe(ctx context.Context, a arm.Arm, rateHz float64, lead time.Duration) error {
+	res, err := probeRun(ctx, a, rateHz, lead, 10*time.Second, 500)
 	fmt.Printf("reads:    n %d  p50 %v  p99 %v\n", res.reads.n, res.reads.p50, res.reads.p99)
 	fmt.Printf("read+send at %.0f Hz: n %d  p50 %v  p99 %v  overruns %d\n", rateHz, res.ticks.n, res.ticks.p50, res.ticks.p99, res.overruns)
 	period := time.Duration(float64(time.Second) / rateHz)
