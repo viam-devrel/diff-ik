@@ -15,6 +15,7 @@ import (
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
+	"go.viam.com/rdk/robot/framesystem"
 	"go.viam.com/rdk/spatialmath"
 	"gonum.org/v1/gonum/num/quat"
 )
@@ -74,6 +75,7 @@ var errUnknownSession = errors.New("unknown session_id")
 
 // poseTransformer is the part of framesystem.Service a session needs.
 type poseTransformer interface {
+	FrameSystemConfig(ctx context.Context) (*framesystem.Config, error)
 	TransformPose(ctx context.Context, pose *referenceframe.PoseInFrame, dst string,
 		supplementalTransforms []*referenceframe.LinkInFrame) (*referenceframe.PoseInFrame, error)
 }
@@ -86,6 +88,10 @@ type SessionConfig struct {
 	Loop    LoopConfig
 	Timeout time.Duration // dead-man
 	Ramp    time.Duration
+	Frames  bool         // build a local frame system at start so servo_target can take a camera frame
+	Filter  TargetFilter // the zero value means DefaultTargetFilter
+
+	NoPointVelocities bool // armIO only: stream positions without per-point target velocities
 }
 
 // SessionStatus is a snapshot of a session, live or final.
@@ -94,6 +100,16 @@ type SessionStatus struct {
 	Config      LoopConfig
 	LastCmdAge  time.Duration
 	RollIgnored bool // servo_twist only: an angular component about the tool axis was dropped (pointing mode)
+	Filter      TargetFilter
+	Clamps      int // targets the floor clamp has raised
+}
+
+// TargetResult is servo_target's outcome. Raw is the target in the session frame before the filter,
+// Target after it (equal to Raw for apply:false).
+type TargetResult struct {
+	Status      SessionStatus
+	Target, Raw spatialmath.Pose
+	Clamped     bool
 }
 
 // session is one arm's servo session: a loop plus the protocol state around it.
@@ -109,8 +125,18 @@ type session struct {
 	logger        logging.Logger
 	armName       string
 
+	// Set once in start() and read-only after, so the frame transform needs no s.mu.
+	fs     *referenceframe.FrameSystem // nil unless Frames
+	frame  string                      // the session frame
+	startQ []float64
+	zeroIn referenceframe.FrameSystemInputs // computed once: NewZeroInputs fills a cache lazily, unsynchronised
+	ff     bool
+	cmu    sync.Mutex
+	chains map[string]error // checkChain results per frame, under cmu
+
 	mu       sync.Mutex
 	est      velEstimator
+	filt     *targetFilter
 	lastCmd  time.Time
 	stopping State // non-empty once a stop has begun: the final state it will end in
 	final    SessionStatus
@@ -179,6 +205,15 @@ func (s *session) onTick(Status) {
 	}
 }
 
+// touch refreshes the dead-man without a command (teleop_status polling).
+func (s *session) touch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopping == "" {
+		s.lastCmd = s.now()
+	}
+}
+
 func (s *session) usable(m Mode) error {
 	if s.ended() {
 		return s.endedErr()
@@ -189,23 +224,81 @@ func (s *session) usable(m Mode) error {
 	return nil
 }
 
-// target handles servo_target: p is in the session frame, in mm.
-func (s *session) target(p spatialmath.Pose) (SessionStatus, error) {
-	if err := s.usable(ModePose); err != nil {
-		return SessionStatus{}, err
+// checkChain reports (cached per frame) whether frame can be transformed with every component but the
+// session's arm at zero inputs: it must exist and hang off the arm or static frames only.
+func (s *session) checkChain(frame string) error {
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	if err, ok := s.chains[frame]; ok {
+		return err
 	}
-	pb := spatialmath.Compose(spatialmath.PoseInverse(s.twb), p)
+	err := func() error {
+		f := s.fs.Frame(frame)
+		if f == nil {
+			return fmt.Errorf("unknown frame %q", frame)
+		}
+		chain, err := s.fs.TracebackFrame(f)
+		if err != nil {
+			return fmt.Errorf("frame %q: %w", frame, err)
+		}
+		for _, c := range chain {
+			if c.Name() != s.armName && len(c.DoF()) > 0 {
+				return fmt.Errorf("frame %q is attached to movable frame %q (only the session's arm is supported)", frame, c.Name())
+			}
+		}
+		return nil
+	}()
+	s.chains[frame] = err
+	return err
+}
+
+// target handles servo_target: p is in frame (the session frame when empty), in mm. With apply false it
+// only transforms p and reports it.
+func (s *session) target(p spatialmath.Pose, frame string, apply bool) (TargetResult, error) {
+	if err := s.usable(ModePose); err != nil {
+		return TargetResult{}, err
+	}
+	// 1. transform: local computation, no RPC, no s.mu
+	if frame != "" && frame != s.frame {
+		if s.fs == nil {
+			return TargetResult{}, errors.New("servo_target frame requires servo_start frames: true")
+		}
+		if err := s.checkChain(frame); err != nil {
+			return TargetResult{}, err
+		}
+		q := s.loop.Status().QMeas
+		if len(q) == 0 {
+			q = s.startQ
+		}
+		in := maps.Clone(s.zeroIn)
+		in[s.armName] = q
+		tf, err := s.fs.Transform(in.ToLinearInputs(), referenceframe.NewPoseInFrame(frame, p), s.frame)
+		if err != nil {
+			return TargetResult{}, fmt.Errorf("transforming target from %q: %w", frame, err)
+		}
+		p = tf.(*referenceframe.PoseInFrame).Pose()
+	}
+	raw := p
+	if !apply {
+		// Intentionally allowed while stopping: a preview moves nothing.
+		return TargetResult{Status: SessionStatus{Status: s.loop.Status(), Config: s.loop.Config()}, Target: raw, Raw: raw}, nil
+	}
+	pb := spatialmath.Compose(spatialmath.PoseInverse(s.twb), p) // base frame: the floor is defined there
 	s.mu.Lock()
 	if s.stopping != "" {
 		defer s.mu.Unlock()
-		return SessionStatus{}, fmt.Errorf("session stopping: %s", s.stopping)
+		return TargetResult{}, fmt.Errorf("session stopping: %s", s.stopping)
 	}
 	now := s.now()
-	v := s.est.update(now, pb)
+	fb, clamped := s.filt.apply(now, pb)
+	v := s.est.update(now, fb)
+	if !s.ff {
+		v = [6]float64{}
+	}
 	s.lastCmd = now
-	s.loop.SetMotion(pb, v) // under s.mu so concurrent commands apply in lastCmd order
+	s.loop.SetMotion(fb, v) // under s.mu so concurrent commands apply in lastCmd order
 	s.mu.Unlock()
-	return s.status(), nil
+	return TargetResult{Status: s.status(), Target: spatialmath.Compose(s.twb, fb), Raw: raw, Clamped: clamped}, nil
 }
 
 // twist handles servo_twist: lin (m/s) and ang (rad/s) are in the session frame.
@@ -267,9 +360,9 @@ func (s *session) status() SessionStatus {
 		return s.final
 	}
 	s.mu.Lock()
-	age := s.now().Sub(s.lastCmd)
+	age, filt, clamps := s.now().Sub(s.lastCmd), s.filt.cfg, s.filt.clamps
 	s.mu.Unlock()
-	return SessionStatus{Status: s.loop.Status(), Config: s.loop.Config(), LastCmdAge: age}
+	return SessionStatus{Status: s.loop.Status(), Config: s.loop.Config(), LastCmdAge: age, Filter: filt, Clamps: clamps}
 }
 
 // servoManager owns the sessions, at most one live session per arm.
@@ -310,6 +403,12 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 	if s := m.byArm[armName]; s != nil && !s.ended() {
 		return nil, nil, fmt.Errorf("arm %s busy", armName)
 	}
+	if cfg.Filter == (TargetFilter{}) {
+		cfg.Filter = DefaultTargetFilter()
+	}
+	if err := cfg.Filter.validate(); err != nil {
+		return nil, nil, err
+	}
 	var twb spatialmath.Pose
 	switch cfg.Frame {
 	case referenceframe.World:
@@ -332,6 +431,9 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 		cfg.Loop.MaxJointDegPerS = slices.Repeat(js, len(model.DoF()))
 	}
 	io := m.newIO(a, cfg.Loop.RateHz)
+	if aio, ok := io.(*armIO); ok { // newIO is per session; test fakes aren't armIOs
+		aio.pointVel = !cfg.NoPointVelocities
+	}
 	l, err := NewLoop(model, io, cfg.Loop)
 	if err != nil {
 		return nil, nil, err
@@ -346,12 +448,32 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 		return nil, nil, err
 	}
 	l.SetTarget(fk)
+	var fsys *referenceframe.FrameSystem
+	var zeroIn referenceframe.FrameSystemInputs
+	if cfg.Frames {
+		cfgFS, err := m.fs.FrameSystemConfig(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("reading the frame system: %w", err)
+		}
+		if fsys, err = referenceframe.NewFrameSystem("servo", cfgFS.Parts, nil); err != nil {
+			return nil, nil, fmt.Errorf("building the frame system: %w", err)
+		}
+		if fsys.Frame(armName) == nil {
+			return nil, nil, fmt.Errorf("arm %s is not in the frame system", armName)
+		}
+		if n := len(fsys.Frame(armName).DoF()); n != len(q) {
+			return nil, nil, fmt.Errorf("arm %s frame has %d DoF, arm reports %d joints", armName, n, len(q))
+		}
+		zeroIn = referenceframe.NewZeroInputs(fsys)
+	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	s := &session{
 		id: rand.Text(), mode: cfg.Mode, loop: l, twb: twb, now: m.now,
 		timeout: cfg.Timeout, ramp: cfg.Ramp, done: make(chan struct{}), cancel: cancel, logger: m.logger, armName: armName,
 		est:     velEstimator{maxLin: l.cfg.MaxLinearMMPerS / mmPerM, maxAng: deg2rad(l.cfg.MaxAngularDegPerS)},
 		lastCmd: m.now(),
+		fs:      fsys, frame: cfg.Frame, startQ: q, zeroIn: zeroIn, chains: map[string]error{},
+		filt: newTargetFilter(cfg.Filter), ff: cfg.Filter.Feedforward,
 	}
 	l.OnTick = s.onTick
 	m.byArm[armName] = s
@@ -370,6 +492,13 @@ func (m *servoManager) get(id string) (*session, error) {
 		}
 	}
 	return nil, errUnknownSession
+}
+
+// current is armName's session, live or ended, or nil.
+func (m *servoManager) current(armName string) *session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.byArm[armName]
 }
 
 func (m *servoManager) busy(armName string) bool {

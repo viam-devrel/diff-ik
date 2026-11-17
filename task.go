@@ -102,20 +102,61 @@ func prioritySolve(J1, J2 *mat.Dense, dx1, dx2 []float64, eps, maxDamping float6
 }
 
 // pointingReach splits pointing error e2 (rad) into the part J2·N1 can still reduce and the
-// residual it can't: |e2_reach| and |e2 − e2_reach| (spec "Achievable pointing").
-func pointingReach(J1, J2 *mat.Dense, e2 [2]float64) (reach, residual float64, err error) {
+// residual it can't: |e2_reach| and |e2 − e2_reach| (spec "Achievable pointing"). A joint within
+// limitEps of a limit in [lo, hi] whose reducing step would push it further out is locked (its
+// column zeroed in J1 and J2) and the split is recomputed. lo/hi nil: no limits.
+func pointingReach(J1, J2 *mat.Dense, e2 [2]float64, q, lo, hi []float64) (reach, residual float64, err error) {
+	reach, residual, dq, err := pointingSplit(J1, J2, e2)
+	if err != nil || lo == nil {
+		return reach, residual, err
+	}
+	J1, J2 = mat.DenseCopyOf(J1), mat.DenseCopyOf(J2)
+	if !lockOutward(J1, J2, dq, q, lo, hi) {
+		return reach, residual, nil
+	}
+	reach, residual, _, err = pointingSplit(J1, J2, e2)
+	return reach, residual, err
+}
+
+// limitEps: a joint within this of its limit with an outward step is locked (lockOutward), so it
+// won't cover that last <0.5 deg toward the limit.
+const limitEps = 0.5 * math.Pi / 180 // rad
+
+// lockOutward zeroes (in place) the J1/J2 columns of joints within limitEps of a limit whose step dq
+// pushes further out (|dq| > 1e-12). Reports whether any column was zeroed.
+func lockOutward(J1, J2 *mat.Dense, dq, q, lo, hi []float64) bool {
+	any := false
+	for i, d := range dq {
+		if (d > 1e-12 && q[i] >= hi[i]-limitEps) || (d < -1e-12 && q[i] <= lo[i]+limitEps) {
+			for r := 0; r < 3; r++ {
+				J1.Set(r, i, 0)
+			}
+			for r := 0; r < 2; r++ {
+				J2.Set(r, i, 0)
+			}
+			any = true
+		}
+	}
+	return any
+}
+
+// pointingSplit is the limit-blind split; dq is the null-space joint step that would reduce e2.
+func pointingSplit(J1, J2 *mat.Dense, e2 [2]float64) (reach, residual float64, dq []float64, err error) {
 	N1, err := nullProjector(J1)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	var J2N, proj mat.Dense
 	J2N.Mul(J2, N1)
 	P, _, _, _, err := dpinv(&J2N, 1, 0, false)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	proj.Mul(&J2N, P)
-	var er mat.VecDense
-	er.MulVec(&proj, mat.NewVecDense(2, e2[:]))
-	return er.Norm(2), math.Hypot(e2[0]-er.AtVec(0), e2[1]-er.AtVec(1)), nil
+	e := mat.NewVecDense(2, e2[:])
+	var er, q0, q mat.VecDense
+	er.MulVec(&proj, e)
+	q0.MulVec(P, e)
+	q.MulVec(N1, &q0)
+	return er.Norm(2), math.Hypot(e2[0]-er.AtVec(0), e2[1]-er.AtVec(1)), q.RawVector().Data, nil
 }

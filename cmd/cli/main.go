@@ -41,7 +41,8 @@ func realMain() error {
 	csvPath := flag.String("csv", "", "write one row per tick to this file (run only)")
 	spread := flag.Float64("spread", 0.1, "validate: fraction of each joint's half-range to sample around the start pose")
 	maxDegS := flag.Float64("max-joint-deg-s", 0, "run: per-joint velocity limit in deg/s (0 = loop default 90)")
-	resyncDeg := flag.Float64("resync-deg", 0, "run: q_cmd/q_meas divergence in deg before resync (0 = loop default 3 ticks at max speed)")
+	resyncDeg := flag.Float64("resync-deg", 0, "run: allowed divergence in deg between q_meas and where the arm should be given its measured lag, before resync (0 = loop default 3 ticks at max speed). The q_cmd - q_meas gap, and so a resync snap, can reach lag travel + this")
+	maxLagMS := flag.Float64("max-lag-ms", 0, "run: longest arm lag the loop treats as lag; lag_ms is capped here and a bigger gap is divergence (0 = loop default 300, max 1000). If the arm never moves, the command can run this far ahead before the first resync")
 	wrist := flag.Int("wrist", 4, "singular: index of the joint whose --singular-deg angle is singular (UR5e wrist: 4; SO-101 elbow: 2)")
 	task := flag.String("task", "", "run: task mode, pose|pointing (default: pointing if the arm has < 6 joints, else pose)")
 	singEps := flag.Float64("singular-eps", 0, "run: Chiaverini threshold ε (0 = loop default 0.04)")
@@ -149,7 +150,7 @@ func realMain() error {
 	case args[0] == "run" && len(args) == 2:
 		return run(ctx, sa, model, args[1], runOpts{
 			rate: *rate, csvPath: *csvPath, wrist: *wrist, maxJointDegS: *maxDegS, maxLinear: *maxLin, maxAngular: *maxAng,
-			resync: *resyncDeg, tolMM: *tolMM, tolDeg: *tolDeg, task: *task, singEps: *singEps, maxDamp: *maxDamp, singDeg: *singDeg,
+			resync: *resyncDeg, maxLagMS: *maxLagMS, tolMM: *tolMM, tolDeg: *tolDeg, task: *task, singEps: *singEps, maxDamp: *maxDamp, singDeg: *singDeg,
 			hold: *hold, circleMMs: *circleMMs, guard: guard, lead: msDur(*leadMS),
 		})
 	default:

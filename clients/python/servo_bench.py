@@ -121,6 +121,8 @@ def start_kw(args, **kw):
             "rate_hz": args.rate, "limits": level_limits(args)}
     if args.task:
         base["task"] = args.task
+    if args.no_point_velocities:
+        base["point_velocities"] = False
     base.update(kw)
     return base
 
@@ -308,6 +310,8 @@ async def main() -> int:
     ap.add_argument("--service", default="servo")
     ap.add_argument("--arm", required=True)
     ap.add_argument("--task", default=None, help="pose|pointing (default: the server's default for the arm)")
+    ap.add_argument("--no-point-velocities", action="store_true",
+                    help="servo_start point_velocities=false (A/B: stream positions without per-point velocities)")
     ap.add_argument("--joint-deg-s", type=float, default=90)
     ap.add_argument("--linear-mm-s", type=float, default=None)
     ap.add_argument("--angular-deg-s", type=float, default=None)

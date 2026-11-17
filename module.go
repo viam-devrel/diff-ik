@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/golang/geo/r3"
@@ -34,6 +35,8 @@ func init() {
 // Config lists the arms this service may servo.
 type Config struct {
 	Arms []string `json:"arms"`
+	// Teleop holds servo_start defaults (limits, rate_hz, timeout_ms, ...) for viam:teleop sessions.
+	Teleop map[string]interface{} `json:"teleop,omitempty"`
 }
 
 // Validate requires at least one arm and no duplicates, and returns the arms as dependencies.
@@ -58,6 +61,12 @@ type diffIkServo struct {
 	name   resource.Name
 	logger logging.Logger
 	m      *servoManager
+
+	teleopConf map[string]interface{}
+	startMu    sync.Mutex // serialises teleop_start
+	tmu        sync.Mutex // guards teleop and teleopErr
+	teleop     map[string]*teleopEntry
+	teleopErr  string // an ended session's reason, reported once by teleop_status
 }
 
 func newDiffIkServo(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (motion.Service, error) {
@@ -82,11 +91,13 @@ func NewServo(ctx context.Context, deps resource.Dependencies, name resource.Nam
 	if err != nil {
 		return nil, err
 	}
-	return newServo(name, logger, newServoManager(arms, fs, logger)), nil
+	srv := newServo(name, logger, newServoManager(arms, fs, logger))
+	srv.teleopConf = conf.Teleop
+	return srv, nil
 }
 
 func newServo(name resource.Name, logger logging.Logger, m *servoManager) *diffIkServo {
-	return &diffIkServo{name: name, logger: logger, m: m}
+	return &diffIkServo{name: name, logger: logger, m: m, teleop: map[string]*teleopEntry{}}
 }
 
 func (s *diffIkServo) Name() resource.Name { return s.name }
@@ -108,6 +119,9 @@ func (s *diffIkServo) Close(ctx context.Context) error { return s.m.close(ctx) }
 
 // DoCommand implements the servo protocol. See docs/superpowers/specs/2026-11-15-diff-ik-phase2-design.md.
 func (s *diffIkServo) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	if isTeleop(cmd) {
+		return s.teleopCommand(ctx, cmd)
+	}
 	name, ok := cmd["command"].(string)
 	if !ok {
 		return nil, errors.New("command is required")
@@ -138,11 +152,24 @@ func (s *diffIkServo) DoCommand(ctx context.Context, cmd map[string]interface{})
 		if err != nil {
 			return nil, err
 		}
-		st, err := sess.target(p)
+		frame, err := optString(cmd, "frame", "")
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{"state": string(st.State), "err_mm": st.ErrMM, "err_deg": st.ErrDeg}, nil
+		apply, err := optBool(cmd, "apply", true)
+		if err != nil {
+			return nil, err
+		}
+		res, err := sess.target(p, frame, apply)
+		if err != nil {
+			return nil, err
+		}
+		st := res.Status
+		return map[string]interface{}{
+			"state": string(st.State), "err_mm": st.ErrMM, "err_deg": st.ErrDeg,
+			"reach_deg": st.ReachDeg, "pointing_residual_deg": st.PointingResidualDeg,
+			"target": poseMap(res.Target), "target_raw": poseMap(res.Raw), "clamped": res.Clamped,
+		}, nil
 	case "servo_twist":
 		lin, err := vec3(cmd, "linear")
 		if err != nil {
@@ -173,55 +200,63 @@ func (s *diffIkServo) DoCommand(ctx context.Context, cmd map[string]interface{})
 }
 
 func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	sess, pose, err := s.startSession(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"session_id": sess.id, "pose": poseMap(pose)}, nil
+}
+
+func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface{}) (*session, spatialmath.Pose, error) {
 	armName, ok := cmd["component_name"].(string)
 	if !ok || armName == "" {
-		return nil, errors.New("component_name is required")
+		return nil, nil, errors.New("component_name is required")
 	}
 	frame, err := optString(cmd, "frame", referenceframe.World)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	mode, err := optString(cmd, "mode", string(ModePose))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	rate, err := optNum(cmd, "rate_hz", 50)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !(rate >= 1 && rate <= 1000) {
-		return nil, fmt.Errorf("rate_hz must be in [1, 1000], got %v", rate)
+		return nil, nil, fmt.Errorf("rate_hz must be in [1, 1000], got %v", rate)
 	}
 	timeout, err := optNum(cmd, "timeout_ms", 500)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !(timeout > 0 && timeout <= 10000) {
-		return nil, fmt.Errorf("timeout_ms must be in (0, 10000], got %v", timeout)
+		return nil, nil, fmt.Errorf("timeout_ms must be in (0, 10000], got %v", timeout)
 	}
 	ramp, err := optNum(cmd, "ramp_ms", 200)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !(ramp > 0 && ramp <= 5000) {
-		return nil, fmt.Errorf("ramp_ms must be in (0, 5000], got %v", ramp)
+		return nil, nil, fmt.Errorf("ramp_ms must be in (0, 5000], got %v", ramp)
 	}
 	lc := LoopConfig{RateHz: rate}
 	if v, ok := cmd["task"]; ok {
 		t, ok := v.(string)
 		if !ok || (t != TaskPose && t != TaskPointing) {
-			return nil, fmt.Errorf("unsupported task %v: use %q or %q", v, TaskPose, TaskPointing)
+			return nil, nil, fmt.Errorf("unsupported task %v: use %q or %q", v, TaskPose, TaskPointing)
 		}
 		lc.Task = t
 	}
 	if raw, ok := cmd["limits"]; ok {
 		lm, ok := raw.(map[string]interface{})
 		if !ok {
-			return nil, errors.New("limits must be an object")
+			return nil, nil, errors.New("limits must be an object")
 		}
 		if v, ok := lm["joint_deg_s"]; ok {
 			if lc.MaxJointDegPerS, err = numOrList(v, "limits.joint_deg_s"); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		for _, f := range []struct {
@@ -231,6 +266,7 @@ func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}
 			{"linear_mm_s", &lc.MaxLinearMMPerS},
 			{"angular_deg_s", &lc.MaxAngularDegPerS},
 			{"resync_deg", &lc.ResyncDeg},
+			{"max_lag_ms", &lc.MaxLagMS},
 			{"singular_eps", &lc.SingularEps},
 			{"max_damping", &lc.MaxDamping},
 			{"tol_mm", &lc.TolMM},
@@ -239,10 +275,10 @@ func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}
 			if v, ok := lm[f.key]; ok {
 				n, err := num(v, "limits."+f.key)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				if !(n > 0) {
-					return nil, fmt.Errorf("limits.%s must be > 0, got %v", f.key, n)
+					return nil, nil, fmt.Errorf("limits.%s must be > 0, got %v", f.key, n)
 				}
 				*f.dst = n
 			}
@@ -251,35 +287,43 @@ func (s *diffIkServo) servoStart(ctx context.Context, cmd map[string]interface{}
 	if v, ok := cmd["task_weights"]; ok {
 		items, ok := v.([]interface{})
 		if !ok || len(items) != 6 {
-			return nil, fmt.Errorf("task_weights must be 6 numbers >= 0, not all zero, got %v", v)
+			return nil, nil, fmt.Errorf("task_weights must be 6 numbers >= 0, not all zero, got %v", v)
 		}
 		sum := 0.0
 		for i, it := range items {
 			n, err := num(it, "task_weights")
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if n < 0 {
-				return nil, fmt.Errorf("task_weights must be >= 0, got %v", n)
+				return nil, nil, fmt.Errorf("task_weights must be >= 0, got %v", n)
 			}
 			lc.TaskWeights[i], sum = n, sum+n
 		}
 		if sum == 0 {
-			return nil, errors.New("task_weights must not all be zero")
+			return nil, nil, errors.New("task_weights must not all be zero")
 		}
 		if lc.Task == TaskPointing {
 			s.logger.Warnw("task_weights are ignored in pointing mode (position has priority)")
 		}
 	}
-	sess, pose, err := s.m.start(ctx, armName, SessionConfig{
-		Frame: frame, Mode: Mode(mode), Loop: lc,
+	frames, err := optBool(cmd, "frames", false)
+	if err != nil {
+		return nil, nil, err
+	}
+	pointVel, err := optBool(cmd, "point_velocities", true)
+	if err != nil {
+		return nil, nil, err
+	}
+	filter, err := parseTargetFilter(cmd["target_filter"])
+	if err != nil {
+		return nil, nil, err
+	}
+	return s.m.start(ctx, armName, SessionConfig{
+		Frame: frame, Mode: Mode(mode), Loop: lc, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
 		Timeout: time.Duration(timeout * float64(time.Millisecond)),
 		Ramp:    time.Duration(ramp * float64(time.Millisecond)),
 	})
-	if err != nil {
-		return nil, err
-	}
-	return map[string]interface{}{"session_id": sess.id, "pose": poseMap(pose)}, nil
 }
 
 func (s *diffIkServo) Status(ctx context.Context) (map[string]interface{}, error) {
@@ -311,6 +355,78 @@ func optNum(m map[string]interface{}, key string, def float64) (float64, error) 
 		return def, nil
 	}
 	return num(v, key)
+}
+
+func optBool(m map[string]interface{}, key string, def bool) (bool, error) {
+	v, ok := m[key]
+	if !ok {
+		return def, nil
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return false, fmt.Errorf("%s must be a bool, got %v", key, v)
+	}
+	return b, nil
+}
+
+// parseTargetFilter reads servo_start's target_filter; absent (nil) gives the pass-through default.
+func parseTargetFilter(raw interface{}) (TargetFilter, error) {
+	f := DefaultTargetFilter()
+	if raw == nil {
+		return f, nil
+	}
+	m, ok := raw.(map[string]interface{})
+	if !ok {
+		return f, errors.New("target_filter must be an object")
+	}
+	for k, v := range m {
+		var err error
+		switch k {
+		case "ema_alpha":
+			f.EMAAlpha, err = num(v, "target_filter.ema_alpha")
+		case "hold_mm":
+			f.HoldMM, err = num(v, "target_filter.hold_mm")
+		case "hold_deg":
+			f.HoldDeg, err = num(v, "target_filter.hold_deg")
+		case "dwell_ms":
+			var ms float64
+			ms, err = num(v, "target_filter.dwell_ms")
+			f.Dwell = time.Duration(ms * float64(time.Millisecond))
+		case "feedforward":
+			f.Feedforward, err = optBool(m, k, true)
+		case "floor":
+			fm, ok := v.(map[string]interface{})
+			if !ok {
+				return f, errors.New("target_filter.floor must be an object")
+			}
+			c := &FloorClamp{}
+			for fk, fv := range fm {
+				switch fk {
+				case "min_z_mm":
+					c.MinZMM, err = num(fv, "target_filter.floor.min_z_mm")
+				case "tip_mm":
+					c.TipMM, err = num(fv, "target_filter.floor.tip_mm")
+				case "margin_mm":
+					c.MarginMM, err = num(fv, "target_filter.floor.margin_mm")
+				default:
+					return f, fmt.Errorf("unknown target_filter.floor key %q", fk)
+				}
+				if err != nil {
+					return f, err
+				}
+			}
+			if _, ok := fm["min_z_mm"]; !ok {
+				return f, errors.New("target_filter.floor.min_z_mm is required")
+			}
+			f.Floor = c
+		default:
+			return f, fmt.Errorf("unknown target_filter key %q", k)
+		}
+		if err != nil {
+			return f, err
+		}
+	}
+	return f, f.validate()
 }
 
 func optString(m map[string]interface{}, key, def string) (string, error) {
@@ -391,6 +507,17 @@ func poseMap(p spatialmath.Pose) map[string]interface{} {
 	return map[string]interface{}{"x": pt.X, "y": pt.Y, "z": pt.Z, "o_x": ov.OX, "o_y": ov.OY, "o_z": ov.OZ, "theta": ov.Theta}
 }
 
+func filterMap(f TargetFilter) map[string]interface{} {
+	out := map[string]interface{}{
+		"ema_alpha": f.EMAAlpha, "hold_mm": f.HoldMM, "hold_deg": f.HoldDeg,
+		"dwell_ms": float64(f.Dwell) / float64(time.Millisecond), "feedforward": f.Feedforward,
+	}
+	if c := f.Floor; c != nil {
+		out["floor"] = map[string]interface{}{"min_z_mm": c.MinZMM, "tip_mm": c.TipMM, "margin_mm": c.MarginMM}
+	}
+	return out
+}
+
 func statusMap(st SessionStatus) map[string]interface{} {
 	js := make([]interface{}, len(st.Config.MaxJointDegPerS))
 	for i, v := range st.Config.MaxJointDegPerS {
@@ -403,13 +530,15 @@ func statusMap(st SessionStatus) map[string]interface{} {
 		"last_command_age_ms": ms(st.LastCmdAge),
 		"limits": map[string]interface{}{
 			"joint_deg_s": js, "linear_mm_s": st.Config.MaxLinearMMPerS,
-			"angular_deg_s": st.Config.MaxAngularDegPerS, "resync_deg": st.Config.ResyncDeg,
+			"angular_deg_s": st.Config.MaxAngularDegPerS, "resync_deg": st.Config.ResyncDeg, "max_lag_ms": st.Config.MaxLagMS,
 			"singular_eps": st.Config.SingularEps, "max_damping": st.Config.MaxDamping,
 			"tol_mm": st.Config.TolMM, "tol_deg": st.Config.TolDeg,
 		},
 		"tick_p50_ms": ms(st.TickP50), "tick_p99_ms": ms(st.TickP99),
-		"overruns": float64(st.Overruns), "resyncs": float64(st.Resyncs), "damping": st.Damping,
+		"overruns": float64(st.Overruns), "resyncs": float64(st.Resyncs), "lag_ms": st.LagMS, "damping": st.Damping,
 	}
+	out["clamps"] = float64(st.Clamps)
+	out["target_filter"] = filterMap(st.Filter)
 	if st.Task == TaskPointing {
 		out["pointing_residual_deg"] = st.PointingResidualDeg
 	}
@@ -441,7 +570,10 @@ func (s *diffIkServo) MoveOnGlobe(ctx context.Context, req motion.MoveOnGlobeReq
 // The `supplemental_transforms` argument can be used to augment the machine's existing frame system with additional frames.
 // deprecated, use framesystem.Servce.GetPose
 func (s *diffIkServo) GetPose(ctx context.Context, componentName string, destinationFrame string, supplementalTransforms []*referenceframe.LinkInFrame, extra map[string]interface{}) (*referenceframe.PoseInFrame, error) {
-	return nil, errUnimplemented
+	if destinationFrame == "" {
+		destinationFrame = referenceframe.World
+	}
+	return s.m.fs.TransformPose(ctx, referenceframe.NewPoseInFrame(componentName, spatialmath.NewZeroPose()), destinationFrame, supplementalTransforms)
 }
 
 // ListPlanStatuses returns the statuses of plans created by `MoveOnGlobe()` or `MoveOnMap()` since the motion service initialized.

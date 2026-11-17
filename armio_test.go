@@ -2,6 +2,7 @@ package diffik
 
 import (
 	"context"
+	"math"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -182,5 +183,78 @@ func TestArmIODefaultLeadIsCappedAtOneTick(t *testing.T) {
 	}
 	if got := NewArmIO(nil, 1000).(*armIO).lead; got != time.Millisecond {
 		t.Fatalf("1 kHz lead %v, want one tick (1 ms)", got)
+	}
+}
+
+// capArm records every streamed point.
+type capArm struct {
+	arm.Arm
+	pts chan arm.TrajectoryPoint
+}
+
+func (c *capArm) MoveThroughJointPositionsStreamed(ctx context.Context, b <-chan []arm.TrajectoryPoint, r chan<- arm.Response, extra map[string]interface{}) error {
+	for batch := range b {
+		for _, p := range batch {
+			c.pts <- p
+		}
+	}
+	return nil
+}
+
+func (c *capArm) Stop(context.Context, map[string]interface{}) error { return nil }
+
+func streamPoints(t *testing.T, pointVel bool, qs ...[]float64) (cur []float64, pts []arm.TrajectoryPoint) {
+	t.Helper()
+	c := &capArm{Arm: fakeUR5e(t), pts: make(chan arm.TrajectoryPoint, 16)}
+	io := NewArmIO(c, 50)
+	io.(*armIO).pointVel = pointVel
+	cur, err := io.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range qs {
+		if err := io.Send(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := io.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range len(qs) + 1 {
+		pts = append(pts, <-c.pts)
+	}
+	return cur, pts
+}
+
+func TestArmIOPointVelocities(t *testing.T) {
+	q1 := []float64{0.1, -1.2, 1.5, -1.9, -1.57, 0}
+	q2 := []float64{0.12, -1.2, 1.49, -1.9, -1.57, 0.01}
+	cur, pts := streamPoints(t, true, q1, q2)
+	if pts[0].Constraints != nil {
+		t.Fatalf("seed point has Constraints %v", pts[0].Constraints)
+	}
+	for k, q := range [][]float64{q1, q2} {
+		prev := cur
+		if k == 1 {
+			prev = q1
+		}
+		c := pts[k+1].Constraints
+		if c == nil || c.Accelerations != nil || len(c.Velocities) != len(q) {
+			t.Fatalf("point %d constraints = %+v", k+1, c)
+		}
+		for i := range q {
+			if want := (q[i] - prev[i]) * 50; math.Abs(c.Velocities[i]-want) > 1e-9 {
+				t.Errorf("point %d v[%d] = %v, want %v", k+1, i, c.Velocities[i], want)
+			}
+		}
+	}
+}
+
+func TestArmIOPointVelocitiesOff(t *testing.T) {
+	_, pts := streamPoints(t, false, []float64{0.1, -1.2, 1.5, -1.9, -1.57, 0})
+	for i, p := range pts {
+		if p.Constraints != nil {
+			t.Errorf("point %d has Constraints %v with point velocities off", i, p.Constraints)
+		}
 	}
 }

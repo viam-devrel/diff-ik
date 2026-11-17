@@ -23,6 +23,10 @@ type armIO struct {
 	a    arm.Arm
 	lead time.Duration // how far ahead of now each point is stamped
 
+	pointVel bool                   // attach per-point target velocities
+	period   float64                // nominal tick, seconds
+	prevQ    []referenceframe.Input // last sent positions (the seed at first)
+
 	batches chan []arm.TrajectoryPoint
 	s       *stream
 	cancel  context.CancelFunc
@@ -48,7 +52,7 @@ func NewArmIOLead(a arm.Arm, rateHz float64, lead time.Duration) JointIO {
 	if lead <= 0 {
 		lead = DefaultLead
 	}
-	return &armIO{a: a, lead: min(lead, time.Duration(float64(time.Second)/rateHz))}
+	return &armIO{a: a, lead: min(lead, time.Duration(float64(time.Second)/rateHz)), pointVel: true, period: 1 / rateHz}
 }
 
 func (io *armIO) Read(ctx context.Context) ([]referenceframe.Input, error) {
@@ -63,6 +67,7 @@ func (io *armIO) Send(ctx context.Context, q []referenceframe.Input) error {
 			return err
 		}
 		io.open()
+		io.prevQ = slices.Clone(cur)
 		batch = append(batch, arm.TrajectoryPoint{Time: 0, Positions: cur}) // first point must be t=0
 	}
 	t := time.Since(io.start) + io.lead
@@ -70,7 +75,16 @@ func (io *armIO) Send(ctx context.Context, q []referenceframe.Input) error {
 		t = io.lastT + time.Microsecond // times must strictly increase
 	}
 	io.lastT = t
-	batch = append(batch, arm.TrajectoryPoint{Time: t, Positions: slices.Clone(q)})
+	pt := arm.TrajectoryPoint{Time: t, Positions: slices.Clone(q)}
+	if io.pointVel && len(io.prevQ) == len(q) {
+		v := make([]float64, len(q))
+		for i := range q {
+			v[i] = (q[i] - io.prevQ[i]) / io.period // nominal tick, not the measured interval
+		}
+		pt.Constraints = &arm.KinematicConstraints{Velocities: v}
+	}
+	io.prevQ = slices.Clone(pt.Positions)
+	batch = append(batch, pt)
 
 	select {
 	case io.batches <- batch:

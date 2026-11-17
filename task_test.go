@@ -137,12 +137,12 @@ func TestPointingReachSplitsSO101Error(t *testing.T) {
 	// Rotating about base z changes the azimuth; its component ⟂ a is the unreachable direction.
 	z := r3.Vector{Z: 1}
 	zp := z.Sub(a.Mul(a.Dot(z))).Normalize()
-	reach, res, err := pointingReach(J1, J2, [2]float64{u.Dot(zp) * 0.1, v.Dot(zp) * 0.1})
+	reach, res, err := pointingReach(J1, J2, [2]float64{u.Dot(zp) * 0.1, v.Dot(zp) * 0.1}, nil, nil, nil)
 	if err != nil || res < 0.09 || reach > 0.01 {
 		t.Fatalf("azimuth error: reach=%.4f res=%.4f err=%v, want mostly residual", reach, res, err)
 	}
 	pitch := a.Cross(z).Normalize() // rotation about the horizontal axis ⟂ arm plane: in-plane pitch
-	reach, res, _ = pointingReach(J1, J2, [2]float64{u.Dot(pitch) * 0.1, v.Dot(pitch) * 0.1})
+	reach, res, _ = pointingReach(J1, J2, [2]float64{u.Dot(pitch) * 0.1, v.Dot(pitch) * 0.1}, nil, nil, nil)
 	if reach < 0.09 || res > 0.01 {
 		t.Fatalf("pitch error: reach=%.4f res=%.4f, want mostly reachable", reach, res)
 	}
@@ -176,5 +176,50 @@ func TestPrioritySecondaryLeavesPositionAlone(t *testing.T) {
 	sec.MulVec(J1, mat.NewVecDense(5, diff))
 	if mat.Norm(&sec, 2) > 1e-10 {
 		t.Fatalf("|J1·(dq-dq1)| = %g, secondary moved position", mat.Norm(&sec, 2))
+	}
+}
+
+// A joint at its limit whose reducing step would push it outward is locked: the error it alone
+// could fix becomes residual. The opposite error direction is unaffected.
+func TestPointingReachLocksJointAtLimit(t *testing.T) {
+	m := so101(t)
+	lim := m.DoF()
+	lo, hi := make([]float64, 5), make([]float64, 5)
+	for i, l := range lim {
+		lo[i], hi[i] = l.Min, l.Max
+	}
+	q := []float64{0, 0.3, 0.3, hi[3], 0}
+	J, _ := Jacobian(m, q)
+	_, o, _ := FK(m, q)
+	a := toolAxis(o)
+	_, u, v := pointingError(a, a)
+	J1, J2 := J.Slice(0, 3, 0, 5).(*mat.Dense), pointingRows(J, u, v)
+	pitch := a.Cross(r3.Vector{Z: 1}).Normalize()
+	var out, in [2]float64 // out: reducing step needs joint 3 to increase
+	for _, s := range []float64{0.1, -0.1} {
+		e := [2]float64{u.Dot(pitch) * s, v.Dot(pitch) * s}
+		_, _, dq, err := pointingSplit(J1, J2, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dq[3] > 0 {
+			out = e
+		} else {
+			in = e
+		}
+	}
+	if out == ([2]float64{}) || in == ([2]float64{}) {
+		t.Fatal("joint 3 does not move with the pitch error")
+	}
+	r0, s0, _ := pointingReach(J1, J2, out, nil, nil, nil)
+	r1, s1, err := pointingReach(J1, J2, out, q, lo, hi)
+	t.Logf("outward: unlimited reach=%.4f res=%.4f; limit-aware reach=%.4f res=%.4f", r0, s0, r1, s1)
+	if err != nil || r1 > 0.2*r0 || s1 < 0.8*math.Hypot(out[0], out[1]) {
+		t.Fatalf("locked joint still counted: reach=%.4f res=%.4f", r1, s1)
+	}
+	r0, s0, _ = pointingReach(J1, J2, in, nil, nil, nil)
+	r1, s1, _ = pointingReach(J1, J2, in, q, lo, hi)
+	if math.Abs(r1-r0) > 1e-9 || math.Abs(s1-s0) > 1e-9 {
+		t.Fatalf("inward error changed: reach %.4f→%.4f res %.4f→%.4f", r0, r1, s0, s1)
 	}
 }

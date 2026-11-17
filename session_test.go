@@ -7,6 +7,8 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/robot/framesystem"
 	"go.viam.com/rdk/spatialmath"
 )
 
@@ -129,11 +132,21 @@ func TestEstimatorSlowAngularAndAngularJump(t *testing.T) {
 }
 
 // fakeFS stands in for the frame system: arm_origin sits at twb in world.
-type fakeFS struct{ twb spatialmath.Pose }
+type fakeFS struct {
+	twb               spatialmath.Pose
+	parts             []*referenceframe.FrameSystemPart
+	cfgCalls, tfCalls atomic.Int32
+}
 
-func (f fakeFS) TransformPose(_ context.Context, p *referenceframe.PoseInFrame, dst string,
+func (f *fakeFS) FrameSystemConfig(context.Context) (*framesystem.Config, error) {
+	f.cfgCalls.Add(1)
+	return &framesystem.Config{Parts: f.parts}, nil
+}
+
+func (f *fakeFS) TransformPose(_ context.Context, p *referenceframe.PoseInFrame, dst string,
 	_ []*referenceframe.LinkInFrame,
 ) (*referenceframe.PoseInFrame, error) {
+	f.tfCalls.Add(1)
 	if p.Parent() != "arm_origin" || dst != referenceframe.World {
 		return nil, fmt.Errorf("unexpected transform %s → %s", p.Parent(), dst)
 	}
@@ -155,7 +168,7 @@ func newTestManager(t *testing.T, twb spatialmath.Pose) (*servoManager, *simIO, 
 	t.Helper()
 	sim := &simIO{q: slices.Clone(home)}
 	clk := newFakeClock()
-	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, fakeFS{twb}, logging.NewTestLogger(t))
+	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, &fakeFS{twb: twb}, logging.NewTestLogger(t))
 	m.now, m.manual = clk.Now, true
 	m.newIO = func(arm.Arm, float64) JointIO { return sim }
 	return m, sim, clk
@@ -245,13 +258,13 @@ func TestSessionLatestWins(t *testing.T) {
 	p1 := spatialmath.NewPose(p.Point().Add(r3.Vector{X: 30}), p.Orientation())
 	p2 := spatialmath.NewPose(p.Point().Add(r3.Vector{Y: 30}), p.Orientation())
 	for _, q := range []spatialmath.Pose{p1, p2} {
-		if _, err := s.target(q); err != nil {
+		if _, err := s.target(q, "", true); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for i := 0; i < 30; i++ { // 3 s, resending p2 every 100 ms to feed the dead-man
 		step(t, s, clk, 5)
-		if _, err := s.target(p2); err != nil {
+		if _, err := s.target(p2, "", true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -269,7 +282,7 @@ func TestSessionWrongModeAndTwistLimits(t *testing.T) {
 
 	m2, _, _ := newTestManager(t, spatialmath.NewZeroPose())
 	tw, _ := mustStart(t, m2, testSessionCfg(ModeTwist))
-	_, err = tw.target(p)
+	_, err = tw.target(p, "", true)
 	wantErr(t, err, "wrong mode: session is twist")
 	_, err = tw.twist(r3.Vector{X: 0.2}, r3.Vector{}) // 200 mm/s > 100 mm/s
 	wantErr(t, err, "exceeds")
@@ -296,7 +309,7 @@ func TestSessionHeldPoseConverges(t *testing.T) {
 	s, p := mustStart(t, m, testSessionCfg(ModePose))
 	goal := spatialmath.NewPose(p.Point().Add(r3.Vector{Z: 20}), p.Orientation())
 	for i := 0; i < 30; i++ {
-		if _, err := s.target(goal); err != nil {
+		if _, err := s.target(goal, "", true); err != nil {
 			t.Fatal(err)
 		}
 		step(t, s, clk, 5)
@@ -324,7 +337,7 @@ func TestSessionDeadmanTimeout(t *testing.T) {
 	if st.State != StateStoppedTimeout || !sim.stopped {
 		t.Fatalf("state = %s stopped = %v, want stopped_timeout and stopped", st.State, sim.stopped)
 	}
-	_, err := s.target(p)
+	_, err := s.target(p, "", true)
 	wantErr(t, err, "session ended: stopped_timeout")
 	if m.busy("arm") {
 		t.Fatal("arm still busy after the session ended")
@@ -346,7 +359,7 @@ func TestSessionWorldFrameMapping(t *testing.T) {
 		t.Fatalf("start pose in world %v, want %v", pw.Point(), spatialmath.Compose(twb, fk).Point())
 	}
 	pb := spatialmath.NewPose(fk.Point().Add(r3.Vector{X: 10}), fk.Orientation())
-	if _, err := s.target(spatialmath.Compose(twb, pb)); err != nil {
+	if _, err := s.target(spatialmath.Compose(twb, pb), "", true); err != nil {
 		t.Fatal(err)
 	}
 	step(t, s, clk, 1) // Status.TargetMM is published by tick; v̂ = 0 on a first sample, so the target doesn't move
@@ -372,7 +385,7 @@ func TestSessionWorldFrameMapping(t *testing.T) {
 // Real clock and real Run goroutine: servo_stop ramps, stops the arm and ends the session.
 func TestSessionStopRealClock(t *testing.T) {
 	sim := &simIO{q: slices.Clone(home)}
-	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, fakeFS{spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
+	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, &fakeFS{twb: spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
 	m.newIO = func(arm.Arm, float64) JointIO { return sim }
 	s, _ := mustStart(t, m, testSessionCfg(ModePose))
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -400,7 +413,7 @@ func TestSessionCommandsRejectedWhileStopping(t *testing.T) {
 	if s.ended() {
 		t.Fatal("session ended before the ramp finished")
 	}
-	_, err := s.target(p)
+	_, err := s.target(p, "", true)
 	wantErr(t, err, "session stopping: stopped_timeout")
 	for i := 0; i < 20 && !s.ended(); i++ {
 		step(t, s, clk, 1)
@@ -418,7 +431,7 @@ func TestSessionCommandsRejectedWhileStopping(t *testing.T) {
 
 func TestManagerCloseStopsLiveSession(t *testing.T) {
 	sim := &simIO{q: slices.Clone(home)}
-	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, fakeFS{spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
+	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, &fakeFS{twb: spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
 	m.newIO = func(arm.Arm, float64) JointIO { return sim }
 	s, _ := mustStart(t, m, testSessionCfg(ModePose))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -435,7 +448,7 @@ func TestManagerCloseStopsLiveSession(t *testing.T) {
 
 func TestSessionFaultDetail(t *testing.T) {
 	sim := &simIO{q: slices.Clone(home), sendErr: errors.New("bus error")}
-	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, fakeFS{spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
+	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, &fakeFS{twb: spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
 	m.newIO = func(arm.Arm, float64) JointIO { return sim }
 	s, p := mustStart(t, m, testSessionCfg(ModePose))
 	select {
@@ -443,7 +456,7 @@ func TestSessionFaultDetail(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("session did not fault")
 	}
-	_, err := s.target(p)
+	_, err := s.target(p, "", true)
 	wantErr(t, err, "session ended: faulted: ")
 	wantErr(t, err, "bus error")
 }
@@ -460,7 +473,7 @@ func TestSessionFinishCancelIsStopped(t *testing.T) {
 func TestStopFailureSurfaces(t *testing.T) {
 	newM := func() (*servoManager, *session) {
 		sim := &simIO{q: slices.Clone(home), stopErr: errors.New("stop failed")}
-		m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, fakeFS{spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
+		m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, &fakeFS{twb: spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
 		m.newIO = func(arm.Arm, float64) JointIO { return sim }
 		s, _ := mustStart(t, m, testSessionCfg(ModePose))
 		return m, s
@@ -538,6 +551,290 @@ func TestSessionTwistReportsIgnoredRollRotatedFrame(t *testing.T) {
 		st, err := s.twist(r3.Vector{}, ang.Mul(deg2rad(10)))
 		if err != nil || st.RollIgnored != tc.want {
 			t.Fatalf("%s: ignored=%v err=%v, want %v", tc.name, st.RollIgnored, err, tc.want)
+		}
+	}
+}
+
+// camPose is the test camera's pose in the arm's end-effector frame.
+var camPose = spatialmath.NewPose(r3.Vector{X: 10, Y: -20, Z: 30}, &spatialmath.OrientationVectorDegrees{OX: 0.3, OZ: 1, Theta: 20})
+
+// newFramedTestManager is newTestManager with a frame system holding the arm (a UR5e model frame named
+// "arm"), a camera "cam" on its end effector, a camera "static" on world, and a second movable arm "arm2"
+// with a camera "cam2" on it. NewFrameSystem adds the "<name>_origin" frames itself.
+func newFramedTestManager(t *testing.T, cam spatialmath.Pose) (*servoManager, *simIO, *fakeClock) {
+	t.Helper()
+	m, sim, clk := newTestManager(t, spatialmath.NewZeroPose())
+	model2, err := kinematics.ModelFromName(kinematics.UR5e, "arm2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := func(parent string, p spatialmath.Pose, name string) *referenceframe.LinkInFrame {
+		return referenceframe.NewLinkInFrame(parent, p, name, nil)
+	}
+	zero := spatialmath.NewZeroPose()
+	m.fs.(*fakeFS).parts = []*referenceframe.FrameSystemPart{
+		{FrameConfig: link(referenceframe.World, zero, "arm"), ModelFrame: ur5e(t)},
+		{FrameConfig: link("arm", cam, "cam")},
+		{FrameConfig: link(referenceframe.World, spatialmath.NewPoseFromPoint(r3.Vector{Z: 500}), "static")},
+		{FrameConfig: link(referenceframe.World, zero, "arm2"), ModelFrame: model2},
+		{FrameConfig: link("arm2", cam, "cam2")},
+	}
+	return m, sim, clk
+}
+
+func framedCfg() SessionConfig {
+	cfg := testSessionCfg(ModePose)
+	cfg.Frames = true
+	return cfg
+}
+
+func loopTarget(s *session) spatialmath.Pose {
+	s.loop.mu.Lock()
+	defer s.loop.mu.Unlock()
+	return s.loop.target
+}
+
+func TestSessionFrameTargetUsesMeasuredJoints(t *testing.T) {
+	m, sim, clk := newFramedTestManager(t, camPose)
+	s, _ := mustStart(t, m, framedCfg())
+	startQ := slices.Clone(sim.q)
+	sim.q[0] += deg2rad(1) // below resync_deg: the loop keeps its command, QMeas follows the arm
+	step(t, s, clk, 1)
+	qm := s.loop.Status().QMeas
+	if maxAbsDiff(qm, startQ) < 1e-6 {
+		t.Fatal("QMeas did not move")
+	}
+	pCam := spatialmath.NewPose(r3.Vector{X: 5, Y: 6, Z: 7}, &spatialmath.OrientationVectorDegrees{OZ: 1, Theta: 10})
+	if _, err := s.target(pCam, "cam", true); err != nil {
+		t.Fatal(err)
+	}
+	want := func(q []float64) spatialmath.Pose {
+		fk, err := ur5e(t).Transform(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return spatialmath.Compose(fk, spatialmath.Compose(camPose, pCam))
+	}
+	got := loopTarget(s)
+	if !spatialmath.PoseAlmostCoincidentEps(got, want(qm), 1e-6) {
+		t.Fatalf("target %v, want FK(QMeas) o cam o p = %v", got, want(qm))
+	}
+	if spatialmath.PoseAlmostCoincidentEps(got, want(startQ), 1e-3) {
+		t.Fatal("target matches the start joints; the measured joints were not used")
+	}
+}
+
+func TestSessionFrameRequiresFrames(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	s, p := mustStart(t, m, testSessionCfg(ModePose))
+	_, err := s.target(p, "cam", true)
+	wantErr(t, err, "frames")
+}
+
+func TestSessionUnknownFrame(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	s, p := mustStart(t, m, framedCfg())
+	before := loopTarget(s)
+	_, err := s.target(p, "nosuchcam", true)
+	wantErr(t, err, "nosuchcam")
+	if !spatialmath.PoseAlmostEqual(loopTarget(s), before) {
+		t.Fatal("loop target changed after an unknown frame")
+	}
+}
+
+func TestSessionFrameChainWithOtherMovableFrameRejected(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	s, p := mustStart(t, m, framedCfg())
+	_, err := s.target(p, "cam2", true)
+	wantErr(t, err, "movable")
+	_, err2 := s.target(p, "cam2", true)
+	if err2 == nil || err2.Error() != err.Error() {
+		t.Fatalf("second call err = %v, want the cached %v", err2, err)
+	}
+	// static and world-parented cameras are fine
+	if _, err := s.target(p, "static", true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionTargetApplyFalse(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	s, p := mustStart(t, m, framedCfg())
+	before := loopTarget(s)
+	res, err := s.target(p, "cam", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Raw == nil || res.Target == nil || !spatialmath.PoseAlmostEqual(res.Raw, res.Target) {
+		t.Fatalf("raw %v target %v, want equal and non-nil", res.Raw, res.Target)
+	}
+	if !spatialmath.PoseAlmostEqual(loopTarget(s), before) {
+		t.Fatal("apply:false changed the loop target")
+	}
+	s.mu.Lock()
+	seeded := s.filt.ema != nil
+	s.mu.Unlock()
+	if seeded {
+		t.Fatal("apply:false advanced the filter")
+	}
+}
+
+func TestSessionFilterFeedforwardOff(t *testing.T) {
+	for _, ff := range []bool{false, true} {
+		m, _, clk := newFramedTestManager(t, camPose)
+		cfg := framedCfg()
+		cfg.Filter = TargetFilter{EMAAlpha: 1, Feedforward: ff}
+		s, p := mustStart(t, m, cfg)
+		for i := 0; i < 2; i++ { // 2 mm in 20 ms = 100 mm/s
+			q := spatialmath.NewPose(p.Point().Add(r3.Vector{X: 2 * float64(i)}), p.Orientation())
+			if _, err := s.target(q, "", true); err != nil {
+				t.Fatal(err)
+			}
+			clk.Advance(20 * time.Millisecond)
+		}
+		s.loop.mu.Lock()
+		v := s.loop.vel
+		s.loop.mu.Unlock()
+		if got := math.Abs(v[0]); ff && got < 0.01 || !ff && got != 0 {
+			t.Fatalf("feedforward %v: vel = %v", ff, v)
+		}
+	}
+}
+
+func TestSessionFrameTargetsMakeNoFrameSystemCalls(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	fsys := m.fs.(*fakeFS)
+	s, p := mustStart(t, m, framedCfg())
+	if n := fsys.cfgCalls.Load(); n != 1 {
+		t.Fatalf("FrameSystemConfig calls at start = %d, want 1", n)
+	}
+	cfg0, tf0 := fsys.cfgCalls.Load(), fsys.tfCalls.Load()
+	for i := 0; i < 5; i++ {
+		if _, err := s.target(p, "cam", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fsys.cfgCalls.Load() != cfg0 || fsys.tfCalls.Load() != tf0 {
+		t.Fatal("framed targets called the frame system (an RPC per target)")
+	}
+}
+
+func fkOf(t *testing.T, q []float64) spatialmath.Pose {
+	t.Helper()
+	fk, err := ur5e(t).Transform(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fk
+}
+
+var pCamTest = spatialmath.NewPose(r3.Vector{X: 5, Y: 6, Z: 7}, &spatialmath.OrientationVectorDegrees{OZ: 1, Theta: 10})
+
+func TestSessionFrameTargetFallsBackToStartQ(t *testing.T) {
+	m, sim, _ := newFramedTestManager(t, camPose)
+	s, _ := mustStart(t, m, framedCfg()) // no tick: QMeas is empty
+	if _, err := s.target(pCamTest, "cam", true); err != nil {
+		t.Fatal(err)
+	}
+	want := spatialmath.Compose(fkOf(t, sim.q), spatialmath.Compose(camPose, pCamTest))
+	if got := loopTarget(s); !spatialmath.PoseAlmostCoincidentEps(got, want, 1e-6) {
+		t.Fatalf("target %v, want %v", got, want)
+	}
+}
+
+func TestSessionFrameWorldSessionFrameWithOffsetBase(t *testing.T) {
+	rz := spatialmath.Quaternion(rotZ(math.Pi / 3))
+	twb := spatialmath.NewPose(r3.Vector{X: 100, Y: 200, Z: 300}, &rz)
+	m, sim, clk := newFramedTestManager(t, camPose)
+	fsys := m.fs.(*fakeFS)
+	fsys.twb = twb
+	fsys.parts[0].FrameConfig = referenceframe.NewLinkInFrame(referenceframe.World, twb, "arm", nil)
+	cfg := framedCfg()
+	cfg.Frame = referenceframe.World
+	s, _ := mustStart(t, m, cfg)
+	sim.q[0] += deg2rad(1)
+	step(t, s, clk, 1)
+	qm := s.loop.Status().QMeas
+	res, err := s.target(pCamTest, "cam", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := spatialmath.Compose(fkOf(t, qm), spatialmath.Compose(camPose, pCamTest))
+	got := loopTarget(s)
+	if !spatialmath.PoseAlmostCoincidentEps(got, want, 1e-6) {
+		t.Fatalf("base-frame target %v, want %v", got, want)
+	}
+	if !spatialmath.PoseAlmostCoincidentEps(res.Target, spatialmath.Compose(twb, got), 1e-6) {
+		t.Fatalf("res.Target %v, want twb o loop target", res.Target)
+	}
+}
+
+func TestSessionPreviewDoesNotNeedLock(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	s, p := mustStart(t, m, framedCfg())
+	s.mu.Lock()
+	done := make(chan error, 1)
+	go func() { _, err := s.target(p, "cam", false); done <- err }()
+	select {
+	case err := <-done:
+		s.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		s.mu.Unlock()
+		t.Fatal("apply:false transform blocked on s.mu")
+	}
+}
+
+func TestSessionConcurrentFramedTargets(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	s, p := mustStart(t, m, framedCfg())
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				if _, err := s.target(p, "cam", true); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestSessionFloorClampReported(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	cfg := framedCfg()
+	cfg.Filter = TargetFilter{EMAAlpha: 1, Feedforward: true, Floor: &FloorClamp{MinZMM: 0, TipMM: 100, MarginMM: 10}}
+	s, _ := mustStart(t, m, cfg)
+	low := spatialmath.NewPose(r3.Vector{X: 300, Y: 100, Z: -50}, &spatialmath.OrientationVectorDegrees{OZ: -1})
+	res, err := s.target(low, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Clamped || s.status().Clamps != 1 {
+		t.Fatalf("clamped %v clamps %d, want true and 1", res.Clamped, s.status().Clamps)
+	}
+	if !(res.Target.Point().Z > res.Raw.Point().Z) {
+		t.Fatalf("target z %v not above raw z %v", res.Target.Point().Z, res.Raw.Point().Z)
+	}
+}
+
+// servo_start's point_velocities reaches the session's armIO (newIO runs per session).
+func TestSessionPointVelocitiesOption(t *testing.T) {
+	for _, off := range []bool{false, true} {
+		m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, &fakeFS{twb: spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
+		var got *armIO
+		m.newIO = func(a arm.Arm, hz float64) JointIO { got = NewArmIO(a, hz).(*armIO); return got }
+		cfg := testSessionCfg(ModePose)
+		cfg.NoPointVelocities = off
+		mustStart(t, m, cfg)
+		if got.pointVel == off {
+			t.Errorf("NoPointVelocities=%v -> pointVel=%v", off, got.pointVel)
 		}
 	}
 }

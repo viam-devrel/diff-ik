@@ -34,6 +34,7 @@ type LoopConfig struct {
 	SingularEps       float64
 	MaxDamping        float64
 	ResyncDeg         float64
+	MaxLagMS          float64 // longest arm lag treated as lag; beyond it a gap is divergence and resyncs. Default 300
 	TolMM             float64
 	TolDeg            float64
 	Task              string // "pose" | "pointing"; empty = pointing if DOF < 6 else pose
@@ -63,6 +64,7 @@ func (c LoopConfig) withDefaults(dof int) LoopConfig {
 	if c.ResyncDeg == 0 && c.RateHz > 0 && len(c.MaxJointDegPerS) > 0 {
 		c.ResyncDeg = 3 * slices.Max(c.MaxJointDegPerS) / c.RateHz
 	}
+	def(&c.MaxLagMS, 300)
 	def(&c.TolMM, 2)
 	def(&c.TolDeg, 2)
 	if c.Task == "" {
@@ -99,12 +101,15 @@ func (c LoopConfig) validate(dof int) error {
 		v    float64
 	}{
 		{"gain", c.Gain}, {"max_linear_mm_per_s", c.MaxLinearMMPerS}, {"max_angular_deg_per_s", c.MaxAngularDegPerS},
-		{"singular_eps", c.SingularEps}, {"max_damping", c.MaxDamping}, {"resync_deg", c.ResyncDeg},
+		{"singular_eps", c.SingularEps}, {"max_damping", c.MaxDamping}, {"resync_deg", c.ResyncDeg}, {"max_lag_ms", c.MaxLagMS},
 		{"tol_mm", c.TolMM}, {"tol_deg", c.TolDeg},
 	} {
 		if !(p.v > 0) {
 			return fmt.Errorf("%s must be > 0, got %v", p.name, p.v)
 		}
+	}
+	if c.MaxLagMS > 1000 {
+		return fmt.Errorf("max_lag_ms must be <= 1000, got %v", c.MaxLagMS)
 	}
 	return nil
 }
@@ -141,15 +146,24 @@ type Status struct {
 	TickP50, TickP99    time.Duration
 	LastTick            time.Duration
 	Overruns, Resyncs   int
+	LagMS               float64 // estimated arm lag behind the commands, ms
 	Damping             float64
 	Limited             bool
 	QCmd, QMeas         []float64
 	Task                string    // active task mode
 	PointingResidualDeg float64   // pointing mode: the unreachable part of the pointing error at q_m
 	ToolAxis            r3.Vector // tool axis of FK(q_cmd), base frame (read by servo_twist)
+	ReachDeg            float64   // the convergence angle: reachable pointing error (pointing) or active orientation error (pose)
 }
 
 const tickWindow = 500 // ticks kept for p50/p99
+
+const (
+	lagAlpha = 0.1 // EMA weight of a new lag sample when the lag estimate falls
+	// moveFrac: qm counts as moving when a joint changed by more than this fraction of one tick of
+	// travel at the top joint speed. Below it, a still arm's sensor noise cannot raise the lag estimate.
+	moveFrac = 0.1
+)
 
 // Loop is a differential-IK servo loop for one arm.
 type Loop struct {
@@ -168,6 +182,11 @@ type Loop struct {
 	stopErr error // io.Stop result of a completed ramp; written and read only on the loop goroutine
 
 	qCmd []float64
+
+	sent     [][]float64 // last sent commands, oldest first, at most MaxLagMS of ticks; loop goroutine only
+	lagTicks float64     // estimated arm lag in ticks; loop goroutine only
+	prevQm   []float64   // measured joints on the previous tick; loop goroutine only
+	moved    bool        // the arm has been seen moving at least once; loop goroutine only
 
 	mu        sync.Mutex
 	errRing   []float64 // weighted measured error norm, one per tick, for stall detection
@@ -437,8 +456,14 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 
 	// 2. hybrid resync (outside mu)
 	resynced := false
-	if maxAbsDiff(l.qCmd, qm) > deg2rad(l.cfg.ResyncDeg) {
+	l.updateLag(qm)
+	if maxAbsDiff(l.expected(), qm) > deg2rad(l.cfg.ResyncDeg) {
 		copy(l.qCmd, qm)
+		// The ring is kept: a real arm still executes its in-flight commands, so they remain the best model
+		// of where it will be. Clearing it makes the loop chase its own pipeline (endless resyncs).
+		if !l.moved { // an arm that never follows gets one run-up, not one per resync
+			l.lagTicks, l.moved = 0, true
+		}
 		resynced = true
 	}
 
@@ -492,6 +517,15 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 		return fmt.Errorf("sending joints: %w", err)
 	}
 	copy(l.qCmd, next)
+	// ponytail: the ring holds MaxLagMS of commands; a lag longer than that is treated as divergence (it
+	// resyncs), not as lag. Raise max_lag_ms for slower arms, at the cost of a bigger snap on a real stall.
+	if w := max(2, int(math.Ceil(l.cfg.MaxLagMS/1000*l.cfg.RateHz))); len(l.sent) >= w {
+		old := l.sent[0]
+		l.sent = append(l.sent[:0], l.sent[1:]...)
+		l.sent = append(l.sent, append(old[:0], next...))
+	} else {
+		l.sent = append(l.sent, slices.Clone(next))
+	}
 
 	// 10. measured error, per task
 	mp, mq, err := FK(l.model, qm)
@@ -512,13 +546,62 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	}
 	st.TargetMM = target.Point()
 	st.ErrMM, st.ErrDeg = ms.posMM, ms.angDeg
+	st.ReachDeg = ms.convDeg
 	st.CmdErrMM, st.CmdErrDeg = cmdPos, cmdAng
 	st.Damping, st.Limited = lambda, limited
+	st.LagMS = l.lagTicks / l.cfg.RateHz * 1000
 	st.Task, st.PointingResidualDeg, st.ToolAxis = l.cfg.Task, ms.residualDeg, toolAxis(cq)
 	st.QCmd, st.QMeas = slices.Clone(l.qCmd), slices.Clone(qm)
 	l.lastReach = deg2rad(ms.convDeg)
 	st.State = l.nextState(ms, limited, vel != ([6]float64{}))
 	return nil
+}
+
+// sentAgo returns the command sent d ticks before the most recent one, or nil if the ring is shorter.
+func (l *Loop) sentAgo(d int) []float64 {
+	if d >= len(l.sent) {
+		return nil
+	}
+	return l.sent[len(l.sent)-1-d]
+}
+
+// expected is where the arm should be now given its measured lag: the command sent round(lagTicks) ticks
+// ago, or the oldest one still in the ring. With an empty ring it is qCmd.
+func (l *Loop) expected() []float64 {
+	if len(l.sent) == 0 {
+		return l.qCmd
+	}
+	return l.sentAgo(min(int(math.Round(l.lagTicks)), len(l.sent)-1))
+}
+
+// updateLag fits qm to the ring of sent commands and moves lagTicks toward the best-fit age. It skips
+// ticks where the commands barely moved over the window (under half of ResyncDeg: it must open before
+// the resync test could trip), since the best fit is ambiguous at rest.
+// A longer lag is taken at once (the lag grows from zero as motion starts, and an EMA would trail
+// it into a resync), but only while the arm is moving, or before it has ever moved (dead time at start):
+// a frozen qm under moving commands is a stall, not lag. A shorter lag is smoothed.
+func (l *Loop) updateLag(qm []float64) {
+	moving := l.prevQm != nil && maxAbsDiff(qm, l.prevQm) > moveFrac*deg2rad(slices.Max(l.cfg.MaxJointDegPerS))/l.cfg.RateHz
+	l.prevQm = append(l.prevQm[:0], qm...)
+	canRaise := moving || !l.moved
+	l.moved = l.moved || moving
+	n := len(l.sent)
+	if n < 2 || maxAbsDiff(l.sent[0], l.sent[n-1]) <= deg2rad(l.cfg.ResyncDeg)/2 {
+		return
+	}
+	best, bestD := math.Inf(1), 0
+	for d := 0; d < n; d++ {
+		if e := maxAbsDiff(qm, l.sentAgo(d)); e < best {
+			best, bestD = e, d
+		}
+	}
+	if f := float64(bestD); f > l.lagTicks {
+		if canRaise {
+			l.lagTicks = f
+		}
+	} else {
+		l.lagTicks += lagAlpha * (f - l.lagTicks)
+	}
 }
 
 // solve computes this tick's joint step for the configured task. cmdPos/cmdAng are the
@@ -536,8 +619,14 @@ func (l *Loop) solve(J *mat.Dense, tp r3.Vector, tq quat.Number, cp r3.Vector, c
 		w := r3.Vector{X: vel[3], Y: vel[4], Z: vel[5]}
 		v2 := capNorm(r3.Vector{X: u.Dot(w) + c.Gain*u.Dot(r), Y: v.Dot(w) + c.Gain*v.Dot(r)}, deg2rad(c.MaxAngularDegPerS)).Mul(scale)
 		J1 := mat.DenseCopyOf(J.Slice(0, 3, 0, n))
-		dq, l1, l2, err := prioritySolve(J1, pointingRows(J, u, v),
-			[]float64{v1.X * dt, v1.Y * dt, v1.Z * dt}, []float64{v2.X * dt, v2.Y * dt}, c.SingularEps, c.MaxDamping)
+		J2 := pointingRows(J, u, v)
+		dx1, dx2 := []float64{v1.X * dt, v1.Y * dt, v1.Z * dt}, []float64{v2.X * dt, v2.Y * dt}
+		dq, l1, l2, err := prioritySolve(J1, J2, dx1, dx2, c.SingularEps, c.MaxDamping)
+		// Lock outward-at-limit joints and re-solve so the step is consistent with the post-hoc clamp
+		// (else clamping one joint corrupts the position task). Each pass locks only new joints.
+		for pass := 0; err == nil && pass < n && lockOutward(J1, J2, dq, l.qCmd, l.lo, l.hi); pass++ {
+			dq, l1, l2, err = prioritySolve(J1, J2, dx1, dx2, c.SingularEps, c.MaxDamping)
+		}
 		if err != nil {
 			return nil, 0, false, 0, 0, err
 		}
@@ -609,7 +698,14 @@ func (l *Loop) measure(tp r3.Vector, tq quat.Number, mp r3.Vector, mq quat.Numbe
 	}
 	r, u, v := pointingError(toolAxis(mq), toolAxis(tq))
 	_, n := Jm.Dims()
-	reach, res, err := pointingReach(mat.DenseCopyOf(Jm.Slice(0, 3, 0, n)), pointingRows(Jm, u, v), [2]float64{u.Dot(r), v.Dot(r)})
+	// Servos sag inside a limit the command sits at: lock on whichever of qm/qCmd is at the limit.
+	qLock := slices.Clone(qm)
+	for i, c := range l.qCmd {
+		if c >= l.hi[i]-limitEps || c <= l.lo[i]+limitEps {
+			qLock[i] = c
+		}
+	}
+	reach, res, err := pointingReach(mat.DenseCopyOf(Jm.Slice(0, 3, 0, n)), pointingRows(Jm, u, v), [2]float64{u.Dot(r), v.Dot(r)}, qLock, l.lo, l.hi)
 	if err != nil {
 		return measured{}, err
 	}

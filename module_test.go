@@ -105,6 +105,7 @@ func TestDoCommandErrors(t *testing.T) {
 		{start("task_weights", []interface{}{math.NaN(), 1.0, 1.0, 1.0, 1.0, 1.0}), "task_weights"},
 		{start("rate_hz", math.NaN()), "rate_hz"},
 		{start("rate_hz", "fast"), "rate_hz"},
+		{start("point_velocities", "no"), "point_velocities"},
 		{start("limits", map[string]interface{}{"linear_mm_s": -5.0}), "linear_mm_s"},
 		{start("limits", "slow"), "limits"},
 		{start("task_weights", []interface{}{1.0, 1.0, 1.0, 1.0, 1.0}), "task_weights"},
@@ -170,7 +171,7 @@ func TestPoseRoundTrip(t *testing.T) {
 
 func TestServoTwistUnitsAndStopViaDoCommandAndStopPlan(t *testing.T) {
 	sim := &simIO{q: slices.Clone(home)}
-	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, fakeFS{spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
+	m := newServoManager(map[string]arm.Arm{"arm": fakeUR5e(t)}, &fakeFS{twb: spatialmath.NewZeroPose()}, logging.NewTestLogger(t))
 	m.newIO = func(arm.Arm, float64) JointIO { return sim }
 	s := testServo(t, m)
 	id := do(t, s, map[string]interface{}{"command": "servo_start", "component_name": "arm",
@@ -355,5 +356,76 @@ func TestServoStartTolLimits(t *testing.T) {
 	lim := st["limits"].(map[string]interface{})
 	if lim["tol_mm"] != 3.5 || lim["tol_deg"] != 4.0 {
 		t.Fatalf("limits = %v, want tol_mm 3.5 tol_deg 4", lim)
+	}
+}
+
+func TestServoFramedTargetReplyAndFilterConfig(t *testing.T) {
+	m, _, _ := newFramedTestManager(t, camPose)
+	m.now, m.manual = time.Now, false // a real Run loop, so Close can stop it
+	s := testServo(t, m)
+	filt := func(alpha float64) map[string]interface{} {
+		return map[string]interface{}{"ema_alpha": alpha, "hold_mm": 1.0, "hold_deg": 0.5, "dwell_ms": 200.0,
+			"floor": map[string]interface{}{"min_z_mm": -10.0, "tip_mm": 105.0, "margin_mm": 15.0}, "feedforward": false}
+	}
+	start := func(alpha float64) (map[string]interface{}, error) {
+		return s.DoCommand(context.Background(), map[string]interface{}{"command": "servo_start", "component_name": "arm",
+			"frame": "arm_origin", "frames": true, "target_filter": filt(alpha)})
+	}
+	if _, err := start(0); err == nil || !strings.Contains(err.Error(), "ema_alpha") {
+		t.Fatalf("ema_alpha 0 err = %v", err)
+	}
+	r, err := start(0.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := r["session_id"].(string)
+	pm := map[string]interface{}{"x": 5.0, "y": 6.0, "z": 7.0, "o_x": 0.0, "o_y": 0.0, "o_z": 1.0, "theta": 10.0}
+	rep := do(t, s, map[string]interface{}{"command": "servo_target", "session_id": id, "pose": pm, "frame": "cam"})
+	for _, k := range []string{"state", "err_mm", "err_deg", "target", "target_raw", "reach_deg", "pointing_residual_deg", "clamped"} {
+		if _, ok := rep[k]; !ok {
+			t.Errorf("servo_target reply lacks %q: %v", k, rep)
+		}
+	}
+	st := do(t, s, map[string]interface{}{"command": "servo_status", "session_id": id})
+	tf, ok := st["target_filter"].(map[string]interface{})
+	if !ok || tf["ema_alpha"] != 0.5 || tf["feedforward"] != false {
+		t.Errorf("servo_status target_filter = %v", st["target_filter"])
+	}
+	if _, ok := st["clamps"]; !ok {
+		t.Errorf("servo_status lacks clamps: %v", st)
+	}
+	if _, err := s.DoCommand(context.Background(), map[string]interface{}{"command": "servo_target", "session_id": id,
+		"pose": pm, "frame": "nosuchcam"}); err == nil {
+		t.Fatal("unknown frame accepted")
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParseTargetFilter(t *testing.T) {
+	def := DefaultTargetFilter()
+	for _, tc := range []struct {
+		name, errSub string
+		in           interface{}
+		check        func(TargetFilter) bool
+	}{
+		{"nil", "", nil, func(f TargetFilter) bool { return f == def }},
+		{"empty", "", map[string]interface{}{}, func(f TargetFilter) bool { return f == def }},
+		{"dwell", "", map[string]interface{}{"dwell_ms": 200}, func(f TargetFilter) bool { return f.Dwell == 200*time.Millisecond }},
+		{"bogus", "unknown", map[string]interface{}{"bogus": 1}, nil},
+		{"floor key", "unknown", map[string]interface{}{"floor": map[string]interface{}{"z": 1}}, nil},
+		{"floor str", "floor", map[string]interface{}{"floor": "x"}, nil},
+		{"floor no min_z", "min_z_mm is required", map[string]interface{}{"floor": map[string]interface{}{"tip_mm": 1}}, nil},
+		{"ff str", "feedforward", map[string]interface{}{"feedforward": "no"}, nil},
+	} {
+		f, err := parseTargetFilter(tc.in)
+		if tc.errSub != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.errSub) {
+				t.Errorf("%s: err = %v, want containing %q", tc.name, err, tc.errSub)
+			}
+		} else if err != nil || !tc.check(f) {
+			t.Errorf("%s: got %+v, %v", tc.name, f, err)
+		}
 	}
 }

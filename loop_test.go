@@ -25,6 +25,7 @@ type simIO struct {
 	stopped bool
 	stopErr error // returned by Stop when set
 	block   bool  // Read blocks until ctx is done
+	delay   int   // the arm reaches each command this many sends late
 }
 
 func (s *simIO) Read(ctx context.Context) ([]referenceframe.Input, error) {
@@ -44,7 +45,9 @@ func (s *simIO) Send(_ context.Context, q []referenceframe.Input) error {
 		s.ignore--
 		return nil
 	}
-	s.q = slices.Clone(q)
+	if i := len(s.sends) - 1 - s.delay; i >= 0 {
+		s.q = slices.Clone(s.sends[i])
+	}
 	return nil
 }
 
@@ -94,6 +97,7 @@ func TestNewLoopRejectsBadConfig(t *testing.T) {
 		"empty limits":         {MaxJointDegPerS: []float64{}},
 		"negative joint limit": {MaxJointDegPerS: []float64{90, 90, 90, 90, 90, -90}},
 		"negative gain":        {Gain: -1},
+		"huge max lag":         {MaxLagMS: 1001},
 	} {
 		if _, err := NewLoop(m, &simIO{}, cfg); err == nil {
 			t.Errorf("%s: want error", name)
@@ -158,6 +162,149 @@ func TestResyncWhenArmLags(t *testing.T) {
 	}
 	if s.State != StateConverged {
 		t.Fatalf("state = %s err = %.2f mm %.2f°, want converged after resync", s.State, s.ErrMM, s.ErrDeg)
+	}
+}
+
+// lagRun drives the target along y at a steady speed so the arm moves the whole time.
+func lagRun(t *testing.T, delay, ticks int) (*Loop, *simIO) {
+	t.Helper()
+	l, sim, m := newTestLoop(t, home, LoopConfig{MaxJointDegPerS: []float64{20, 20, 20, 20, 20, 20}, MaxLinearMMPerS: 200})
+	sim.delay = delay
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+	l.SetVelocity([6]float64{0, 0.1, 0, 0, 0, 0})
+	runTicks(t, l, ticks)
+	return l, sim
+}
+
+func TestLagCompensatedResync(t *testing.T) {
+	const delay = 10 // 200 ms at 50 Hz
+	l, _ := lagRun(t, delay, 150)
+	s := l.Status()
+	if s.Resyncs != 0 {
+		t.Fatalf("resyncs = %d, want 0 for a steady lag", s.Resyncs)
+	}
+	if want := float64(delay) / l.cfg.RateHz * 1000; math.Abs(s.LagMS-want) > 0.15*want {
+		t.Fatalf("LagMS = %.1f, want about %.1f", s.LagMS, want)
+	}
+}
+
+func TestResyncWhenArmStallsMidMotion(t *testing.T) {
+	const lag = 10
+	l, sim := lagRun(t, lag, 100)
+	step := 0.0 // largest per-tick command step just before the stall
+	for i := len(sim.sends) - 10; i < len(sim.sends); i++ {
+		step = math.Max(step, maxAbsDiff(sim.sends[i], sim.sends[i-1]))
+	}
+	sim.ignore = 1 << 30 // arm stops following
+	before := l.Status().Resyncs
+	gap := 0.0
+	for i := 1; ; i++ {
+		if i > lag+5 {
+			t.Fatalf("no resync within %d ticks of the stall", lag+5)
+		}
+		runTicks(t, l, 1)
+		s := l.Status()
+		if s.Resyncs > before {
+			break
+		}
+		gap = math.Max(gap, maxAbsDiff(l.qCmd, sim.q))
+	}
+	if bound := (lag+1)*step + deg2rad(l.cfg.ResyncDeg); gap > bound {
+		t.Fatalf("command ran %.2f° ahead of the stalled arm, want <= %.2f°", gap*180/math.Pi, bound*180/math.Pi)
+	}
+}
+
+func TestLagStaysZeroAtRest(t *testing.T) {
+	l, _, m := newTestLoop(t, home, LoopConfig{})
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+	runTicks(t, l, 100)
+	if s := l.Status(); s.LagMS != 0 || s.Resyncs != 0 {
+		t.Fatalf("LagMS = %.1f resyncs = %d at rest, want 0 and 0", s.LagMS, s.Resyncs)
+	}
+}
+
+func TestLagHoldsThroughStopThenHold(t *testing.T) {
+	l, _ := lagRun(t, 10, 100)
+	before := l.Status().LagMS
+	l.SetVelocity([6]float64{}) // commands stop; the arm drains its pipeline, then sits still
+	runTicks(t, l, 1500)
+	if s := l.Status(); math.Abs(s.LagMS-before) > 0.15*before || s.Resyncs != 0 {
+		t.Fatalf("LagMS %.1f -> %.1f resyncs = %d, want unchanged and 0", before, s.LagMS, s.Resyncs)
+	}
+}
+
+// settles runs n more ticks and fails if a resync lands in the last window of them or LagMS is off.
+func settles(t *testing.T, l *Loop, sim *simIO, n, window, lag int) {
+	t.Helper()
+	runTicks(t, l, n-window)
+	mid := l.Status().Resyncs
+	runTicks(t, l, window)
+	s := l.Status()
+	if s.Resyncs != mid {
+		t.Fatalf("%d resyncs in the last %d ticks, want none (total %d)", s.Resyncs-mid, window, s.Resyncs)
+	}
+	if want := float64(lag) / l.cfg.RateHz * 1000; math.Abs(s.LagMS-want) > 0.2*want {
+		t.Fatalf("LagMS = %.1f, want about %.1f", s.LagMS, want)
+	}
+}
+
+func TestRecoversFromDroppedSends(t *testing.T) {
+	const lag = 10
+	l, sim := lagRun(t, lag, 100)
+	sim.ignore = 8 // the arm misses 8 updates, then catches up with its pipeline
+	settles(t, l, sim, 6*lag+8, 2*lag, lag)
+}
+
+func TestRecoversFromStallAndRelease(t *testing.T) {
+	const lag = 10
+	l, sim, m := newTestLoop(t, home, LoopConfig{MaxLinearMMPerS: 400, MaxJointDegPerS: []float64{45, 45, 45, 45, 45, 45}})
+	sim.delay = lag
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+	l.SetVelocity([6]float64{0, 0.25, 0, 0, 0, 0}) // fast: 250 mm/s TCP, default resync_deg (2.7 deg)
+	runTicks(t, l, 60)
+	sim.ignore = 20 // the arm freezes for 20 ticks, then follows its pipeline again
+	settles(t, l, sim, 20+160, 2*lag, lag)
+}
+
+func TestArmThatNeverFollowsResyncsRepeatedly(t *testing.T) {
+	l, sim := lagRun(t, 0, 0)
+	sim.ignore = 1 << 30
+	runTicks(t, l, 1)
+	step := maxAbsDiff(sim.sends[0], sim.q)
+	first := -1
+	gap := 0.0
+	for i := 0; i < 200; i++ {
+		runTicks(t, l, 1)
+		if first < 0 && l.Status().Resyncs > 0 {
+			first = i
+		}
+		if first >= 0 {
+			gap = math.Max(gap, maxAbsDiff(l.qCmd, sim.q))
+		}
+	}
+	if first < 0 || l.Status().Resyncs < 40 {
+		t.Fatalf("resyncs = %d (first at %d), want a steady stream after the first", l.Status().Resyncs, first)
+	}
+	if bound := deg2rad(l.cfg.ResyncDeg) + 2*step; gap > bound {
+		t.Fatalf("gap after the first resync %.2f°, want <= %.2f°", gap*180/math.Pi, bound*180/math.Pi)
+	}
+}
+
+func TestMaxLagMSSetsRingWindow(t *testing.T) {
+	// 10 ticks of lag (200 ms) fits a 300 ms cap but not a 100 ms one (5 ticks), which resyncs instead.
+	run := func(maxLagMS float64) int {
+		l, sim, m := newTestLoop(t, home, LoopConfig{MaxJointDegPerS: []float64{20, 20, 20, 20, 20, 20}, MaxLinearMMPerS: 200, MaxLagMS: maxLagMS, ResyncDeg: 0.6})
+		sim.delay = 10
+		l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+		l.SetVelocity([6]float64{0, 0.1, 0, 0, 0, 0})
+		runTicks(t, l, 150)
+		return l.Status().Resyncs
+	}
+	if n := run(300); n != 0 {
+		t.Fatalf("300 ms cap: resyncs = %d, want 0", n)
+	}
+	if n := run(100); n == 0 {
+		t.Fatal("100 ms cap: want resyncs for a 200 ms lag")
 	}
 }
 
@@ -831,5 +978,82 @@ func TestPoseLeashIgnoresDroppedRow(t *testing.T) {
 	l.mu.Unlock()
 	if math.Abs(got-5) > 0.25 {
 		t.Fatalf("target yawed %.2f° in 0.5 s at 10°/s, want 5 (dropped row must not leash)", got)
+	}
+}
+
+func TestStatusReachDeg(t *testing.T) {
+	// pointing, unreachable: ReachDeg is the reachable part, below ErrDeg, and converges
+	l, _, m, clk := newSO101Loop(t, q0a, LoopConfig{})
+	start := fkPose(t, m, q0a)
+	rq := spatialmath.Quaternion(quat.Mul(rotZ(deg2rad(20)), start.Orientation().Quaternion()))
+	l.SetTarget(spatialmath.NewPose(start.Point(), &rq))
+	clockTicks(t, l, clk, 300)
+	if s := l.Status(); !(s.ReachDeg <= s.ErrDeg) || s.ReachDeg >= 1 || s.PointingResidualDeg <= 5 {
+		t.Fatalf("reach=%.2f err=%.2f residual=%.2f", s.ReachDeg, s.ErrDeg, s.PointingResidualDeg)
+	}
+	// pose task, reachable: ReachDeg > 0 before convergence
+	u, _, um := newTestLoop(t, home, LoopConfig{})
+	u.SetTarget(offsetTarget(t, um, home, r3.Vector{X: 30}, deg2rad(10)))
+	runTicks(t, u, 1)
+	if s := u.Status(); s.ReachDeg <= 0 {
+		t.Fatalf("pose ReachDeg = %v, want > 0", s.ReachDeg)
+	}
+}
+
+// wristTarget returns the pose at q0 rotated by s rad about the pitch axis (tool tilts toward/away from the limit).
+func wristTarget(t *testing.T, m referenceframe.Model, q0 []float64, s float64) spatialmath.Pose {
+	t.Helper()
+	start := fkPose(t, m, q0)
+	pitch := toolAxis(start.Orientation().Quaternion()).Cross(r3.Vector{Z: 1}).Normalize()
+	h := math.Sin(s / 2)
+	rq := spatialmath.Quaternion(quat.Mul(quat.Number{Real: math.Cos(s / 2), Imag: pitch.X * h, Jmag: pitch.Y * h, Kmag: pitch.Z * h},
+		start.Orientation().Quaternion()))
+	return spatialmath.NewPose(start.Point(), &rq)
+}
+
+// Wrist flex pinned at its upper limit: an outward pointing step must lock it in the solve (not just in
+// the clamp), so position still converges and the unreachable pointing is reported as residual.
+func TestPointingWristAtLimit(t *testing.T) {
+	m := so101(t)
+	hi := m.DoF()[3].Max
+	q0 := []float64{0, 0.3, 0.3, hi - 2e-6, 0}
+	for _, tc := range []struct {
+		s       float64
+		outward bool
+	}{{0.35, true}, {-0.35, false}} {
+		l, _, _, clk := newSO101Loop(t, q0, LoopConfig{})
+		l.SetTarget(wristTarget(t, m, q0, tc.s))
+		clockTicks(t, l, clk, 500)
+		st := l.Status()
+		t.Logf("s=%+.2f state=%s err=%.2fmm residual=%.2f° q3=%.4f/%.4f", tc.s, st.State, st.ErrMM, st.PointingResidualDeg, st.QCmd[3], hi)
+		if st.State != StateConverged || st.ErrMM >= 2 {
+			t.Fatalf("s=%v: state=%s err=%.2fmm, want converged <2mm", tc.s, st.State, st.ErrMM)
+		}
+		if tc.outward && st.PointingResidualDeg <= 15 {
+			t.Fatalf("outward residual=%.2f°, want >15°", st.PointingResidualDeg)
+		}
+		if !tc.outward && st.QCmd[3] > hi-0.05 {
+			t.Fatalf("inward: joint 3 stayed at limit (q3=%.4f, hi=%.4f)", st.QCmd[3], hi)
+		}
+	}
+}
+
+// qm sagging 1° inside the limit while qCmd sits at it must still lock the joint in measure.
+func TestMeasureLocksOnCmdAtLimit(t *testing.T) {
+	m := so101(t)
+	hi := m.DoF()[3].Max
+	qc := []float64{0, 0.3, 0.3, hi, 0}
+	qm := slices.Clone(qc)
+	qm[3] = hi - deg2rad(1)
+	tgt := wristTarget(t, m, qc, 0.35)
+	mp, mq := fkPose(t, m, qm), fkPose(t, m, qm).Orientation().Quaternion()
+	l, _, _, _ := newSO101Loop(t, qc, LoopConfig{})
+	l.qCmd = slices.Clone(qc)
+	ms, err := l.measure(tgt.Point().Mul(1/mmPerM), tgt.Orientation().Quaternion(), mp.Point().Mul(1/mmPerM), mq, qm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ms.residualDeg <= 15 {
+		t.Fatalf("residual=%.2f°, want >15° (joint 3 locked via qCmd)", ms.residualDeg)
 	}
 }

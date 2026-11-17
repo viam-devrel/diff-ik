@@ -47,7 +47,7 @@ Spec: `docs/superpowers/specs/2026-11-15-diff-ik-phase3c1-design.md`. Plan: `doc
 4. **Droop.**
    - At `q_start`, wait 2 s, then record commanded minus measured for each joint: ___ °.
    - Record the end-effector error |FK(commanded) − FK(measured)|: ___ mm.
-   - Set `resync_deg` = max(3 ticks at the level speed, 2 × the largest per-joint droop) = ___.
+   - Set `resync_deg`: `resync_deg` is divergence beyond the measured lag. Keep the default (3 ticks at max joint speed), and raise it only for steady droop (to about 2 × the largest per-joint droop) = ___. Drop the old lag-sized overrides (16.2, 9.6, 4.8).
    - **End-effector error ≤ 1 mm:** the 2 mm bars stand.
    - **> 1 mm:** set `--tol-mm` (and the bench's `--tol-mm`) to 2 + that error = ___, and record the sag as a loop finding.
    - **> 5 mm:** stop and discuss before any servoing.
@@ -274,3 +274,139 @@ Read the driver's `streamed … late` lines with `read_machine_logs`. The bar is
 - **Calibrated limits** (leader / follower, deg): j0 −101.6…134.9 / −116.0…109.2; j1 −105.8…102.9 / −98.5…106.1; j2 −98.3…95.6 / −110.2…84.8; j3 −111.3…93.5 / −108.2…107.4; j4 −167.6…169.6 / −172.6…176.5. The leader's folded rest pose is outside the follower's range.
 - **Dry run:** leader read p50 1.8 ms, p99 2.6 ms, so 50 Hz fits.
 - **Settings used:** `--linear-mm-s 150 --joint-deg-s 90 --angular-deg-s 45 --resync-deg 16.2 --min-z-mm -10`, plus `--tol-mm 13 --tol-deg 5` for `smooth`.
+
+## Stage 3: AprilTag visual servoing
+
+Spec: `docs/superpowers/specs/2026-11-16-diff-ik-phase3c3-design.md`. Plan: `docs/superpowers/plans/2026-11-16-diff-ik-phase3c3.md`, Part C. The client is `clients/python/tag_servo.py`. It servos the follower to hover over an AprilTag, sending camera-frame targets that the `servo` module transforms into the arm frame (`servo_start` `frames: true`).
+
+### Hardware setup (record the measured values here)
+
+- **Wrist camera** (`wrist-cam`): rigidly mounted on the gripper, frame parent `follower-arm`.
+- **Scene camera** (`scene-cam`): fixed, 0.5–1 m from the workspace, oblique, frame parent `world`.
+- **ChArUco board for the table** (A4): dictionary ___, squares ___ × ___, square ___ mm, marker ___ mm.
+- **Small ChArUco board for the gripper** (about 100 × 70 mm): dictionary ___, squares ___ × ___, square ___ mm, marker ___ mm. Mount it rigidly; it must not flop.
+- **Two tag36h11 tags** on rigid cards: IDs ___ and ___, `tag_width_mm` ___ (edge length of the black square: not the diagonal, not including the white border).
+- **Offsets for the calibration `workspace_bounds`:**
+  - wrist camera to the lowest jaw point: ___ mm;
+  - gripper board to the lowest jaw point: ___ mm.
+
+### Config changes
+
+Each one needs the user's OK and a backup of the config first.
+
+1. Enable both cameras (`rdk:builtin:webcam`).
+2. Add the `viam:apriltag` module. Add one `viam:apriltag:pose_tracker` per camera (`camera_name`, `tag_family: "tag36h11"`, `tag_width_mm`), named e.g. `wrist-tags` and `scene-tags`.
+3. Add the `viam:camera-calibration` module:
+   - a `charuco` pose tracker per board/camera pair;
+   - an `eye_in_hand` service (wrist camera) and an `eye_to_hand` service (scene camera);
+   - `workspace_bounds` with `mode: "absolute"` (bounds on the camera pose, or on the board pose, *not* the jaw: z.min = table + the offset above + 20 mm);
+   - `input_range_override` inside the stage 1–2 joint ranges, containing the seed pose;
+   - `settle_seconds` 2.
+4. Add a **table obstacle**: a frame-system component with box geometry, its top 1–2 mm below the arm's base plane. The calibration module plans with no WorldState, so only frame-system obstacles count.
+5. **Before calibrating**, temporarily lower the follower's `speed_degs_per_sec` (20) and `acceleration_degs_per_sec_per_sec`. **Restore them afterwards.**
+6. Rebuild `bin/diff-ik` and restart its module after any module change.
+
+### 1. Intrinsics (each camera)
+
+```
+uv run clients/python/intrinsics.py --address $ADDR --insecure --camera wrist-cam \
+  --dict DICT_5X5_100 --squares 7x5 --square-mm <s> --marker-mm <m> --views 20
+```
+
+- Move the board through the whole view: centre and corners, near and far, tilted.
+- **Bar:** RMS < 1 px.
+- Paste the printed `intrinsic_parameters` and `distortion_parameters` into the camera's config (config change).
+- **Note:** `viam:apriltag` uses only fx, fy, ppx and ppy. It never applies distortion, which is an accuracy factor away from the image centre.
+
+### 2. Extrinsics (`viam:camera-calibration`)
+
+- **Wrist camera, `eye_in_hand`:** the A4 board flat on the table.
+- **Scene camera, `eye_to_hand`:** the small board on the gripper.
+
+Steps:
+1. Move the follower to a **high** seed pose with a clean view of the board (`bin/cli … pose --start-joints …`).
+   - The final return to the seed is an unplanned single joint move.
+   - Auto-apply runs before that return. If it reconfigures the module, the arm stays at its last station.
+2. Send `{"calibrate": {}}` to the service.
+   - **Never send `cancel`, and never press Stop in the app, during a sweep.** Both call the driver's `Stop`, which means max speed during a profiled move. Abort by cutting power.
+   - Hand on the follower's power switch, the other near the arm.
+3. **Bars:** translation residual ≤ 5 mm, rotation ≤ 2°, mean reprojection ≤ 2 px. Record the `quality` block and `auto_applied`.
+4. **After `eye_in_hand` auto-applies,** check the wrist camera's frame parent is `follower-arm` (or a 0-DoF frame). Parented to the input-enabled gripper, the module's chain check rejects it.
+5. Restore the follower's speed and acceleration.
+
+### 3. Calibration check (each camera)
+
+Put a tag flat at a ruler-measured position in the arm's base frame. Read its pose through the module: `servo_target` with `frame: <camera>` and `apply: false` on a `frames: true` session, or run `tag_servo.py --axis down` and read `tagarm_*` (the tag's arm-frame pose) in the CSV, or `tagarm_mean_mm` from `tag_lag.py`. Compare with the ruler. Record the error: ___ mm.
+
+### 4. Runs (each camera)
+
+Common flags: `--address $ADDR --insecure --camera <cam> --tracker <tracker> --tag-id <id>`. The defaults are L2 limits, `--min-z-mm -10` and `--timeout-ms 300`.
+
+1. **Static noise** (tag still, at the tracking distance, filter off):
+   ```
+   uv run clients/python/tag_servo.py … --hover-mm 150 --ema-alpha 1 --hold-mm 0 --hold-deg 0 --duration 10 --csv .runs/3c3-<cam>-noise
+   uv run clients/python/tag_lag.py .runs/3c3-<cam>-noise --rest all
+   ```
+   Set `--hold-mm` and `--hold-deg` to about 3× `raw_std_mm_axes` and 3× `raw_normal_std_deg` for the runs below.
+2. **Tracking** (60 s; hand-held tag moved slowly, then held still ≥ 3 s), with `--feedforward on`, then `--feedforward off`:
+   ```
+   uv run clients/python/tag_servo.py … --hover-mm 150 --hold-mm <h> --hold-deg <d> --feedforward on --duration 60 --csv .runs/3c3-<cam>-track-ff
+   ```
+   - Bars: driver late 0; overruns 0; max tick p99 < 20 ms; no visible jitter (user).
+   - Check `det_rate_hz` in `tag_lag.py`; if below ~5 Hz, raise `--gate-stale-s` from 0.2 to ~0.4.
+   - If there's jitter with `tuned`, repeat with `servo_gain_profile: "smooth"`. That is a config change on `follower-arm`: it needs the user's OK and a config backup first (see Config changes).
+3. **Static accuracy** (tag flat on the table at 5 positions; `--axis down`):
+   - scene camera: `--hover-mm 20` (closed loop), measure once converged (CSV state is `converged`);
+   - wrist camera: `--hover-mm 150 --final-hover-mm 20` (look, then move), measure at "measure now".
+   - Measure the horizontal offset from the tag centre of **the point on the tool axis between the pads** (the TCP is 6.8 mm off-axis and roll is free), and its height.
+   - Target ≤ 10 mm (informational).
+4. **Timing skew** (wrist camera, once): static tag; alternate separate runs at `--hover-mm 120` and `--hover-mm 180`, each with `--ema-alpha 1 --hold-mm 0 --hold-deg 0 --duration 5`, analysed with `tag_lag.py PREFIX --phase all`. It reports `skew_ms`.
+
+### After every run
+
+- Read the driver's `streamed … late` lines (`read_machine_logs`).
+- Run `uv run clients/python/tag_lag.py .runs/<prefix>`.
+
+### Safety
+
+- **Tag lost:** if no detection arrives for 100 ms, the client holds the last applied arm-frame target. After 0.5 s it stops the session. If the client dies, the dead-man stops the follower within 300 ms plus the 200 ms ramp.
+- **Targets are floor-clamped in the module** (both camera-frame and arm-frame), and the watchdog checks the follower's real pose.
+- **Ctrl-C and SIGTERM** exit cleanly, as in stage 2.
+- **Calibration sweeps** are the only planned or profiled motion: never `cancel`, never Stop, start high, hands on power.
+
+### Results log
+
+(Filled in during Part C.)
+
+### Stage 3 sim rehearsal (2026-11-16, `mujoco-sim-mac`, `--min-z-mm -70`)
+
+| Step | Result |
+|---|---|
+| B0 teleop self-tracking | 49.99 Hz, rest convergence 100 % (0.01 mm), 0 overruns; SIGINT, SIGTERM, `--fault-after` all exit cleanly |
+| B1 `frame_check.py` | camera round trip 0.0000 mm; +30 mm via `scene-cam` → dz 29.97 mm; below-floor target clamped, lowest z −55 (floor −70); `apply:false` moved 0.014 mm; zero pose in `arm` previews as the EE pose (0.034 mm) |
+| B2 fake tag, hover 150 | **first run failed:** wrist flex parked at its 95° limit, 38° of pointing error reported as reachable, engage timed out. Fixed in a846336 + 722bfa2 (joints at a limit and pushed outward are locked in both the reach split and the solve). After: converged 181/191 track ticks, mean err 0.22 mm, residual 35° reported as unreachable, det 18.6 Hz, 0 overruns |
+| B2b look-then-move, `--axis down`, hover 150 → 20 | converged, descended, "measure now"; hold 45 ticks converged, follower EE z 145.6 (jaw tip ≈ z 40 over a tag at z 20); no loss trip |
+| B3 `--fake-tag-drop-after 5` | 92 detections, 4 keepalive re-sends, "tag lost: stopped", exit 0 |
+
+**Hardware note:** a tag pose whose normal the 5-DOF arm can't match now converges on position and reports the gap as `pointing_residual_deg`, instead of hanging in engage.
+
+### Point-velocity A/B (2026-11-16, L2 bench, 50 Hz, 5 ms lead, `stream_speed_margin` 1.3, `tuned` gains)
+
+Driver `teleop-smooth` f7af962 (speed-profiled streaming uses `Constraints.Velocities` when present, else Δq/dt); diff-ik 3f10fca (`armIO` sends `(q − prevQ)/period`; `servo_start` `point_velocities`, bench `--no-point-velocities`). Runs alternated on, off, on, off; raw output in `.runs/ab-vel-*.txt`.
+
+| | on 1 | on 2 | off 1 | off 2 |
+|---|---|---|---|---|
+| command → motion, median / max | 88 / 102 ms | 89 / 99 ms | 89 / 107 ms | 91 / 103 ms |
+| stop sent → stationary | 196 ms | 189 ms | 205 ms | 214 ms |
+| travel after stop (ideal 5.0) | 6.9 mm | 6.7 mm | 6.6 mm | 6.7 mm |
+| dead-man → `stopped_timeout` | 535 ms | — | 535 ms | — |
+| last cmd → arm stationary | never (creep) | 514 ms | 548 ms | 1019 ms |
+| circle 50 mm/s, mean / max | 3.2 / 5.0 mm | 3.6 / 5.5 mm | 3.4 / 5.4 mm | 3.0 / 4.9 mm |
+
+Driver late 0 on all 28 streams. **No measurable difference** on this servo: the driver's Δq/dt estimate already equals the loop's velocity apart from tick jitter, and everything is inside run-to-run noise. Stop-to-stationary is 10–25 ms shorter with velocities on in both pairs, too small to call with n = 2. The dead-man "stationary" times are stick-slip creep noise, not the change. Keep velocities on (default): they're what a trajex producer (`TempStreamArmJointPositions`) needs on this driver, and they avoid Δq/dt's max-speed request on bunched points.
+
+### Driver streaming defaults fixed (2026-11-16)
+
+so-101 `teleop-smooth` d17f8ba + a7f67f1: speed-profiled streaming is the only streamed behaviour (margin 1.3, floor 10°/s, Acc unlimited, per-point velocities when present); the `stream_speed_margin`, `stream_min_speed_deg_s`, `stream_accel_deg_s2` and `stream_substeps` attributes are gone (old configs still load: unknown keys are ignored). Removed `stream_speed_margin` 1.3 and `stream_min_speed_deg_s` 10 from `follower-arm` on `laptop-main` (backup: `.runs/laptop-main-follower-arm-before-stream-defaults.json`).
+
+Confirmation L2 bench with no stream attributes: latency median 86 / max 99 ms, stop → stationary 184 ms (7.0 mm), dead-man 536 ms, circle 3.6 / 5.4 mm, 0 resyncs, ALL PASS, late 0 on 7 streams. Same as the configured runs above.
