@@ -1,12 +1,17 @@
-# Module diff-ik 
+# Module diff-ik
 
-Provide a description of the purpose of the module and any relevant information.
+Cartesian servoing for Viam arms: a motion service that tracks a stream of pose targets or twists with a 50 Hz
+differential-IK loop, with speed limits, a velocity ramp and a mandatory dead-man on every session. Use it for
+teleoperation, visual servoing and learned policies, where the target keeps moving. It also works as the motion
+backend of [`viam:teleop`](https://github.com/viam-modules/teleop).
+
+This is a proof of concept. Results are in `docs/results/`.
 
 ## Models
 
 This module provides the following model(s):
 
-- [`devrel:diff-ik:servo`](devrel_diff-ik_servo.md) - Provide a brief description of the model
+- [`devrel:diff-ik:servo`](devrel_diff-ik_servo.md): Cartesian servo sessions on arms through `DoCommand`, plus `viam:teleop`'s `teleop_*` commands
 
 ## Local SO-101 simulation (Phase 3a)
 

@@ -3,7 +3,7 @@
   "module_id": "devrel:diff-ik",
   "visibility": "public_unlisted",
   "url": "",
-  "description": "Modular motion service: servo",
+  "description": "Cartesian servoing for arms: a motion service that tracks streamed pose or twist targets with a differential-IK loop (teleop, visual servoing, policies)",
   "markdown_link": "README.md",
   "entrypoint": "bin/diff-ik",
   "first_run": "",
