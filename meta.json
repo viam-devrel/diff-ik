@@ -2,7 +2,7 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "devrel:diff-ik",
   "visibility": "public_unlisted",
-  "url": "",
+  "url": "https://github.com/viam-devrel/diff-ik",
   "description": "Cartesian servoing for arms: a motion service that tracks streamed pose or twist targets with a differential-IK loop (teleop, visual servoing, policies)",
   "markdown_link": "README.md",
   "entrypoint": "bin/diff-ik",
