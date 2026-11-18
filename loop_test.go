@@ -53,6 +53,9 @@ func (s *simIO) Send(_ context.Context, q []referenceframe.Input) error {
 
 func (s *simIO) Stop(context.Context) error { s.stopped = true; return s.stopErr }
 
+// noAccel lifts the acceleration limit for tests that pin the solver's exact steps.
+var noAccel = LoopConfig{MaxJointDegPerS2: []float64{1e9, 1e9, 1e9, 1e9, 1e9, 1e9}}
+
 // home is a typical UR5e working pose, away from singularities.
 var home = []float64{0, -1.2, 1.5, -1.9, -1.57, 0}
 
@@ -98,6 +101,8 @@ func TestNewLoopRejectsBadConfig(t *testing.T) {
 		"negative joint limit": {MaxJointDegPerS: []float64{90, 90, 90, 90, 90, -90}},
 		"negative gain":        {Gain: -1},
 		"huge max lag":         {MaxLagMS: 1001},
+		"negative accel":       {MaxJointDegPerS2: []float64{360, 360, 360, 360, 360, -1}},
+		"short accel":          {MaxJointDegPerS2: []float64{360}},
 	} {
 		if _, err := NewLoop(m, &simIO{}, cfg); err == nil {
 			t.Errorf("%s: want error", name)
@@ -856,7 +861,7 @@ func TestUR5ePoseDroppedPositionRow(t *testing.T) {
 // With m=5 < n=6 active rows the step is dpinv(W½J_active)·W½dx, undamped away from singularity.
 func TestUR5ePoseMLessThanNUsesDpinv(t *testing.T) {
 	w := [6]float64{1, 1, 1, 1, 1, 0}
-	l, sim, m, _ := newClockLoop(t, home, LoopConfig{TaskWeights: w})
+	l, sim, m, _ := newClockLoop(t, home, LoopConfig{TaskWeights: w, MaxJointDegPerS2: noAccel.MaxJointDegPerS2})
 	tgt := offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10))
 	l.SetTarget(tgt)
 	runTicks(t, l, 1)
@@ -912,7 +917,7 @@ func TestPointingLimitedWhenDamped(t *testing.T) {
 func TestPointingRampScalesAndCaps(t *testing.T) {
 	m := so101(t)
 	// (a) far reachable target: each tick's position step stays within the linear cap
-	l, sim, _, clk := newSO101Loop(t, q0a, LoopConfig{})
+	l, sim, _, clk := newSO101Loop(t, q0a, LoopConfig{MaxJointDegPerS2: slices.Repeat([]float64{1e9}, len(q0a))})
 	qt := []float64{q0a[0] + 0.6, q0a[1] - 0.5, q0a[2] + 0.5, q0a[3] - 0.3, q0a[4]}
 	far := fkPose(t, m, qt)
 	if d := far.Point().Sub(fkPose(t, m, q0a).Point()).Norm(); d < 100 {
@@ -935,7 +940,7 @@ func TestPointingRampScalesAndCaps(t *testing.T) {
 	}
 
 	// (b) pointing-dominant target (pitch only, same position): the ramp must scale the pointing level
-	l, sim, _, clk = newSO101Loop(t, q0a, LoopConfig{})
+	l, sim, _, clk = newSO101Loop(t, q0a, LoopConfig{MaxJointDegPerS2: slices.Repeat([]float64{1e9}, len(q0a))})
 	start := fkPose(t, m, q0a)
 	_, cq, _ := FK(m, q0a)
 	pitch := toolAxis(cq).Cross(r3.Vector{Z: 1}).Normalize()
@@ -1055,5 +1060,84 @@ func TestMeasureLocksOnCmdAtLimit(t *testing.T) {
 	}
 	if ms.residualDeg <= 15 {
 		t.Fatalf("residual=%.2f°, want >15° (joint 3 locked via qCmd)", ms.residualDeg)
+	}
+}
+
+// Every tick's joint step changes by at most a·dt² from the last (start ramp included), and a joint
+// driven at its upper limit brakes at √(2·a·d) instead of hitting the position clamp at speed.
+func TestAccelerationLimit(t *testing.T) {
+	l, sim, m := newTestLoop(t, home, LoopConfig{})
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10)))
+	runTicks(t, l, 150)
+	dt := 1 / l.cfg.RateHz
+	prev, prevStep := home, make([]float64, len(home))
+	for k, q := range sim.sends {
+		for i := range q {
+			step := q[i] - prev[i]
+			if lim := deg2rad(l.cfg.MaxJointDegPerS2[i]) * dt * dt; math.Abs(step-prevStep[i]) > lim+1e-12 {
+				t.Fatalf("send %d joint %d step change %.3g rad exceeds %.3g", k, i, step-prevStep[i], lim)
+			}
+			prevStep[i] = step
+		}
+		prev = q
+	}
+	if s := l.Status(); s.State != StateConverged {
+		t.Fatalf("state = %s, want converged", s.State)
+	}
+
+	// joint 0 just inside its upper limit, driven past it by the feedforward twist about base z
+	q0 := slices.Clone(home)
+	q0[0] = l.hi[0] - 0.05
+	l, sim, m = newTestLoop(t, q0, LoopConfig{})
+	l.SetTarget(offsetTarget(t, m, q0, r3.Vector{}, 0))
+	l.SetVelocity([6]float64{0, 0, 0, 0, 0, deg2rad(45)})
+	runTicks(t, l, 100)
+	a := deg2rad(l.cfg.MaxJointDegPerS2[0])
+	prev = q0
+	for k, q := range sim.sends {
+		if c := math.Sqrt(2*a*(l.hi[0]-prev[0]))*dt + 1e-12; q[0]-prev[0] > c {
+			t.Fatalf("send %d: joint 0 step %.3g exceeds braking cap %.3g", k, q[0]-prev[0], c)
+		}
+		prev = q
+	}
+}
+
+// A ramp-stop shorter than the acceleration limit allows runs on until the command is at rest.
+func TestRampStopWaitsForRest(t *testing.T) {
+	l, sim, m, clk := newClockLoop(t, home, LoopConfig{})
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+	l.SetVelocity([6]float64{0, 0, 0, 0, 0, deg2rad(45)})
+	clockTicks(t, l, clk, 50)
+	l.RampStop(20*time.Millisecond, StateStopped)
+	if !clockTicks(t, l, clk, 100) {
+		t.Fatal("ramp did not complete")
+	}
+	dt := 1 / l.cfg.RateHz
+	n := len(sim.sends)
+	if d := maxAbsDiff(sim.sends[n-1], sim.sends[n-2]); d > deg2rad(l.cfg.MaxJointDegPerS2[0])*dt*dt+1e-12 {
+		t.Fatalf("last step %.3g rad: stopped while still moving", d)
+	}
+}
+
+func TestModelAccelerationTightens(t *testing.T) {
+	sm := ur5e(t).(*referenceframe.SimpleModel)
+	first := sm.MoveableFrameNames()[0]
+	lim := sm.DoF()[0]
+	lim.MaxAcceleration = func(v float64) *float64 { return &v }(deg2rad(100))
+	m, err := referenceframe.NewModelWithLimitOverrides(sm, map[string]referenceframe.Limit{first: lim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		cfg  []float64
+		want float64
+	}{{nil, 100}, {[]float64{50, 50, 50, 50, 50, 50}, 50}, {[]float64{500, 500, 500, 500, 500, 500}, 100}} {
+		l, err := NewLoop(m, &simIO{}, LoopConfig{MaxJointDegPerS2: c.cfg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := l.Config().MaxJointDegPerS2[0]; math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("cfg %v: joint 0 accel %v, want %v", c.cfg, got, c.want)
+		}
 	}
 }

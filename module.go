@@ -259,6 +259,11 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 				return nil, nil, err
 			}
 		}
+		if v, ok := lm["joint_deg_s2"]; ok {
+			if lc.MaxJointDegPerS2, err = numOrList(v, "limits.joint_deg_s2"); err != nil {
+				return nil, nil, err
+			}
+		}
 		for _, f := range []struct {
 			key string
 			dst *float64
@@ -523,13 +528,17 @@ func statusMap(st SessionStatus) map[string]interface{} {
 	for i, v := range st.Config.MaxJointDegPerS {
 		js[i] = v
 	}
+	as := make([]interface{}, len(st.Config.MaxJointDegPerS2))
+	for i, v := range st.Config.MaxJointDegPerS2 {
+		as[i] = v
+	}
 	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 	out := map[string]interface{}{
 		"task":  st.Task,
 		"state": string(st.State), "err_mm": st.ErrMM, "err_deg": st.ErrDeg, "rate_hz": st.RateHz,
 		"last_command_age_ms": ms(st.LastCmdAge),
 		"limits": map[string]interface{}{
-			"joint_deg_s": js, "linear_mm_s": st.Config.MaxLinearMMPerS,
+			"joint_deg_s": js, "joint_deg_s2": as, "linear_mm_s": st.Config.MaxLinearMMPerS,
 			"angular_deg_s": st.Config.MaxAngularDegPerS, "resync_deg": st.Config.ResyncDeg, "max_lag_ms": st.Config.MaxLagMS,
 			"singular_eps": st.Config.SingularEps, "max_damping": st.Config.MaxDamping,
 			"tol_mm": st.Config.TolMM, "tol_deg": st.Config.TolDeg,

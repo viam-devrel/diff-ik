@@ -4,8 +4,8 @@ A motion service that servos arms in Cartesian space. A client opens a session o
 twists to it. A 50 Hz differential-IK loop tracks the latest one and streams joint goals to the arm through
 `MoveThroughJointPositionsStreamed`.
 
-Every session enforces joint, linear and angular speed limits, a velocity ramp at start and stop, and a mandatory
-dead-man timeout. Targets can be given in any frame.
+Every session enforces joint, linear and angular speed limits, joint acceleration limits (which ramp motion at start
+and stop), and a mandatory dead-man timeout. Targets can be given in any frame.
 
 The service also answers [`viam:teleop`](https://github.com/viam-modules/teleop)'s `teleop_*` commands, so it can be
 that module's `motion_service`.
@@ -55,7 +55,7 @@ second session on a busy arm fails.
   "rate_hz": 50,
   "timeout_ms": 500,
   "ramp_ms": 200,
-  "limits": { "joint_deg_s": 90, "linear_mm_s": 100, "angular_deg_s": 45 },
+  "limits": { "joint_deg_s": 90, "joint_deg_s2": 360, "linear_mm_s": 100, "angular_deg_s": 45 },
   "target_filter": { "ema_alpha": 1, "hold_mm": 1, "hold_deg": 0.5, "feedforward": true,
                      "floor": { "min_z_mm": 0, "tip_mm": 100, "margin_mm": 15 } },
   "frames": false
@@ -70,8 +70,9 @@ second session on a busy arm fails.
 | `task` | `pose`; `pointing` below 6 DOF | `pointing` tracks position and tool-axis direction. |
 | `rate_hz` | 50 | 1–1000. |
 | `timeout_ms` | 500 | Dead-man, in (0, 10000]. It can't be disabled. |
-| `ramp_ms` | 200 | Velocity ramp at start and stop. |
+| `ramp_ms` | 200 | Stop ramp: the velocity scales to zero over this time. The stop lasts longer if the acceleration limit needs it. |
 | `limits.joint_deg_s` | 90 | A number, or one per joint. |
+| `limits.joint_deg_s2` | the arm's kinematic model, else 360 | Joint acceleration limit: a number, or one per joint. It can only tighten the model's limit. Each tick, the change in joint velocity is scaled (all joints together) to stay within it, and a joint near a position limit is slowed to √(2·a·d) so it can stop in time. |
 | `limits.linear_mm_s` / `angular_deg_s` | 100 / 45 | TCP speed limits. |
 | `limits.tol_mm` / `tol_deg` | 2 / 2 | Convergence tolerance. |
 | `limits.resync_deg`, `limits.max_lag_ms` | 3 ticks at the joint cap; 300 | See Status fields. |

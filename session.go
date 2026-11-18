@@ -81,7 +81,7 @@ type poseTransformer interface {
 }
 
 // SessionConfig is a parsed servo_start request. Loop.RateHz must be set. A one-element
-// Loop.MaxJointDegPerS applies to every joint.
+// Loop.MaxJointDegPerS or Loop.MaxJointDegPerS2 applies to every joint.
 type SessionConfig struct {
 	Frame   string // "world" or "<arm>_origin"
 	Mode    Mode
@@ -429,6 +429,9 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 	}
 	if js := cfg.Loop.MaxJointDegPerS; len(js) == 1 {
 		cfg.Loop.MaxJointDegPerS = slices.Repeat(js, len(model.DoF()))
+	}
+	if as := cfg.Loop.MaxJointDegPerS2; len(as) == 1 {
+		cfg.Loop.MaxJointDegPerS2 = slices.Repeat(as, len(model.DoF()))
 	}
 	io := m.newIO(a, cfg.Loop.RateHz)
 	if aio, ok := io.(*armIO); ok { // newIO is per session; test fakes aren't armIOs

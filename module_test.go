@@ -102,6 +102,7 @@ func TestDoCommandErrors(t *testing.T) {
 		{start("ramp_ms", 6000.0), "ramp_ms"},
 		{start("rate_hz", 2000.0), "rate_hz"},
 		{start("limits", map[string]interface{}{"joint_deg_s": []interface{}{math.NaN()}}), "joint_deg_s"},
+		{start("limits", map[string]interface{}{"joint_deg_s2": "fast"}), "joint_deg_s2"},
 		{start("task_weights", []interface{}{math.NaN(), 1.0, 1.0, 1.0, 1.0, 1.0}), "task_weights"},
 		{start("rate_hz", math.NaN()), "rate_hz"},
 		{start("rate_hz", "fast"), "rate_hz"},

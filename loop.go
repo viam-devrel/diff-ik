@@ -31,6 +31,7 @@ type LoopConfig struct {
 	MaxLinearMMPerS   float64
 	MaxAngularDegPerS float64
 	MaxJointDegPerS   []float64 // one per joint
+	MaxJointDegPerS2  []float64 // acceleration, one per joint; nil: the model's, else defaultJointDegPerS2
 	SingularEps       float64
 	MaxDamping        float64
 	ResyncDeg         float64
@@ -96,6 +97,14 @@ func (c LoopConfig) validate(dof int) error {
 			return fmt.Errorf("joint %d velocity limit must be > 0, got %v", i, v)
 		}
 	}
+	if len(c.MaxJointDegPerS2) != dof {
+		return fmt.Errorf("need %d joint acceleration limits, got %d", dof, len(c.MaxJointDegPerS2))
+	}
+	for i, v := range c.MaxJointDegPerS2 {
+		if !(v > 0) {
+			return fmt.Errorf("joint %d acceleration limit must be > 0, got %v", i, v)
+		}
+	}
 	for _, p := range []struct {
 		name string
 		v    float64
@@ -129,6 +138,8 @@ const (
 )
 
 const (
+	defaultJointDegPerS2 = 360 // reaches the default 90°/s joint cap in 0.25 s
+
 	minHold = 100 * time.Millisecond // floor on the SetMotion extrapolation hold
 	leashS  = 0.1                    // the target may lead FK(q_cmd) by this many seconds at the speed limits
 )
@@ -181,7 +192,8 @@ type Loop struct {
 
 	stopErr error // io.Stop result of a completed ramp; written and read only on the loop goroutine
 
-	qCmd []float64
+	qCmd     []float64
+	lastStep []float64 // q_cmd change on the last tick, rad; loop goroutine only
 
 	sent     [][]float64 // last sent commands, oldest first, at most MaxLagMS of ticks; loop goroutine only
 	lagTicks float64     // estimated arm lag in ticks; loop goroutine only
@@ -212,10 +224,23 @@ func NewLoop(model referenceframe.Model, io JointIO, cfg LoopConfig) (*Loop, err
 	limits := model.DoF()
 	dof := len(limits)
 	cfg = cfg.withDefaults(dof)
+	if cfg.MaxJointDegPerS2 == nil {
+		cfg.MaxJointDegPerS2 = make([]float64, dof)
+		for i := range cfg.MaxJointDegPerS2 {
+			cfg.MaxJointDegPerS2[i] = defaultJointDegPerS2
+		}
+	}
 	if err := cfg.validate(dof); err != nil {
 		return nil, err
 	}
-	l := &Loop{model: model, io: io, cfg: cfg, lo: make([]float64, dof), hi: make([]float64, dof)}
+	// the model's acceleration limits (rad/s²) win where they are tighter: the session may only tighten
+	cfg.MaxJointDegPerS2 = slices.Clone(cfg.MaxJointDegPerS2)
+	for i, lim := range limits {
+		if a := lim.MaxAcceleration; a != nil && *a > 0 {
+			cfg.MaxJointDegPerS2[i] = math.Min(cfg.MaxJointDegPerS2[i], rad2deg(*a))
+		}
+	}
+	l := &Loop{model: model, io: io, cfg: cfg, lo: make([]float64, dof), hi: make([]float64, dof), lastStep: make([]float64, dof)}
 	for i, lim := range limits {
 		// stay fdStep inside the limits so Jacobian perturbations remain valid inputs
 		l.lo[i], l.hi[i] = lim.Min+fdStep, lim.Max-fdStep
@@ -423,9 +448,10 @@ func (l *Loop) stop(cause error) error {
 // tick runs one control step. See the spec's per-tick data flow; step numbers match.
 func (l *Loop) tick(ctx context.Context, dt float64) error {
 	// 0. ramp-stop complete: stop the arm and end. This runs before the idle return so an idle ramp ends too.
+	// The ramp lasts until the acceleration limit allows stopping in one tick, which may be after ramp.
 	l.mu.Lock()
 	ramping, scale := l.rampScale()
-	if ramping && scale == 0 {
+	if ramping && scale == 0 && l.canStop(dt) {
 		l.status.State = l.rampFinal
 		l.mu.Unlock()
 		// final state is set even if io.Stop fails; Run returns that error (spec: 'or the stop error')
@@ -500,11 +526,18 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 		}
 	}
 
+	// 7b. acceleration: brake ahead of position limits, then clamp the velocity change, all joints together
+	step := make([]float64, len(dq))
+	for i, d := range dq {
+		step[i] = d * s
+	}
+	accelLimited := l.limitAccel(step, dt)
+
 	// 8. position limits
 	next := make([]float64, len(dq))
 	clamped := false
-	for i, d := range dq {
-		v := l.qCmd[i] + d*s
+	for i := range dq {
+		v := l.qCmd[i] + step[i]
 		if v < l.lo[i] || v > l.hi[i] {
 			v = math.Min(math.Max(v, l.lo[i]), l.hi[i])
 			clamped = true
@@ -515,6 +548,9 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	// 9. send
 	if err := l.io.Send(ctx, next); err != nil {
 		return fmt.Errorf("sending joints: %w", err)
+	}
+	for i := range next {
+		l.lastStep[i] = next[i] - l.qCmd[i]
 	}
 	copy(l.qCmd, next)
 	// ponytail: the ring holds MaxLagMS of commands; a lag longer than that is treated as divergence (it
@@ -536,7 +572,7 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	if err != nil {
 		return err
 	}
-	limited := s < 1 || clamped || limitedTask
+	limited := s < 1 || clamped || limitedTask || accelLimited
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -555,6 +591,46 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	l.lastReach = deg2rad(ms.convDeg)
 	st.State = l.nextState(ms, limited, vel != ([6]float64{}))
 	return nil
+}
+
+// canStop reports whether the last tick's step is small enough to stop from within the acceleration limit.
+func (l *Loop) canStop(dt float64) bool {
+	for i, d := range l.lastStep {
+		if math.Abs(d) > deg2rad(l.cfg.MaxJointDegPerS2[i])*dt*dt {
+			return false
+		}
+	}
+	return true
+}
+
+// limitAccel limits this tick's joint step (rad) in place and reports whether it changed it. A joint
+// moving toward a position limit is capped at √(2·a·d)·dt, d the distance left, so it can always stop in
+// time. Then the change from the last tick's step is scaled, all joints together, to at most a·dt² per
+// joint. Steps rather than velocities keep an unlimited tick bit-exact.
+func (l *Loop) limitAccel(step []float64, dt float64) bool {
+	changed := false
+	k := 1.0
+	for i := range step {
+		a := deg2rad(l.cfg.MaxJointDegPerS2[i])
+		d := l.hi[i] - l.qCmd[i]
+		if step[i] < 0 {
+			d = l.qCmd[i] - l.lo[i]
+		}
+		if c := math.Sqrt(2*a*math.Max(d, 0)) * dt; math.Abs(step[i]) > c {
+			step[i] = math.Copysign(c, step[i])
+			changed = true
+		}
+		if dv := math.Abs(step[i] - l.lastStep[i]); dv*k > a*dt*dt {
+			k = a * dt * dt / dv
+		}
+	}
+	if k < 1 {
+		for i := range step {
+			step[i] = l.lastStep[i] + k*(step[i]-l.lastStep[i])
+		}
+		changed = true
+	}
+	return changed
 }
 
 // sentAgo returns the command sent d ticks before the most recent one, or nil if the ring is shorter.
@@ -774,6 +850,7 @@ func Oscillations(qs [][]float64, minStep []float64) []int {
 }
 
 func deg2rad(d float64) float64 { return d * math.Pi / 180 }
+func rad2deg(r float64) float64 { return r * 180 / math.Pi }
 
 func capNorm(v r3.Vector, max float64) r3.Vector {
 	if n := v.Norm(); n > max {

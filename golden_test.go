@@ -30,19 +30,19 @@ func goldenScenarios(t *testing.T) map[string][][]uint64 {
 	}
 	res := map[string][][]uint64{}
 
-	l, sim, m := newTestLoop(t, home, LoopConfig{})
+	l, sim, m := newTestLoop(t, home, noAccel)
 	l.SetTarget(offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10)))
 	runTicks(t, l, 150)
 	res["converge"] = bits(sim.sends)
 
 	q0 := slices.Clone(home)
 	q0[4] = 0
-	l, sim, m = newTestLoop(t, q0, LoopConfig{})
+	l, sim, m = newTestLoop(t, q0, noAccel)
 	l.SetTarget(offsetTarget(t, m, q0, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10)))
 	runTicks(t, l, 150)
 	res["singular"] = bits(sim.sends)
 
-	l, sim, m, clk := newClockLoop(t, home, LoopConfig{})
+	l, sim, m, clk := newClockLoop(t, home, noAccel)
 	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
 	l.SetVelocity([6]float64{0.05, 0, 0, 0, 0, deg2rad(10)})
 	clockTicks(t, l, clk, 50)
