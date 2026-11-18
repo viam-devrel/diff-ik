@@ -1,9 +1,12 @@
 package diffik
 
 import (
+	"fmt"
 	"math"
+	"slices"
 
 	"github.com/golang/geo/r3"
+	"go.viam.com/rdk/referenceframe"
 	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/gonum/num/quat"
 )
@@ -159,4 +162,93 @@ func pointingSplit(J1, J2 *mat.Dense, e2 [2]float64) (reach, residual float64, d
 	q0.MulVec(P, e)
 	q.MulVec(N1, &q0)
 	return er.Norm(2), math.Hypot(e2[0]-er.AtVec(0), e2[1]-er.AtVec(1)), q.RawVector().Data, nil
+}
+
+// pointingAxisWeight weighs the QP's two tool-axis rows against the position rows (weight 1): its square
+// root, 0.01, makes 1 rad of axis error cost what 10 mm of position error does, so position wins
+// whenever the two conflict (spec "Objective"; stands in for prioritySolve's strict priority).
+const pointingAxisWeight = 1e-4
+
+// pointingTaskRows stacks J1 (3×n) over √pointingAxisWeight·J2 (2×n), with the matching Δx.
+func pointingTaskRows(J1, J2 *mat.Dense, dx1, dx2 []float64) taskRows {
+	_, n := J1.Dims()
+	sw := math.Sqrt(pointingAxisWeight)
+	A, b := mat.NewDense(5, n, nil), make([]float64, 5)
+	for j := 0; j < n; j++ {
+		for i := 0; i < 3; i++ {
+			A.Set(i, j, J1.At(i, j))
+		}
+		for i := 0; i < 2; i++ {
+			A.Set(3+i, j, sw*J2.At(i, j))
+		}
+	}
+	copy(b, dx1)
+	b[3], b[4] = sw*dx2[0], sw*dx2[1]
+	return taskRows{A: A, b: b}
+}
+
+// SelfMotion moves q along the arm's self-motion (the null space of its 6×n Jacobian, n > 6) until joint
+// j has changed by delta rad, pulling the pose back to FK(q) after each small step. The result holds
+// the same end-effector pose with a different posture.
+func SelfMotion(m referenceframe.Model, q []float64, j int, delta float64) ([]float64, error) {
+	p0, o0, err := FK(m, q)
+	if err != nil {
+		return nil, err
+	}
+	cur := slices.Clone(q)
+	const h = 0.002 // rad of joint j per step
+	for k := 0; k < 10000 && math.Abs(delta-(cur[j]-q[j])) > 1e-6; k++ {
+		J, err := Jacobian(m, cur)
+		if err != nil {
+			return nil, err
+		}
+		_, n := J.Dims()
+		if n <= 6 {
+			return nil, fmt.Errorf("self-motion needs more than 6 joints, got %d", n)
+		}
+		var svd mat.SVD
+		if !svd.Factorize(J, mat.SVDFull) {
+			return nil, errSVD
+		}
+		var V mat.Dense
+		svd.VTo(&V)
+		v := mat.Col(nil, n-1, &V)
+		if math.Abs(v[j]) < 0.05 { // else h/v[j] would swing the other joints wildly (review finding)
+			return nil, fmt.Errorf("joint %d barely moves along the self-motion here (|v| = %.3g)", j, math.Abs(v[j]))
+		}
+		want := delta - (cur[j] - q[j])
+		s := math.Copysign(math.Min(h, math.Abs(want)), want) / v[j]
+		for i := range cur {
+			cur[i] += s * v[i]
+		}
+		for it := 0; it < 3; it++ {
+			p, o, err := FK(m, cur)
+			if err != nil {
+				return nil, err
+			}
+			e := PoseError(p0, o0, p, o)
+			Jc, err := Jacobian(m, cur)
+			if err != nil {
+				return nil, err
+			}
+			P, _, _, _, err := dpinv(Jc, 1, 0, false)
+			if err != nil {
+				return nil, err
+			}
+			var dq mat.VecDense
+			dq.MulVec(P, mat.NewVecDense(6, e[:]))
+			for i := range cur {
+				cur[i] += dq.AtVec(i)
+			}
+		}
+		for i, lim := range m.DoF() {
+			if cur[i] < lim.Min || cur[i] > lim.Max {
+				return nil, fmt.Errorf("self-motion took joint %d out of its limits", i)
+			}
+		}
+	}
+	if math.Abs(delta-(cur[j]-q[j])) > 1e-6 {
+		return nil, fmt.Errorf("self-motion stalled at joint %d: moved %.4g of %.4g rad", j, cur[j]-q[j], delta)
+	}
+	return cur, nil
 }

@@ -14,15 +14,15 @@ import os
 import time
 
 POSE_KEYS = ("x", "y", "z", "o_x", "o_y", "o_z", "theta")
-FOLLOW_COLS = ["t", "kind", *[f"f_{k}" for k in POSE_KEYS], "rate_hz", "tick_p99_ms", "overruns", "resyncs", "lag_ms"]
+FOLLOW_COLS = ["t", "kind", *[f"f_{k}" for k in POSE_KEYS], "rate_hz", "tick_p99_ms", "overruns", "resyncs", "lag_ms", "peak_accel_ratio"]
 
 
 def follow_row(t: float, fp: dict, st: dict | None = None) -> list:
     """One follower-CSV row: a "pose" row, or a "status" row from a servo_status reply st."""
     if st is None:
-        return [f"{t:.4f}", "pose", *[fp[q] for q in POSE_KEYS], "", "", "", "", ""]
+        return [f"{t:.4f}", "pose", *[fp[q] for q in POSE_KEYS], "", "", "", "", "", ""]
     return [f"{t:.4f}", "status", *[fp[q] for q in POSE_KEYS], st.get("rate_hz"), st.get("tick_p99_ms"),
-            st.get("overruns"), st.get("resyncs"), st.get("lag_ms")]
+            st.get("overruns"), st.get("resyncs"), st.get("lag_ms"), st.get("peak_accel_ratio")]
 
 
 def pose_dict(p) -> dict:
@@ -75,6 +75,7 @@ def base_parser(doc: str) -> argparse.ArgumentParser:
     ap.add_argument("--service", default="servo")
     ap.add_argument("--follower", default="follower-arm")
     ap.add_argument("--joint-deg-s", type=float, default=60)
+    ap.add_argument("--solver", choices=["dls", "qp"], default=None, help="servo_start solver (default: the server's, dls)")
     ap.add_argument("--linear-mm-s", type=float, default=70)
     ap.add_argument("--angular-deg-s", type=float, default=30)
     ap.add_argument("--resync-deg", type=float, default=9.6)
@@ -163,7 +164,7 @@ class ServoClient:
         r = await self.svc.do_command({
             "command": "servo_start", "component_name": a.follower, "frame": f"{a.follower}_origin",
             "mode": "pose", "task": task, "rate_hz": a.rate, "timeout_ms": a.timeout_ms,
-            "limits": level_limits(a, half=half), **extra})
+            "limits": level_limits(a, half=half), **({"solver": a.solver} if a.solver else {}), **extra})
         self.sid = r["session_id"]
         return r["pose"]
 

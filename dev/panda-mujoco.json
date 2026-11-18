@@ -1,0 +1,37 @@
+{
+  "network": {"bind_address": "localhost:8083"},
+  "modules": [
+    {"type": "local", "name": "mujoco-sim", "executable_path": "/Users/nick.hehr/src/viam-mujoco-sim/run.sh"},
+    {"type": "local", "name": "diff-ik", "executable_path": "/Users/nick.hehr/src/diff-ik/bin/diff-ik"}
+  ],
+  "components": [
+    {"name": "sim-world", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:world",
+     "attributes": {"props": [
+       {"name": "mug", "type": "mesh", "mesh": "/Users/nick.hehr/viam-sim-demos/franka-mug/assets/mug-centered/mug.obj",
+        "texture": "/Users/nick.hehr/viam-sim-demos/franka-mug/assets/mug-centered/texture_map.png",
+        "position": [0.5, 0.1, 0.0615], "orientation_wxyz": [0.7071068, 0, 0, 0.7071068],
+        "scale": 1, "mass": 0.3, "static_friction": 2, "color": [0.8, 0.2, 0.2]}]}},
+    {"name": "table", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:obstacle",
+     "attributes": {"world": "sim-world", "color": [0.55, 0.45, 0.35]},
+     "frame": {"parent": "world", "translation": {"x": 600, "y": 0, "z": 10},
+               "geometry": {"type": "box", "x": 800, "y": 1200, "z": 20}}},
+    {"name": "bin", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:obstacle",
+     "attributes": {"world": "sim-world", "color": [0.3, 0.5, 0.8], "mesh": "meshes/bin.stl"},
+     "frame": {"parent": "world", "translation": {"x": 450, "y": -350, "z": 0}}},
+    {"name": "pick-arm", "api": "rdk:component:arm", "model": "viam-labs:mujoco-sim:arm",
+     "attributes": {"world": "sim-world", "max_joint_deg_s": 30, "max_joint_deg_s2": 60,
+                    "mjcf": "/Users/nick.hehr/viam-sim-demos/franka-mug/assets/franka_emika_panda/panda_nohand.xml"},
+     "frame": {"parent": "world"}},
+    {"name": "pick-gripper", "api": "rdk:component:gripper", "model": "viam-labs:mujoco-sim:gripper",
+     "attributes": {"world": "sim-world", "arm": "pick-arm", "asset": "robotiq_2f85", "sensorless": true},
+     "frame": {"parent": "pick-arm", "translation": {"x": 0, "y": 0, "z": 155.8}}},
+    {"name": "overview", "api": "rdk:component:camera", "model": "viam-labs:mujoco-sim:camera",
+     "attributes": {"world": "sim-world", "width": 1280, "height": 720, "target": [0.45, -0.15, 0.05]},
+     "frame": {"parent": "world", "translation": {"x": 1450, "y": 300, "z": 700}}}
+  ],
+  "services": [
+    {"name": "world-state", "api": "rdk:service:world_state_store", "model": "viam-labs:mujoco-sim:world_state",
+     "attributes": {"world": "sim-world"}},
+    {"name": "servo", "api": "rdk:service:motion", "model": "devrel:diff-ik:servo", "attributes": {"arms": ["pick-arm"]}}
+  ]
+}

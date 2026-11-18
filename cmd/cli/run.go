@@ -78,6 +78,10 @@ type runOpts struct {
 	circleMMs                                   float64
 	lead                                        time.Duration
 	guard                                       *floorGuard
+	solver                                      string
+	postureJoint                                int
+	postureDeg, postureW, postureK              float64
+	orbitDegS, orbitDeg, maxJointDegS2          float64
 }
 
 func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario string, o runOpts) (err error) {
@@ -110,6 +114,10 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 	case "circle":
 		fmt.Printf("circle: %.0f mm/s\n", o.circleMMs)
 		body = circleAt(o.circleMMs, o.guard)
+	case "hold":
+		body = holdScenario(o.hold, o.postureW > 0 || o.postureDeg != 0)
+	case "orbit":
+		body = orbit(model, o.orbitDegS, o.orbitDeg)
 	default:
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}
@@ -120,6 +128,24 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 		for range model.DoF() {
 			cfg.MaxJointDegPerS = append(cfg.MaxJointDegPerS, o.maxJointDegS)
 		}
+	}
+	if o.maxJointDegS2 > 0 {
+		for range model.DoF() {
+			cfg.MaxJointDegPerS2 = append(cfg.MaxJointDegPerS2, o.maxJointDegS2)
+		}
+	}
+	cfg.Solver = o.solver
+	if o.postureW > 0 || o.postureDeg != 0 {
+		pq, perr := a.JointPositions(ctx, nil)
+		if perr != nil {
+			return perr
+		}
+		if o.postureDeg != 0 {
+			if pq, perr = diffik.SelfMotion(model, pq, o.postureJoint, o.postureDeg*math.Pi/180); perr != nil {
+				return perr
+			}
+		}
+		cfg.Posture = &diffik.Posture{JointsDeg: degrees(pq), Weight: o.postureW, Gain: o.postureK}
 	}
 	l, err := diffik.NewLoop(model, diffik.NewArmIOLead(a, o.rate, o.lead), cfg)
 	if err != nil {
@@ -178,6 +204,7 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 	fmt.Printf("rate:     %.2f Hz (pass ≥ %.2f) %s\n", s.RateHz, minRate, pass(s.RateHz >= minRate))
 	fmt.Printf("tick:     p50 %v  p99 %v\n", s.TickP50, s.TickP99)
 	fmt.Printf("overruns: %d   resyncs: %d\n", s.Overruns, s.Resyncs)
+	fmt.Printf("peak accel ratio: %.3f   qp fallbacks: %d\n", s.PeakAccelRatio, s.QPFallbacks)
 	if !(s.RateHz >= minRate) { // NaN-safe
 		scenarioErr = errors.Join(scenarioErr, fmt.Errorf("loop rate %.2f Hz below %.2f", s.RateHz, minRate))
 	}
@@ -458,4 +485,132 @@ func axisAngle(axis r3.Vector, angle float64) quat.Number {
 
 func randUnit(rng *rand.Rand) r3.Vector {
 	return r3.Vector{X: rng.NormFloat64(), Y: rng.NormFloat64(), Z: rng.NormFloat64()}.Normalize()
+}
+
+func degrees(q []float64) []float64 {
+	d := make([]float64, len(q))
+	for i, v := range q {
+		d[i] = v * 180 / math.Pi
+	}
+	return d
+}
+
+// holdScenario: target the start pose for hold (default 3 s) and report the worst error, and with a
+// posture task the largest joint distance to q0.
+func holdScenario(hold time.Duration, posture bool) func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error {
+	return func(ctx context.Context, l *diffik.Loop, rec *recorder, start spatialmath.Pose) error {
+		if hold == 0 {
+			hold = 3 * time.Second
+		}
+		l.SetTarget(start)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(hold):
+		}
+		rows, _ := rec.since(0)
+		worst := 0.0
+		for _, r := range rows {
+			worst = math.Max(worst, r.ErrMM)
+		}
+		fmt.Printf("hold: worst err %.2f mm\n", worst)
+		if p := l.Config().Posture; posture && p != nil && len(rows) > 0 {
+			last := rows[len(rows)-1]
+			dist := func(q []float64) (d float64) {
+				for i, v := range q {
+					d = math.Max(d, math.Abs(v*180/math.Pi-p.JointsDeg[i]))
+				}
+				return d
+			}
+			fmt.Printf("posture: max joint distance to q0: measured %.2f°  commanded %.2f°\n", dist(last.QMeas), dist(last.QCmd))
+		}
+		return nil
+	}
+}
+
+// orbitTarget is start rotated deg about the base z axis: position about the origin, orientation left-multiplied.
+func orbitTarget(start spatialmath.Pose, deg float64) spatialmath.Pose {
+	rz := spatialmath.NewPoseFromOrientation(&spatialmath.OrientationVectorDegrees{OZ: 1, Theta: deg})
+	return spatialmath.Compose(rz, start)
+}
+
+// orbit rotates the target about base z at degS for total degrees, then holds 1 s. The target starts at
+// the current pose, so there is no convergence wait.
+func orbit(model referenceframe.Model, degS, total float64) func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error {
+	return func(ctx context.Context, l *diffik.Loop, rec *recorder, start spatialmath.Pose) error {
+		from := rec.len()
+		t := time.NewTicker(time.Duration(float64(time.Second) / l.Config().RateHz))
+		defer t.Stop()
+		t0 := time.Now()
+		for deg := 0.0; deg < total; deg = degS * time.Since(t0).Seconds() {
+			l.SetTarget(orbitTarget(start, math.Min(deg, total)))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+			}
+		}
+		l.SetTarget(orbitTarget(start, total))
+		orbitEnd := rec.len()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+		rows, _ := rec.since(from)
+		rows = rows[:orbitEnd-from]
+		if len(rows) == 0 {
+			return errors.New("no ticks recorded during orbit")
+		}
+		var sum, worst, limSum float64
+		var limN int
+		for _, r := range rows {
+			sum += r.ErrMM
+			worst = math.Max(worst, r.ErrMM)
+			if r.Limited {
+				limSum += r.ErrMM
+				limN++
+			}
+		}
+		fmt.Printf("tracking error: mean %.2f mm  max %.2f mm\n", sum/float64(len(rows)), worst)
+		if limN > 0 {
+			fmt.Printf("limited ticks: %d, mean err %.2f mm\n", limN, limSum/float64(limN))
+		} else {
+			fmt.Println("limited ticks: 0")
+		}
+		all, allT := rec.since(0)
+		if k, j := limitReached(all, model.DoF(), 0.5); k < 0 {
+			fmt.Println("no joint reached a limit")
+		} else {
+			var m float64
+			for _, r := range all[k:] {
+				m += r.ErrMM
+			}
+			fmt.Printf("mean err after a joint reached its limit: %.2f mm (from t=%.1fs, joint %d)\n", m/float64(len(all)-k), allT[k].Seconds(), j)
+		}
+		for j, lim := range model.DoF() {
+			margin := math.Inf(1)
+			for _, r := range all {
+				if j < len(r.QCmd) {
+					margin = math.Min(margin, math.Min(r.QCmd[j]-lim.Min, lim.Max-r.QCmd[j])*180/math.Pi)
+				}
+			}
+			fmt.Printf("joint %d: min margin %.2f°\n", j, margin)
+		}
+		return nil
+	}
+}
+
+// limitReached returns the index of the first row where any joint's QCmd is within marginDeg of a
+// limit, and that joint; -1 if none.
+func limitReached(rows []diffik.Status, lims []referenceframe.Limit, marginDeg float64) (row, joint int) {
+	m := marginDeg * math.Pi / 180
+	for k, r := range rows {
+		for j, q := range r.QCmd {
+			if j < len(lims) && (q-lims[j].Min <= m || lims[j].Max-q <= m) {
+				return k, j
+			}
+		}
+	}
+	return -1, -1
 }

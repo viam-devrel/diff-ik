@@ -123,6 +123,8 @@ def start_kw(args, **kw):
         base["task"] = args.task
     if args.no_point_velocities:
         base["point_velocities"] = False
+    if args.solver:
+        base["solver"] = args.solver
     base.update(kw)
     return base
 
@@ -313,6 +315,7 @@ async def main() -> int:
     ap.add_argument("--no-point-velocities", action="store_true",
                     help="servo_start point_velocities=false (A/B: stream positions without per-point velocities)")
     ap.add_argument("--joint-deg-s", type=float, default=90)
+    ap.add_argument("--solver", choices=["dls", "qp"], default=None, help="servo_start solver (default: the server's, dls)")
     ap.add_argument("--linear-mm-s", type=float, default=None)
     ap.add_argument("--angular-deg-s", type=float, default=None)
     ap.add_argument("--rate", type=float, default=50)

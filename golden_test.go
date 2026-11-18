@@ -47,6 +47,17 @@ func goldenScenarios(t *testing.T) map[string][][]uint64 {
 	l.SetVelocity([6]float64{0.05, 0, 0, 0, 0, deg2rad(10)})
 	clockTicks(t, l, clk, 50)
 	res["twist"] = bits(sim.sends)
+
+	sm := so101(t)
+	qs := []float64{0.2, -0.4, 0.6, 0.9, 0.1}
+	ssim := &simIO{q: slices.Clone(qs)}
+	sl, err := NewLoop(sm, ssim, LoopConfig{Solver: SolverQP, MaxJointDegPerS2: repeat(1e9, 5)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl.SetTarget(offsetTarget(t, sm, qs, r3.Vector{X: 20, Y: -15, Z: 10}, 0))
+	runTicks(t, sl, 150)
+	res["qp_so101_static"] = bits(ssim.sends)
 	return res
 }
 

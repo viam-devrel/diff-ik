@@ -77,6 +77,8 @@ second session on a busy arm fails.
 | `limits.tol_mm` / `tol_deg` | 2 / 2 | Convergence tolerance. |
 | `limits.resync_deg`, `limits.max_lag_ms` | 3 ticks at the joint cap; 300 | See Status fields. |
 | `limits.singular_eps`, `limits.max_damping` | 0.04, 0.1 | Damping near singularities. |
+| `solver` | `dls` | `dls` or `qp`. `qp` solves a QP each tick. It enforces joint position, velocity and acceleration limits as hard bounds, and adds the posture task. |
+| `posture` | see below | `qp` only. `{"joints_deg", "weight", "gain"}`: `joints_deg` defaults to the joints at session start (one value per joint; an empty list or a wrong length is rejected); `weight` defaults to 1e-3 and must be in (0, 0.01]; `gain` defaults to 1/s and must be > 0. Posture motion is not bound by the TCP speed limits, so its weight is capped at 0.01; it moves joints only where the task leaves freedom. Unknown keys are rejected. It is fixed for the session; start a new one to change it. |
 | `task_weights` | `[1,1,1,1,1,1]` | x, y, z, rx, ry, rz weights for the pose task. |
 | `target_filter` | pass-through, feed-forward on | `ema_alpha` (1 = off), hold deadband `hold_mm` + `hold_deg` with `dwell_ms`, `feedforward`, and `floor` (`min_z_mm` required). The floor raises targets so the flange and a tip `tip_mm` along the tool axis stay `margin_mm` above `min_z_mm`. |
 | `frames` | false | When true, `servo_target` accepts a `frame` from the frame system. That frame may hang off static frames or this arm. |
@@ -118,7 +120,12 @@ States: `idle` (no target yet), `running`, `converged`, `stalled` (limit-bound o
 - `rate_hz`, `tick_p50_ms`, `tick_p99_ms`, `overruns`;
 - `resyncs`, `lag_ms`, `damping`, `clamps`, `last_command_age_ms`;
 - the active `limits` and `target_filter`;
-- `pointing_residual_deg`, for the pointing task.
+- `solver`, `q_cmd_deg` (the commanded joints, in degrees) and `peak_accel_ratio`;
+- `pointing_residual_deg`, for the pointing task;
+- with `qp`: `qp_active`, `qp_iters` and `qp_fallbacks`.
+
+`peak_accel_ratio` is the session's maximum of |Δstep| / (a·dt²). At or below 1, the acceleration limit held on every
+tick.
 
 `lag_ms` is the loop's measured estimate of how far the arm trails its commands, capped at `limits.max_lag_ms`
 (default 300, at most 1000). If the arm never moves, the command can run up to that much travel ahead before the first
@@ -127,6 +134,15 @@ resync.
 `limits.resync_deg` is how far the arm may be from where it should be given that lag before the loop resyncs its
 command to the measured joints. The default is 3 ticks of travel at max joint speed. The gap between command and
 measured joints, and so the size of a resync snap, can reach lag travel + `resync_deg`.
+
+## QP solver
+
+With `"solver": "qp"`, each tick solves a weighted least-squares QP over the joint step. The task rows are the same
+ones the DLS path uses, and the pointing task's axis rows get weight 1e-4, so position wins. Joint position, velocity
+and acceleration limits are hard bounds, with a discrete braking cap near a position limit. The posture task pulls the
+joints toward `posture.joints_deg` in the null space. Its pull is scaled by the ramp, so stops aren't delayed. If the QP
+fails on a tick, that tick uses the DLS path (`qp_fallbacks` counts them). After 10 failures in a row the session
+faults with `qp: <error>`. `qp` is experimental. See `docs/results/2026-11-qp-solver.md`.
 
 ## viam:teleop compatibility
 

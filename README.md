@@ -13,6 +13,14 @@ This module provides the following model(s):
 
 - [`devrel:diff-ik:servo`](devrel_diff-ik_servo.md): Cartesian servo sessions on arms through `DoCommand`, plus `viam:teleop`'s `teleop_*` commands
 
+## Solvers
+
+`servo_start` takes `"solver": "dls"` (the default) or `"qp"`. `qp` is opt-in and experimental: it enforces joint
+position, velocity and acceleration limits as hard bounds and adds a null-space posture task. Design:
+[`docs/superpowers/specs/2026-11-18-diff-ik-qp-solver-design.md`](docs/superpowers/specs/2026-11-18-diff-ik-qp-solver-design.md).
+Results: [`docs/results/2026-11-qp-solver.md`](docs/results/2026-11-qp-solver.md). Fields are in
+[`devrel_diff-ik_servo.md`](devrel_diff-ik_servo.md).
+
 ## Local SO-101 simulation (Phase 3a)
 
 No cloud machine needed:

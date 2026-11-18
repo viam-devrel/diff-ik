@@ -22,7 +22,7 @@ import (
 )
 
 const usage = `usage: cli [flags] validate
-       cli [flags] run static|singular|circle
+       cli [flags] run static|singular|circle|hold|orbit
        cli [flags] probe
        cli [flags] pose`
 
@@ -59,6 +59,14 @@ func realMain() error {
 	circleMMs := flag.Float64("circle-mm-s", 50, "circle: speed around the circle (mm/s)")
 	leadMS := flag.Float64("lead-ms", 0, "run/probe: stamp each streamed point this far ahead (ms; 0 = diffik.DefaultLead, 5 ms; capped at one tick)")
 	startJoints := flag.String("start-joints", "", "comma-separated joint angles (rad): run/validate/probe first make a guarded profiled move here")
+	solver := flag.String("solver", "", "run: dls|qp (default dls)")
+	postureJoint := flag.Int("posture-joint", 0, "run: joint index the posture offset moves along the self-motion (7-DoF arms)")
+	postureDeg := flag.Float64("posture-deg", 0, "run: with --solver qp, posture q0 = the start joints moved this many degrees on --posture-joint along the self-motion (0 = q0 is the start joints)")
+	postureW := flag.Float64("posture-weight", 0, "run: posture weight (0 = no posture task)")
+	postureK := flag.Float64("posture-gain", 0, "run: posture gain 1/s (0 = default 1)")
+	orbitDegS := flag.Float64("orbit-deg-s", 8, "orbit: rate the target pose rotates about base z, deg/s")
+	orbitDeg := flag.Float64("orbit-deg", 320, "orbit: total rotation, deg")
+	maxDegS2 := flag.Float64("max-joint-deg-s2", 0, "run: per-joint acceleration limit in deg/s² (0 = the model's, else 360)")
 	flag.Parse()
 	args := flag.Args()
 	minZSet := false
@@ -82,11 +90,20 @@ func realMain() error {
 	if *singEps < 0 || *maxDamp < 0 {
 		return errors.New("--singular-eps and --max-damping must be >= 0")
 	}
+	if !(*orbitDegS > 0) || *maxDegS2 < 0 {
+		return errors.New("--orbit-deg-s must be > 0 and --max-joint-deg-s2 >= 0")
+	}
+	if *solver != "" && *solver != diffik.SolverDLS && *solver != diffik.SolverQP {
+		return fmt.Errorf("--solver must be %q or %q", diffik.SolverDLS, diffik.SolverQP)
+	}
+	if (*postureW > 0 || *postureDeg != 0) && *solver != diffik.SolverQP {
+		return errors.New("--posture-weight and --posture-deg need --solver qp")
+	}
 	if !(*rate >= 1) {
 		return errors.New("--rate must be >= 1")
 	}
 	validCmd := len(args) == 1 && (args[0] == "validate" || args[0] == "probe" || args[0] == "pose") ||
-		len(args) == 2 && args[0] == "run" && (args[1] == "static" || args[1] == "singular" || args[1] == "circle")
+		len(args) == 2 && args[0] == "run" && (args[1] == "static" || args[1] == "singular" || args[1] == "circle" || args[1] == "hold" || args[1] == "orbit")
 	if *armName == "" || !validCmd {
 		return errors.New(usage)
 	}
@@ -123,6 +140,9 @@ func realMain() error {
 		return fmt.Errorf("getting kinematics: %w", err)
 	}
 
+	if *postureJoint < 0 || *postureJoint >= len(model.DoF()) {
+		return fmt.Errorf("--posture-joint %d out of range for %d joints", *postureJoint, len(model.DoF()))
+	}
 	var guard *floorGuard
 	if minZSet {
 		guard = &floorGuard{model: model, minZ: *minZ, tipMM: *tipMM}
@@ -152,6 +172,8 @@ func realMain() error {
 			rate: *rate, csvPath: *csvPath, wrist: *wrist, maxJointDegS: *maxDegS, maxLinear: *maxLin, maxAngular: *maxAng,
 			resync: *resyncDeg, maxLagMS: *maxLagMS, tolMM: *tolMM, tolDeg: *tolDeg, task: *task, singEps: *singEps, maxDamp: *maxDamp, singDeg: *singDeg,
 			hold: *hold, circleMMs: *circleMMs, guard: guard, lead: msDur(*leadMS),
+			solver: *solver, postureJoint: *postureJoint, postureDeg: *postureDeg, postureW: *postureW, postureK: *postureK,
+			orbitDegS: *orbitDegS, orbitDeg: *orbitDeg, maxJointDegS2: *maxDegS2,
 		})
 	default:
 		return errors.New(usage)

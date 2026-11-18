@@ -320,30 +320,35 @@ func TestSessionHeldPoseConverges(t *testing.T) {
 }
 
 func TestSessionDeadmanTimeout(t *testing.T) {
-	m, sim, clk := newTestManager(t, spatialmath.NewZeroPose())
-	cfg := testSessionCfg(ModePose)
-	cfg.Timeout, cfg.Ramp = 100*time.Millisecond, 100*time.Millisecond
-	s, p := mustStart(t, m, cfg)
-	ticks := 0
-	for !s.ended() && ticks < 100 {
-		step(t, s, clk, 1)
-		ticks++
-	}
-	// timeout + dt + ramp = 100 + 20 + 100 ms
-	if elapsed := time.Duration(ticks) * 20 * time.Millisecond; elapsed > 220*time.Millisecond {
-		t.Fatalf("dead-man stop took %v, want ≤ 220 ms", elapsed)
-	}
-	st := s.status()
-	if st.State != StateStoppedTimeout || !sim.stopped {
-		t.Fatalf("state = %s stopped = %v, want stopped_timeout and stopped", st.State, sim.stopped)
-	}
-	_, err := s.target(p, "", true)
-	wantErr(t, err, "session ended: stopped_timeout")
-	if m.busy("arm") {
-		t.Fatal("arm still busy after the session ended")
-	}
-	if _, _, err := m.start(context.Background(), "arm", cfg); err != nil {
-		t.Fatalf("restart after timeout: %v", err)
+	for _, solver := range []string{SolverDLS, SolverQP} {
+		t.Run(solver, func(t *testing.T) {
+			m, sim, clk := newTestManager(t, spatialmath.NewZeroPose())
+			cfg := testSessionCfg(ModePose)
+			cfg.Loop.Solver = solver
+			cfg.Timeout, cfg.Ramp = 100*time.Millisecond, 100*time.Millisecond
+			s, p := mustStart(t, m, cfg)
+			ticks := 0
+			for !s.ended() && ticks < 100 {
+				step(t, s, clk, 1)
+				ticks++
+			}
+			// timeout + dt + ramp = 100 + 20 + 100 ms
+			if elapsed := time.Duration(ticks) * 20 * time.Millisecond; elapsed > 220*time.Millisecond {
+				t.Fatalf("dead-man stop took %v, want ≤ 220 ms", elapsed)
+			}
+			st := s.status()
+			if st.State != StateStoppedTimeout || !sim.stopped {
+				t.Fatalf("state = %s stopped = %v, want stopped_timeout and stopped", st.State, sim.stopped)
+			}
+			_, err := s.target(p, "", true)
+			wantErr(t, err, "session ended: stopped_timeout")
+			if m.busy("arm") {
+				t.Fatal("arm still busy after the session ended")
+			}
+			if _, _, err := m.start(context.Background(), "arm", cfg); err != nil {
+				t.Fatalf("restart after timeout: %v", err)
+			}
+		})
 	}
 }
 

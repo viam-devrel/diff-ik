@@ -111,6 +111,15 @@ func TestDoCommandErrors(t *testing.T) {
 		{start("limits", "slow"), "limits"},
 		{start("task_weights", []interface{}{1.0, 1.0, 1.0, 1.0, 1.0}), "task_weights"},
 		{start("task_weights", []interface{}{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}), "task_weights"},
+		{start("solver", "osqp"), "unsupported solver"},
+		{start("posture", map[string]interface{}{}), `posture needs "solver": "qp"`},
+		{start("solver", "qp", "posture", "x"), "posture must be an object"},
+		{start("solver", "qp", "posture", map[string]interface{}{"weight": 0.0}), "posture.weight must be in (0, 0.01]"},
+		{start("solver", "qp", "posture", map[string]interface{}{"weight": 0.1}), "posture.weight must be in (0, 0.01]"},
+		{start("solver", "qp", "posture", map[string]interface{}{"gain": -1.0}), "posture.gain must be > 0"},
+		{start("solver", "qp", "posture", map[string]interface{}{"joints_deg": []interface{}{1.0}}), "posture.joints_deg needs"},
+		{start("solver", "qp", "posture", map[string]interface{}{"joints_deg": []interface{}{}}), "posture.joints_deg needs"},
+		{start("solver", "qp", "posture", map[string]interface{}{"weigth": 1.0}), "unknown posture key"},
 		{map[string]interface{}{"command": "servo_status"}, "session_id is required"},
 		{map[string]interface{}{"command": "servo_status", "session_id": "nope"}, "unknown session_id"},
 	} {
@@ -427,6 +436,36 @@ func TestParseTargetFilter(t *testing.T) {
 			}
 		} else if err != nil || !tc.check(f) {
 			t.Errorf("%s: got %+v, %v", tc.name, f, err)
+		}
+	}
+}
+
+func TestStatusSolverFields(t *testing.T) {
+	for _, solver := range []string{"dls", "qp"} {
+		m, _, clk := newTestManager(t, spatialmath.NewZeroPose())
+		s := testServo(t, m)
+		r := do(t, s, map[string]interface{}{"command": "servo_start", "component_name": "arm",
+			"frame": "arm_origin", "solver": solver})
+		id := r["session_id"].(string)
+		sess, err := m.get(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		step(t, sess, clk, 1)
+		st := do(t, s, map[string]interface{}{"command": "servo_status", "session_id": id})
+		if st["solver"] != solver {
+			t.Errorf("%s: solver = %v", solver, st["solver"])
+		}
+		if q, ok := st["q_cmd_deg"].([]interface{}); !ok || len(q) != 6 {
+			t.Errorf("%s: q_cmd_deg = %v", solver, st["q_cmd_deg"])
+		}
+		if _, ok := st["peak_accel_ratio"]; !ok {
+			t.Errorf("%s: no peak_accel_ratio", solver)
+		}
+		for _, k := range []string{"qp_active", "qp_iters", "qp_fallbacks"} {
+			if _, ok := st[k]; ok != (solver == "qp") {
+				t.Errorf("%s: %s present = %v", solver, k, ok)
+			}
 		}
 	}
 }

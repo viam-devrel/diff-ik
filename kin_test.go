@@ -3,6 +3,7 @@ package diffik
 import (
 	"math"
 	"math/rand"
+	"os"
 	"slices"
 	"testing"
 
@@ -185,6 +186,36 @@ func so101(t *testing.T) referenceframe.Model {
 		t.Fatalf("so101 DOF = %d, want 5", n)
 	}
 	return m
+}
+
+// panda loads the 7-DOF Franka Panda test model (testdata/panda.json, exported from the MuJoCo sim with
+// dev/exportmodel).
+func panda(t *testing.T) referenceframe.Model {
+	t.Helper()
+	b, err := os.ReadFile("testdata/panda.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := referenceframe.UnmarshalModelJSON(b, "arm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(m.DoF()); n != 7 {
+		t.Fatalf("panda DOF = %d, want 7", n)
+	}
+	return m
+}
+
+func TestPandaFixture(t *testing.T) {
+	m := panda(t)
+	l, err := NewLoop(m, &simIO{}, LoopConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("panda limits: joint_deg_s %v joint_deg_s2 %v", l.Config().MaxJointDegPerS, l.Config().MaxJointDegPerS2)
+	for i, lim := range m.DoF() {
+		t.Logf("joint %d: [%.1f°, %.1f°]", i, rad2deg(lim.Min), rad2deg(lim.Max))
+	}
 }
 
 var (

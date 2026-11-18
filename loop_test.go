@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,10 +104,27 @@ func TestNewLoopRejectsBadConfig(t *testing.T) {
 		"huge max lag":         {MaxLagMS: 1001},
 		"negative accel":       {MaxJointDegPerS2: []float64{360, 360, 360, 360, 360, -1}},
 		"short accel":          {MaxJointDegPerS2: []float64{360}},
+		"bad solver":           {Solver: "osqp"},
+		"posture without qp":   {Posture: &Posture{}},
+		"posture joint count":  {Solver: SolverQP, Posture: &Posture{JointsDeg: []float64{0, 0}}},
+		"posture weight < 0":   {Solver: SolverQP, Posture: &Posture{Weight: -1}},
+		"posture weight > cap": {Solver: SolverQP, Posture: &Posture{Weight: 0.1}},
+		"posture gain < 0":     {Solver: SolverQP, Posture: &Posture{Gain: -1}},
 	} {
 		if _, err := NewLoop(m, &simIO{}, cfg); err == nil {
 			t.Errorf("%s: want error", name)
 		}
+	}
+}
+
+func TestSolverAndPostureDefaults(t *testing.T) {
+	l, _, _ := newTestLoop(t, home, LoopConfig{})
+	if l.Config().Solver != SolverDLS || l.Config().Posture != nil {
+		t.Fatalf("defaults: solver %q posture %v", l.Config().Solver, l.Config().Posture)
+	}
+	l, _, _ = newTestLoop(t, home, LoopConfig{Solver: SolverQP, Posture: &Posture{}})
+	if p := l.Config().Posture; p.Weight != 1e-3 || p.Gain != 1 || p.JointsDeg != nil {
+		t.Fatalf("posture defaults %+v", *p)
 	}
 }
 
@@ -379,7 +397,16 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 func newClockLoop(t *testing.T, q0 []float64, cfg LoopConfig) (*Loop, *simIO, referenceframe.Model, *fakeClock) {
 	t.Helper()
-	l, sim, m := newTestLoop(t, q0, cfg)
+	return newClockLoopModel(t, ur5e(t), q0, cfg)
+}
+
+func newClockLoopModel(t *testing.T, m referenceframe.Model, q0 []float64, cfg LoopConfig) (*Loop, *simIO, referenceframe.Model, *fakeClock) {
+	t.Helper()
+	sim := &simIO{q: slices.Clone(q0)}
+	l, err := NewLoop(m, sim, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	clk := newFakeClock()
 	l.Now = clk.Now
 	return l, sim, m, clk
@@ -560,33 +587,37 @@ func TestRampStopKeepsStoppedAgainstLaterTimeout(t *testing.T) {
 }
 
 func TestRampStopScalesToZeroThenStops(t *testing.T) {
-	l, sim, m, clk := newClockLoop(t, home, LoopConfig{})
-	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
-	l.SetVelocity([6]float64{0.05})
-	clockTicks(t, l, clk, 25)
-	n0 := len(sim.sends)
-	l.RampStop(200*time.Millisecond, StateStopped)
-	if !clockTicks(t, l, clk, 20) {
-		t.Fatal("ramp did not complete within 20 ticks")
-	}
-	if n := len(sim.sends) - n0; n > 10 {
-		t.Fatalf("ramp sent %d ticks, want ≤ 10 (200 ms)", n)
-	}
-	steps := sim.sends[n0-1:]
-	first := maxAbsDiff(steps[1], steps[0])
-	prev := first
-	for k := 2; k < len(steps); k++ {
-		d := maxAbsDiff(steps[k], steps[k-1])
-		if d > prev*1.02+1e-12 {
-			t.Fatalf("ramp step %d grew: %.3g > %.3g", k, d, prev)
-		}
-		prev = d
-	}
-	if prev > 0.15*first {
-		t.Fatalf("last ramp step %.3g is not near zero (first %.3g)", prev, first)
-	}
-	if s := l.Status().State; !sim.stopped || s != StateStopped {
-		t.Fatalf("stopped = %v state = %s, want stopped", sim.stopped, s)
+	for _, solver := range []string{SolverDLS, SolverQP} {
+		t.Run(solver, func(t *testing.T) {
+			l, sim, m, clk := newClockLoop(t, home, LoopConfig{Solver: solver})
+			l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+			l.SetVelocity([6]float64{0.05})
+			clockTicks(t, l, clk, 25)
+			n0 := len(sim.sends)
+			l.RampStop(200*time.Millisecond, StateStopped)
+			if !clockTicks(t, l, clk, 20) {
+				t.Fatal("ramp did not complete within 20 ticks")
+			}
+			if n := len(sim.sends) - n0; n > 10 {
+				t.Fatalf("ramp sent %d ticks, want ≤ 10 (200 ms)", n)
+			}
+			steps := sim.sends[n0-1:]
+			first := maxAbsDiff(steps[1], steps[0])
+			prev := first
+			for k := 2; k < len(steps); k++ {
+				d := maxAbsDiff(steps[k], steps[k-1])
+				if d > prev*1.02+1e-12 {
+					t.Fatalf("ramp step %d grew: %.3g > %.3g", k, d, prev)
+				}
+				prev = d
+			}
+			if prev > 0.15*first {
+				t.Fatalf("last ramp step %.3g is not near zero (first %.3g)", prev, first)
+			}
+			if s := l.Status().State; !sim.stopped || s != StateStopped {
+				t.Fatalf("stopped = %v state = %s, want stopped", sim.stopped, s)
+			}
+		})
 	}
 }
 
@@ -1066,56 +1097,67 @@ func TestMeasureLocksOnCmdAtLimit(t *testing.T) {
 // Every tick's joint step changes by at most a·dt² from the last (start ramp included), and a joint
 // driven at its upper limit brakes at √(2·a·d) instead of hitting the position clamp at speed.
 func TestAccelerationLimit(t *testing.T) {
-	l, sim, m := newTestLoop(t, home, LoopConfig{})
-	l.SetTarget(offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10)))
-	runTicks(t, l, 150)
-	dt := 1 / l.cfg.RateHz
-	prev, prevStep := home, make([]float64, len(home))
-	for k, q := range sim.sends {
-		for i := range q {
-			step := q[i] - prev[i]
-			if lim := deg2rad(l.cfg.MaxJointDegPerS2[i]) * dt * dt; math.Abs(step-prevStep[i]) > lim+1e-12 {
-				t.Fatalf("send %d joint %d step change %.3g rad exceeds %.3g", k, i, step-prevStep[i], lim)
+	for _, solver := range []string{SolverDLS, SolverQP} {
+		t.Run(solver, func(t *testing.T) {
+			l, sim, m := newTestLoop(t, home, LoopConfig{Solver: solver})
+			l.SetTarget(offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10)))
+			runTicks(t, l, 150)
+			dt := 1 / l.cfg.RateHz
+			prev, prevStep := home, make([]float64, len(home))
+			for k, q := range sim.sends {
+				for i := range q {
+					step := q[i] - prev[i]
+					if lim := deg2rad(l.cfg.MaxJointDegPerS2[i]) * dt * dt; math.Abs(step-prevStep[i]) > lim+1e-12 {
+						t.Fatalf("send %d joint %d step change %.3g rad exceeds %.3g", k, i, step-prevStep[i], lim)
+					}
+					prevStep[i] = step
+				}
+				prev = q
 			}
-			prevStep[i] = step
-		}
-		prev = q
-	}
-	if s := l.Status(); s.State != StateConverged {
-		t.Fatalf("state = %s, want converged", s.State)
-	}
+			if s := l.Status(); s.State != StateConverged {
+				t.Fatalf("state = %s, want converged", s.State)
+			}
+			if r := l.Status().PeakAccelRatio; r > 1+1e-9 {
+				t.Fatalf("peak accel ratio %v, want ≤ 1", r)
+			}
 
-	// joint 0 just inside its upper limit, driven past it by the feedforward twist about base z
-	q0 := slices.Clone(home)
-	q0[0] = l.hi[0] - 0.05
-	l, sim, m = newTestLoop(t, q0, LoopConfig{})
-	l.SetTarget(offsetTarget(t, m, q0, r3.Vector{}, 0))
-	l.SetVelocity([6]float64{0, 0, 0, 0, 0, deg2rad(45)})
-	runTicks(t, l, 100)
-	a := deg2rad(l.cfg.MaxJointDegPerS2[0])
-	prev = q0
-	for k, q := range sim.sends {
-		if c := math.Sqrt(2*a*(l.hi[0]-prev[0]))*dt + 1e-12; q[0]-prev[0] > c {
-			t.Fatalf("send %d: joint 0 step %.3g exceeds braking cap %.3g", k, q[0]-prev[0], c)
-		}
-		prev = q
+			// joint 0 just inside its upper limit, driven past it by the feedforward twist about base z
+			q0 := slices.Clone(home)
+			q0[0] = l.hi[0] - 0.05
+			l, sim, m = newTestLoop(t, q0, LoopConfig{Solver: solver})
+			l.SetTarget(offsetTarget(t, m, q0, r3.Vector{}, 0))
+			l.SetVelocity([6]float64{0, 0, 0, 0, 0, deg2rad(45)})
+			runTicks(t, l, 100)
+			a := deg2rad(l.cfg.MaxJointDegPerS2[0])
+			prev = q0
+			for k, q := range sim.sends {
+				if c := math.Sqrt(2*a*(l.hi[0]-prev[0]))*dt + 1e-12; q[0]-prev[0] > c {
+					t.Fatalf("send %d: joint 0 step %.3g exceeds braking cap %.3g", k, q[0]-prev[0], c)
+				}
+				prev = q
+			}
+		})
 	}
 }
 
 // A ramp-stop shorter than the acceleration limit allows runs on until the command is at rest.
 func TestRampStopWaitsForRest(t *testing.T) {
-	l, sim, m, clk := newClockLoop(t, home, LoopConfig{})
-	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
-	l.SetVelocity([6]float64{0, 0, 0, 0, 0, deg2rad(45)})
-	clockTicks(t, l, clk, 50)
-	l.RampStop(20*time.Millisecond, StateStopped)
-	if !clockTicks(t, l, clk, 100) {
-		t.Fatal("ramp did not complete")
-	}
-	dt := 1 / l.cfg.RateHz
-	n := len(sim.sends)
-	if d := maxAbsDiff(sim.sends[n-1], sim.sends[n-2]); d > deg2rad(l.cfg.MaxJointDegPerS2[0])*dt*dt+1e-12 {
-		t.Fatalf("last step %.3g rad: stopped while still moving", d)
+	for _, solver := range []string{SolverDLS, SolverQP} {
+		t.Run(solver, func(t *testing.T) {
+			l, sim, m, clk := newClockLoop(t, home, LoopConfig{Solver: solver})
+			l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+			l.SetVelocity([6]float64{0, 0, 0, 0, 0, deg2rad(45)})
+			clockTicks(t, l, clk, 50)
+			l.RampStop(20*time.Millisecond, StateStopped)
+			if !clockTicks(t, l, clk, 100) {
+				t.Fatal("ramp did not complete")
+			}
+			dt := 1 / l.cfg.RateHz
+			n := len(sim.sends)
+			if d := maxAbsDiff(sim.sends[n-1], sim.sends[n-2]); d > deg2rad(l.cfg.MaxJointDegPerS2[0])*dt*dt+1e-12 {
+				t.Fatalf("last step %.3g rad: stopped while still moving", d)
+			}
+		})
 	}
 }
 
@@ -1139,5 +1181,131 @@ func TestModelAccelerationTightens(t *testing.T) {
 		if got := l.Config().MaxJointDegPerS2[0]; math.Abs(got-c.want) > 1e-9 {
 			t.Errorf("cfg %v: joint 0 accel %v, want %v", c.cfg, got, c.want)
 		}
+	}
+}
+
+// spec "Fallback and faults": a failing solver falls back tick by tick and faults after 10 in a row.
+func TestQPFallbackThenFault(t *testing.T) {
+	orig := qpSolver
+	t.Cleanup(func() { qpSolver = orig })
+	qpSolver = func(qpProblem) ([]float64, int, int, error) { return nil, 0, 1, errQPInfeasible }
+	l, sim, m := newTestLoop(t, home, LoopConfig{Solver: SolverQP})
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{X: 20}, 0))
+	for i := 0; i < 9; i++ {
+		if err := l.tick(context.Background(), 1/l.cfg.RateHz); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+	}
+	if s := l.Status(); s.QPFallbacks != 9 || len(sim.sends) != 9 {
+		t.Fatalf("fallbacks %d sends %d, want 9 and 9", s.QPFallbacks, len(sim.sends))
+	}
+	err := l.tick(context.Background(), 1/l.cfg.RateHz)
+	if err == nil || !strings.Contains(err.Error(), "qp: infeasible") {
+		t.Fatalf("tick 10: err %v, want qp: infeasible", err)
+	}
+}
+
+func TestQPConverges(t *testing.T) {
+	l, _, m := newTestLoop(t, home, LoopConfig{Solver: SolverQP})
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{X: 30, Y: 30, Z: -25}, deg2rad(10)))
+	runTicks(t, l, 200)
+	s := l.Status()
+	if s.State != StateConverged || s.QPFallbacks != 0 {
+		t.Fatalf("state %s fallbacks %d, want converged and 0", s.State, s.QPFallbacks)
+	}
+	if s.PeakAccelRatio > 1+1e-9 {
+		t.Fatalf("peak accel ratio %v > 1", s.PeakAccelRatio)
+	}
+}
+
+// spec "Config and status": peak_accel_ratio must be able to fail.
+// White box: joint 0 is 0.5 rad below its limit and the previous step is said to be 1 rad toward it, so
+// limitAccel keeps the step near 1 rad and step 8's position clamp then cuts it: a real violation.
+func TestPeakAccelRatioCanExceedOne(t *testing.T) {
+	m := ur5e(t)
+	q := slices.Clone(home)
+	q[0] = m.DoF()[0].Max - fdStep - 0.5
+	l, _, _ := newTestLoop(t, q, LoopConfig{})
+	l.SetTarget(offsetTarget(t, m, q, r3.Vector{X: 30}, 0))
+	runTicks(t, l, 5)
+	l.lastStep[0] += 1
+	runTicks(t, l, 1)
+	if r := l.Status().PeakAccelRatio; !(r > 1+1e-9) {
+		t.Fatalf("peak accel ratio %v, want > 1", r)
+	}
+}
+
+var pandaHold = []float64{0, -0.3, 0, -2.0, 0, 1.8, 0.785}
+
+// spec "Tests → Posture": q₀ on the self-motion manifold is reached while the pose holds.
+func TestPostureReachesQ0(t *testing.T) {
+	m := panda(t)
+	q0, err := SelfMotion(m, pandaHold, 0, deg2rad(20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(q0[0]-pandaHold[0]-deg2rad(20)) >= 1e-4 {
+		t.Fatalf("q0[0] moved %v rad, want %v", q0[0]-pandaHold[0], deg2rad(20))
+	}
+	pa, oa, _ := FK(m, pandaHold)
+	pb, ob, _ := FK(m, q0)
+	pe := PoseError(pa, oa, pb, ob)
+	if math.Hypot(math.Hypot(pe[0], pe[1]), pe[2]) > 1e-5 || math.Hypot(math.Hypot(pe[3], pe[4]), pe[5]) > deg2rad(0.01) {
+		t.Fatalf("FK(q0) differs from FK(pandaHold): %v", pe)
+	}
+	q0deg := make([]float64, len(q0))
+	for i, v := range q0 {
+		q0deg[i] = rad2deg(v)
+	}
+	sim := &simIO{q: slices.Clone(pandaHold)}
+	l, err := NewLoop(m, sim, LoopConfig{Solver: SolverQP, Posture: &Posture{JointsDeg: q0deg}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.SetTarget(offsetTarget(t, m, pandaHold, r3.Vector{}, 0))
+	worst := 0.0
+	for i := 0; i < 150; i++ { // 3 s at 50 Hz
+		runTicks(t, l, 1)
+		worst = math.Max(worst, l.Status().ErrMM)
+	}
+	d := rad2deg(maxAbsDiff(sim.q, q0))
+	t.Logf("worst TCP error %.4f mm, final distance to q0 %.3f°", worst, d)
+	if worst >= 0.5 {
+		t.Errorf("TCP error reached %.3f mm, want < 0.5", worst)
+	}
+	if d > 2 {
+		t.Errorf("joints %.2f° from q0 after 3 s, want ≤ 2", d)
+	}
+}
+
+// spec "Tests → The loop": a 20° posture error must not keep a ramp-stop going (≤ N + 1 ticks).
+func TestPostureDoesNotDelayRampStop(t *testing.T) {
+	m := panda(t)
+	q0, err := SelfMotion(m, pandaHold, 0, deg2rad(20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticks := func(p *Posture) int {
+		l, _, _, clk := newClockLoopModel(t, m, pandaHold, LoopConfig{Solver: SolverQP, Posture: p})
+		l.SetTarget(offsetTarget(t, m, pandaHold, r3.Vector{}, 0))
+		l.SetVelocity([6]float64{0.03})
+		clockTicks(t, l, clk, 25)
+		l.RampStop(200*time.Millisecond, StateStopped)
+		for n := 1; n <= 100; n++ {
+			if clockTicks(t, l, clk, 1) {
+				return n
+			}
+		}
+		t.Fatal("ramp did not complete in 100 ticks")
+		return 0
+	}
+	deg := make([]float64, len(q0))
+	for i, v := range q0 {
+		deg[i] = rad2deg(v)
+	}
+	a, b := ticks(nil), ticks(&Posture{JointsDeg: deg})
+	t.Logf("ramp ticks: %d with posture, %d without", b, a)
+	if b > a+1 {
+		t.Fatalf("ramp took %d ticks with posture, %d without", b, a)
 	}
 }

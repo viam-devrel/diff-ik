@@ -38,7 +38,22 @@ type LoopConfig struct {
 	MaxLagMS          float64 // longest arm lag treated as lag; beyond it a gap is divergence and resyncs. Default 300
 	TolMM             float64
 	TolDeg            float64
-	Task              string // "pose" | "pointing"; empty = pointing if DOF < 6 else pose
+	Task              string   // "pose" | "pointing"; empty = pointing if DOF < 6 else pose
+	Solver            string   // "dls" (default) | "qp" (spec "QP solver and posture task")
+	Posture           *Posture // QP only: pull toward a preferred posture
+}
+
+// Solver names.
+const (
+	SolverDLS = "dls"
+	SolverQP  = "qp"
+)
+
+// Posture is the QP's posture task: w_p‖Δq − scale·k·dt·(q₀ − q)‖² (spec "Objective").
+type Posture struct {
+	JointsDeg []float64 // q₀ in degrees; nil means the joints at the first tick
+	Weight    float64   // w_p, default 1e-3
+	Gain      float64   // k in 1/s, default 1
 }
 
 func (c LoopConfig) withDefaults(dof int) LoopConfig {
@@ -73,6 +88,15 @@ func (c LoopConfig) withDefaults(dof int) LoopConfig {
 		if dof < 6 {
 			c.Task = TaskPointing
 		}
+	}
+	if c.Solver == "" {
+		c.Solver = SolverDLS
+	}
+	if c.Posture != nil {
+		p := *c.Posture
+		def(&p.Weight, 1e-3)
+		def(&p.Gain, 1)
+		c.Posture = &p
 	}
 	return c
 }
@@ -120,6 +144,23 @@ func (c LoopConfig) validate(dof int) error {
 	if c.MaxLagMS > 1000 {
 		return fmt.Errorf("max_lag_ms must be <= 1000, got %v", c.MaxLagMS)
 	}
+	if c.Solver != SolverDLS && c.Solver != SolverQP {
+		return fmt.Errorf("unsupported solver %q: use %q or %q", c.Solver, SolverDLS, SolverQP)
+	}
+	if p := c.Posture; p != nil {
+		if c.Solver != SolverQP {
+			return fmt.Errorf("posture needs solver %q", SolverQP)
+		}
+		if p.JointsDeg != nil && len(p.JointsDeg) != dof {
+			return fmt.Errorf("posture.joints_deg needs %d values, got %d", dof, len(p.JointsDeg))
+		}
+		if !(p.Weight > 0 && p.Weight <= 1e-2) {
+			return fmt.Errorf("posture weight must be in (0, 0.01], got %v", p.Weight)
+		}
+		if !(p.Gain > 0) {
+			return fmt.Errorf("posture gain must be > 0, got %v", p.Gain)
+		}
+	}
 	return nil
 }
 
@@ -165,6 +206,9 @@ type Status struct {
 	PointingResidualDeg float64   // pointing mode: the unreachable part of the pointing error at q_m
 	ToolAxis            r3.Vector // tool axis of FK(q_cmd), base frame (read by servo_twist)
 	ReachDeg            float64   // the convergence angle: reachable pointing error (pointing) or active orientation error (pose)
+	QPActive, QPIters   int       // solver qp: active constraints and iterations this tick
+	QPFallbacks         int       // solver qp: ticks that fell back to the DLS path, session total
+	PeakAccelRatio      float64   // max over ticks and joints of |step − lastStep| / (a·dt²); ≤ 1 means the limit held
 }
 
 const tickWindow = 500 // ticks kept for p50/p99
@@ -194,6 +238,10 @@ type Loop struct {
 
 	qCmd     []float64
 	lastStep []float64 // q_cmd change on the last tick, rad; loop goroutine only
+
+	q0        []float64 // posture target, rad; set at NewLoop or the first tick
+	qpFails   int       // consecutive QP fallbacks; loop goroutine only
+	peakAccel float64   // see Status.PeakAccelRatio; loop goroutine only
 
 	sent     [][]float64 // last sent commands, oldest first, at most MaxLagMS of ticks; loop goroutine only
 	lagTicks float64     // estimated arm lag in ticks; loop goroutine only
@@ -244,6 +292,12 @@ func NewLoop(model referenceframe.Model, io JointIO, cfg LoopConfig) (*Loop, err
 	for i, lim := range limits {
 		// stay fdStep inside the limits so Jacobian perturbations remain valid inputs
 		l.lo[i], l.hi[i] = lim.Min+fdStep, lim.Max-fdStep
+	}
+	if p := cfg.Posture; p != nil && p.JointsDeg != nil {
+		l.q0 = make([]float64, dof)
+		for i, d := range p.JointsDeg {
+			l.q0[i] = deg2rad(d)
+		}
 	}
 	l.status.State = StateIdle
 	l.status.Task = cfg.Task
@@ -471,6 +525,9 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	}
 	if l.qCmd == nil {
 		l.qCmd = slices.Clone(qm)
+		if l.cfg.Posture != nil && l.q0 == nil {
+			l.q0 = slices.Clone(qm)
+		}
 	}
 	if !hasTarget {
 		l.mu.Lock()
@@ -510,39 +567,32 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	if err != nil {
 		return err
 	}
-	dq, lambda, limitedTask, cmdPos, cmdAng, err := l.solve(J, tp, tq, cp, cq, vel, scale, dt)
+	dq, lambda, limitedTask, cmdPos, cmdAng, rows, err := l.solve(J, tp, tq, cp, cq, vel, scale, dt)
 	if err != nil {
 		return err
 	}
 
-	// 7. joint velocity clamp, direction kept
-	s := 1.0
-	for i, d := range dq {
-		if math.IsNaN(d) || math.IsInf(d, 0) {
-			return fmt.Errorf("non-finite joint step %v", dq)
-		}
-		if lim := deg2rad(l.cfg.MaxJointDegPerS[i]) * dt; math.Abs(d)*s > lim {
-			s = lim / math.Abs(d)
+	var next []float64
+	var limStep bool
+	var qpActive, qpIters int
+	fellBack := false
+	if l.cfg.Solver == SolverQP {
+		var qerr error
+		next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt)
+		if qerr != nil {
+			l.qpFails++
+			fellBack, next = true, nil
+			if l.qpFails >= 10 {
+				return fmt.Errorf("qp: %w", qerr)
+			}
+		} else {
+			l.qpFails, limStep = 0, qpActive > 0
 		}
 	}
-
-	// 7b. acceleration: brake ahead of position limits, then clamp the velocity change, all joints together
-	step := make([]float64, len(dq))
-	for i, d := range dq {
-		step[i] = d * s
-	}
-	accelLimited := l.limitAccel(step, dt)
-
-	// 8. position limits
-	next := make([]float64, len(dq))
-	clamped := false
-	for i := range dq {
-		v := l.qCmd[i] + step[i]
-		if v < l.lo[i] || v > l.hi[i] {
-			v = math.Min(math.Max(v, l.lo[i]), l.hi[i])
-			clamped = true
+	if next == nil {
+		if next, limStep, err = l.clampStep(dq, dt); err != nil {
+			return err
 		}
-		next[i] = v
 	}
 
 	// 9. send
@@ -550,7 +600,11 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 		return fmt.Errorf("sending joints: %w", err)
 	}
 	for i := range next {
-		l.lastStep[i] = next[i] - l.qCmd[i]
+		step := next[i] - l.qCmd[i]
+		if r := math.Abs(step-l.lastStep[i]) / (deg2rad(l.cfg.MaxJointDegPerS2[i]) * dt * dt); r > l.peakAccel {
+			l.peakAccel = r
+		}
+		l.lastStep[i] = step
 	}
 	copy(l.qCmd, next)
 	// ponytail: the ring holds MaxLagMS of commands; a lag longer than that is treated as divergence (it
@@ -572,7 +626,7 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	if err != nil {
 		return err
 	}
-	limited := s < 1 || clamped || limitedTask || accelLimited
+	limited := limStep || limitedTask
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -588,6 +642,10 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	st.LagMS = l.lagTicks / l.cfg.RateHz * 1000
 	st.Task, st.PointingResidualDeg, st.ToolAxis = l.cfg.Task, ms.residualDeg, toolAxis(cq)
 	st.QCmd, st.QMeas = slices.Clone(l.qCmd), slices.Clone(qm)
+	st.QPActive, st.QPIters, st.PeakAccelRatio = qpActive, qpIters, l.peakAccel
+	if fellBack {
+		st.QPFallbacks++
+	}
 	l.lastReach = deg2rad(ms.convDeg)
 	st.State = l.nextState(ms, limited, vel != ([6]float64{}))
 	return nil
@@ -680,11 +738,52 @@ func (l *Loop) updateLag(qm []float64) {
 	}
 }
 
+// taskRows is the weighted task the QP's objective uses: ‖A·Δq − b‖² with A = W^½J and b = W^½Δx.
+// solve fills it only for solver qp.
+type taskRows struct {
+	A      *mat.Dense
+	b      []float64
+	lambda float64 // the QP's damping: for pointing, max(λ₁, λ₂) from the first prioritySolve, before lockOutward
+}
+
+// clampStep applies steps 7, 7b and 8 (the DLS path) to dq: the uniform speed scaling, the acceleration
+// limit and the position clamp. It returns the joints to send and whether any of them bound.
+func (l *Loop) clampStep(dq []float64, dt float64) (next []float64, limited bool, err error) {
+	// 7. joint velocity clamp, direction kept
+	s := 1.0
+	for i, d := range dq {
+		if math.IsNaN(d) || math.IsInf(d, 0) {
+			return nil, false, fmt.Errorf("non-finite joint step %v", dq)
+		}
+		if lim := deg2rad(l.cfg.MaxJointDegPerS[i]) * dt; math.Abs(d)*s > lim {
+			s = lim / math.Abs(d)
+		}
+	}
+	// 7b. acceleration: brake ahead of position limits, then clamp the velocity change, all joints together
+	step := make([]float64, len(dq))
+	for i, d := range dq {
+		step[i] = d * s
+	}
+	accelLimited := l.limitAccel(step, dt)
+	// 8. position limits
+	next = make([]float64, len(dq))
+	clamped := false
+	for i := range dq {
+		v := l.qCmd[i] + step[i]
+		if v < l.lo[i] || v > l.hi[i] {
+			v = math.Min(math.Max(v, l.lo[i]), l.hi[i])
+			clamped = true
+		}
+		next[i] = v
+	}
+	return next, s < 1 || clamped || accelLimited, nil
+}
+
 // solve computes this tick's joint step for the configured task. cmdPos/cmdAng are the
 // commanded-side errors in mm / deg (spec "Status fields").
 func (l *Loop) solve(J *mat.Dense, tp r3.Vector, tq quat.Number, cp r3.Vector, cq quat.Number,
 	vel [6]float64, scale, dt float64,
-) (dq []float64, lambda float64, limited bool, cmdPos, cmdAng float64, err error) {
+) (dq []float64, lambda float64, limited bool, cmdPos, cmdAng float64, rows taskRows, err error) {
 	c := l.cfg
 	_, n := J.Dims()
 	if c.Task == TaskPointing {
@@ -697,16 +796,22 @@ func (l *Loop) solve(J *mat.Dense, tp r3.Vector, tq quat.Number, cp r3.Vector, c
 		J1 := mat.DenseCopyOf(J.Slice(0, 3, 0, n))
 		J2 := pointingRows(J, u, v)
 		dx1, dx2 := []float64{v1.X * dt, v1.Y * dt, v1.Z * dt}, []float64{v2.X * dt, v2.Y * dt}
+		if c.Solver == SolverQP {
+			rows = pointingTaskRows(J1, J2, dx1, dx2)
+		}
 		dq, l1, l2, err := prioritySolve(J1, J2, dx1, dx2, c.SingularEps, c.MaxDamping)
+		if c.Solver == SolverQP {
+			rows.lambda = math.Max(l1, l2)
+		}
 		// Lock outward-at-limit joints and re-solve so the step is consistent with the post-hoc clamp
 		// (else clamping one joint corrupts the position task). Each pass locks only new joints.
 		for pass := 0; err == nil && pass < n && lockOutward(J1, J2, dq, l.qCmd, l.lo, l.hi); pass++ {
 			dq, l1, l2, err = prioritySolve(J1, J2, dx1, dx2, c.SingularEps, c.MaxDamping)
 		}
 		if err != nil {
-			return nil, 0, false, 0, 0, err
+			return nil, 0, false, 0, 0, taskRows{}, err
 		}
-		return dq, math.Max(l1, l2), l1 > 0 || l2 > 0, e1.Norm() * mmPerM, r.Norm() * 180 / math.Pi, nil
+		return dq, math.Max(l1, l2), l1 > 0 || l2 > 0, e1.Norm() * mmPerM, r.Norm() * 180 / math.Pi, rows, nil
 	}
 
 	e := PoseError(tp, tq, cp, cq)
@@ -722,32 +827,48 @@ func (l *Loop) solve(J *mat.Dense, tp r3.Vector, tq quat.Number, cp r3.Vector, c
 	dx := [6]float64{lin.X * dt, lin.Y * dt, lin.Z * dt, ang.X * dt, ang.Y * dt, ang.Z * dt}
 	cmdPos, cmdAng = activePosMM(e, c.TaskWeights), activeAngDeg(e, c.TaskWeights)
 
-	var rows []int
+	var active []int
 	for i, w := range c.TaskWeights {
 		if w > 0 {
-			rows = append(rows, i)
+			active = append(active, i)
 		}
 	}
-	if len(rows) >= n { // unchanged Phase 1/2 path: bit-identical for the UR5e with all weights
+	if len(active) >= n { // unchanged Phase 1/2 path: bit-identical for the UR5e with all weights
+		if c.Solver == SolverQP {
+			A, b := mat.NewDense(6, n, nil), make([]float64, 6)
+			for i := 0; i < 6; i++ {
+				sw := math.Sqrt(c.TaskWeights[i])
+				for j := 0; j < n; j++ {
+					A.Set(i, j, sw*J.At(i, j))
+				}
+				b[i] = sw * dx[i]
+			}
+			rows = taskRows{A: A, b: b} // lambda set below from dlsStep
+		}
 		dq, lambda, sigmaMin, err := dlsStep(J, c.TaskWeights, dx, c.SingularEps, c.MaxDamping)
-		return dq, lambda, sigmaMin < c.SingularEps, cmdPos, cmdAng, err
+		rows.lambda = lambda
+		return dq, lambda, sigmaMin < c.SingularEps, cmdPos, cmdAng, rows, err
 	}
-	A := mat.NewDense(len(rows), n, nil)
-	b := make([]float64, len(rows))
-	for k, i := range rows {
+	A := mat.NewDense(len(active), n, nil)
+	b := make([]float64, len(active))
+	for k, i := range active {
 		sw := math.Sqrt(c.TaskWeights[i])
 		for j := 0; j < n; j++ {
 			A.Set(k, j, sw*J.At(i, j))
 		}
 		b[k] = sw * dx[i]
 	}
+	if c.Solver == SolverQP {
+		rows = taskRows{A: A, b: b}
+	}
 	P, lambda, sigmaR, _, err := dpinv(A, c.SingularEps, c.MaxDamping, true)
 	if err != nil {
-		return nil, 0, false, 0, 0, err
+		return nil, 0, false, 0, 0, taskRows{}, err
 	}
+	rows.lambda = lambda
 	var x mat.VecDense
 	x.MulVec(P, mat.NewVecDense(len(b), b))
-	return append([]float64(nil), x.RawVector().Data...), lambda, sigmaR < c.SingularEps, cmdPos, cmdAng, nil
+	return append([]float64(nil), x.RawVector().Data...), lambda, sigmaR < c.SingularEps, cmdPos, cmdAng, rows, nil
 }
 
 // measured holds the per-task measured errors used for status, convergence and stall.

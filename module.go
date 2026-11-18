@@ -312,6 +312,62 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 			s.logger.Warnw("task_weights are ignored in pointing mode (position has priority)")
 		}
 	}
+	solver, err := optString(cmd, "solver", SolverDLS)
+	if err != nil {
+		return nil, nil, err
+	}
+	if solver != SolverDLS && solver != SolverQP {
+		return nil, nil, fmt.Errorf("unsupported solver %q: use %q or %q", solver, SolverDLS, SolverQP)
+	}
+	lc.Solver = solver
+	if raw, ok := cmd["posture"]; ok {
+		if solver != SolverQP {
+			return nil, nil, errors.New(`posture needs "solver": "qp"`)
+		}
+		pm, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, nil, errors.New("posture must be an object")
+		}
+		p := &Posture{Weight: 1e-3, Gain: 1}
+		for k := range pm {
+			if k != "joints_deg" && k != "weight" && k != "gain" {
+				return nil, nil, fmt.Errorf("unknown posture key %q", k)
+			}
+		}
+		if v, ok := pm["joints_deg"]; ok {
+			items, ok := v.([]interface{})
+			if !ok {
+				return nil, nil, errors.New("posture.joints_deg must be a list of numbers")
+			}
+			p.JointsDeg = make([]float64, 0, len(items)) // non-nil, so an empty list fails validate
+			for _, it := range items {
+				n, err := num(it, "posture.joints_deg")
+				if err != nil {
+					return nil, nil, err
+				}
+				p.JointsDeg = append(p.JointsDeg, n)
+			}
+		}
+		for _, f := range []struct {
+			key string
+			dst *float64
+		}{{"weight", &p.Weight}, {"gain", &p.Gain}} {
+			if v, ok := pm[f.key]; ok {
+				n, err := num(v, "posture."+f.key)
+				if err != nil {
+					return nil, nil, err
+				}
+				if f.key == "weight" && !(n > 0 && n <= 1e-2) {
+					return nil, nil, fmt.Errorf("posture.weight must be in (0, 0.01], got %v", n)
+				}
+				if !(n > 0) {
+					return nil, nil, fmt.Errorf("posture.%s must be > 0, got %v", f.key, n)
+				}
+				*f.dst = n
+			}
+		}
+		lc.Posture = p
+	}
 	frames, err := optBool(cmd, "frames", false)
 	if err != nil {
 		return nil, nil, err
@@ -550,6 +606,16 @@ func statusMap(st SessionStatus) map[string]interface{} {
 	out["target_filter"] = filterMap(st.Filter)
 	if st.Task == TaskPointing {
 		out["pointing_residual_deg"] = st.PointingResidualDeg
+	}
+	out["solver"] = st.Config.Solver
+	qc := make([]interface{}, len(st.QCmd))
+	for i, v := range st.QCmd {
+		qc[i] = rad2deg(v)
+	}
+	out["q_cmd_deg"] = qc
+	out["peak_accel_ratio"] = st.PeakAccelRatio
+	if st.Config.Solver == SolverQP {
+		out["qp_active"], out["qp_iters"], out["qp_fallbacks"] = float64(st.QPActive), float64(st.QPIters), float64(st.QPFallbacks)
 	}
 	return out
 }
