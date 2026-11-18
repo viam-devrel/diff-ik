@@ -34,6 +34,23 @@ For physics (Phase 3b), use the MuJoCo SO-101 from viam-mujoco-sim's `so101-asse
     viam-server -config dev/so101-mujoco.json   # serves plaintext localhost:8082
     go run ./cmd/cli --address localhost:8082 --insecure --arm arm --task pointing run static
 
+## Example: visual servoing on a moving AprilTag (MuJoCo)
+
+The SO-101 hovers 150 mm above an AprilTag. The sim slides the tag around a 60 mm circle at 10, 20, 40 and 80 mm/s,
+and the arm follows it using either the wrist camera (eye-in-hand) or a fixed scene camera (eye-to-hand).
+[`viam:apriltag`](https://github.com/viam-labs/apriltag) detects the tag, and
+`clients/python/tag_servo.py` streams the detections to a servo session as camera-frame targets.
+
+    go build -o bin/diff-ik ./cmd/module
+    viam-server -config dev/so101-mujoco-tag.json   # plaintext localhost:8082
+    uv run clients/python/tag_sweep.py --insecure --camera wrist-cam --tracker wrist-tags --csv .runs/p4-wrist
+    uv run clients/python/tag_sweep_report.py .runs/p4-wrist
+
+In sim, mean tracking error is about 1 mm per 10 mm/s of tag speed (1.7 mm at 20 mm/s). Nearly all of it is
+lag of about 85 ms, and neither camera lost the tag up to 80 mm/s. Setup (apriltag from source, pre-positioning the
+arm) is in [`dev/so101-mujoco.md`](dev/so101-mujoco.md), and full results are in
+[`docs/results/2026-11-phase4-tag-sweep.md`](docs/results/2026-11-phase4-tag-sweep.md).
+
 ## teleop_* compatibility
 
 The service is a drop-in `motion_service` for [`viam:teleop`](https://github.com/viam-modules/teleop). It answers
