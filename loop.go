@@ -176,6 +176,7 @@ const (
 	StateFaulted        State = "faulted"
 	StateStopped        State = "stopped"
 	StateStoppedTimeout State = "stopped_timeout"
+	StateStoppedStale   State = "stopped_stale" // live obstacles went stale
 )
 
 const (
@@ -215,6 +216,11 @@ type Status struct {
 	CollisionPair                      string
 	CollisionRows, CollisionRelaxed    int
 	CollisionBrakes                    int
+	LivePinched                        int     // live obstacles: ticks solved by the second relax tier (no further approach plus a soft retreat), session total
+	LiveCount                          int     // live obstacles in use this tick
+	LiveAgeMS                          float64 // age of the newest set (or of the wait for the first)
+	LiveWaiting, LiveStale             bool    // no set yet / the newest set is older than stale_ms
+	LiveBackingAway                    bool    // any live pair has g < 0 this tick
 	CollisionIgnored, CollisionSkipped []string
 	CollisionLate                      string // last "approach faster than v_max" warning
 }
@@ -251,6 +257,7 @@ type Loop struct {
 
 	q0        []float64       // posture target, rad; set at NewLoop or the first tick
 	qpFails   int             // consecutive QP fallbacks; loop goroutine only
+	live      *liveState      // live-obstacle mode; nil: off
 	coll      *collisionModel // nil: collision avoidance off; rows() is called from the loop goroutine only
 	peakAccel float64         // see Status.PeakAccelRatio; loop goroutine only
 
@@ -278,6 +285,52 @@ type Loop struct {
 	last     time.Time // start of the latest tick
 }
 
+// liveState is the live-obstacle mode's state. Only pend is shared with the poller, under its mutex.
+type liveState struct {
+	staleMS float64
+	start   time.Time
+	pend    struct {
+		mu   sync.Mutex
+		set  []liveObstacle
+		at   time.Time // newest publish, on the loop's clock
+		have bool      // a set is waiting to be taken
+		ever bool      // at least one set arrived
+	}
+}
+
+// SetLive enables live-obstacle mode (call after SetCollision, before Run) and returns the function the
+// poller publishes whole sets with. The slot is stamped with the loop's clock, so fake-clock tests go stale.
+func (l *Loop) SetLive(staleMS float64) (publish func([]liveObstacle)) {
+	ls := &liveState{staleMS: staleMS, start: l.now()}
+	l.live = ls
+	l.mu.Lock()
+	l.status.Collision, l.status.LiveWaiting = "on", true
+	l.mu.Unlock()
+	return func(set []liveObstacle) {
+		p := &ls.pend
+		p.mu.Lock()
+		p.set, p.at, p.have, p.ever = set, l.now(), true, true
+		p.mu.Unlock()
+	}
+}
+
+// liveTick runs at tick start on the loop goroutine: it takes a pending set into the model and reports
+// the age of the newest set and whether none has ever arrived.
+func (l *Loop) liveTick() (age time.Duration, waiting bool) {
+	p := &l.live.pend
+	p.mu.Lock()
+	set, have, ever, at := p.set, p.have, p.ever, p.at
+	p.set, p.have = nil, false
+	p.mu.Unlock()
+	if have { // the pair rebuild runs outside the slot lock
+		l.coll.setLive(set)
+	}
+	if !ever {
+		return l.now().Sub(l.live.start), true
+	}
+	return l.now().Sub(at), false
+}
+
 // SetCollision turns on collision avoidance (solver qp only). Call it before Run.
 func (l *Loop) SetCollision(c *collisionModel) error {
 	if l.cfg.Solver != SolverQP {
@@ -288,7 +341,7 @@ func (l *Loop) SetCollision(c *collisionModel) error {
 	defer l.mu.Unlock()
 	l.status.Collision = "on"
 	l.status.CollisionMinMM = math.Inf(1)
-	if len(c.pairs) == 0 {
+	if !c.hasPairs() && l.live == nil {
 		l.status.Collision = "off"
 	}
 	l.status.CollisionIgnored, l.status.CollisionSkipped = c.ignored(), slices.Clone(c.skipped)
@@ -402,15 +455,16 @@ func (l *Loop) rampScale() (bool, float64) {
 // twist to use. cp and cq are FK(q_cmd). Caller holds l.mu.
 //   - Hold (SetMotion only): after holdAfter the target stays put and no feedforward is added.
 //   - Ramp: the target stays put but the feedforward still applies; tick scales it toward zero.
+//   - hold (live obstacles still waiting for a first set): the same, with scale 0 from tick.
 //   - Leash, per axis: an advance is skipped only when the commanded-side error already exceeds
 //     leashS × the speed limit and the advance would grow it (vel · e > 0).
-func (l *Loop) advance(dt float64, cp r3.Vector, cq quat.Number, ramping bool) (spatialmath.Pose, [6]float64) {
+func (l *Loop) advance(dt float64, cp r3.Vector, cq quat.Number, ramping, hold bool) (spatialmath.Pose, [6]float64) {
 	var zero [6]float64
 	if l.extrap && l.now().Sub(l.lastSet) > l.holdAfter {
 		return l.target, zero
 	}
 	vel := l.vel
-	if ramping || vel == zero {
+	if ramping || hold || vel == zero {
 		return l.target, vel
 	}
 	tp, tq := l.target.Point().Mul(1/mmPerM), l.target.Orientation().Quaternion()
@@ -566,6 +620,12 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 		return nil
 	}
 
+	var liveAge time.Duration
+	var liveWaiting bool
+	if l.live != nil { // the pending set is taken only here, at tick start
+		liveAge, liveWaiting = l.liveTick()
+	}
+
 	// 2. hybrid resync (outside mu)
 	resynced := false
 	l.updateLag(qm)
@@ -587,7 +647,10 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	l.mu.Lock()
 	ramping, scale = l.rampScale() // a RampStop may have landed since step 0
 	// not covered by a test: a missed mid-tick ramp start only costs one full-scale tick
-	target, vel := l.advance(dt, cp, cq, ramping)
+	if liveWaiting { // a separate factor: ramping stays false, so the ramp-complete check can't end the session
+		scale = 0
+	}
+	target, vel := l.advance(dt, cp, cq, ramping, liveWaiting)
 	l.mu.Unlock()
 	tp, tq := target.Point().Mul(1/mmPerM), target.Orientation().Quaternion()
 
@@ -604,7 +667,7 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	var next []float64
 	var limStep bool
 	var qpActive, qpIters int
-	fellBack, relaxed, braked := false, false, false
+	fellBack, relaxed, braked, pinched := false, false, false, false
 	var crows []collRow
 	var cmin float64
 	var cpair int
@@ -612,26 +675,31 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	if l.cfg.Solver == SolverQP {
 		var qerr error
 		var accel []float64
-		if l.coll != nil && len(l.coll.pairs) > 0 {
+		if l.coll != nil && l.coll.hasPairs() {
 			accel = make([]float64, len(l.qCmd))
 			for i := range accel {
 				accel[i] = deg2rad(l.cfg.MaxJointDegPerS2[i])
 			}
 			var cerr error
-			crows, cmin, cpair, cerr = l.coll.rows(l.qCmd, accel, dt)
+			crows, cmin, cpair, cerr = l.coll.rows(l.qCmd, accel, dt, l.cfg.MaxLinearMMPerS*dt)
 			if cerr != nil {
 				return fmt.Errorf("collision: %w", cerr)
 			}
-			for _, r := range crows { // entered faster than it can stop: d_act was too small
-				if v := dotf(r.jd, l.lastStep); -v > r.vmax+lateTolMM {
+			for _, r := range crows { // entered faster than it can stop: d_act was too small (live pairs can appear inside d_act, so skip them)
+				if v := dotf(r.jd, l.lastStep); !r.live && -v > r.vmax+r.ad+lateTolMM {
 					late = fmt.Sprintf("%s: approach %.3g mm/tick > v_max %.3g", l.coll.pairName(r.pair), -v, r.vmax)
 				}
 			}
 		}
-		next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt, crows, false)
+		next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt, crows, 0)
 		if qerr != nil && len(crows) > 0 {
 			relaxed = true
-			next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt, crows, true)
+			next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt, crows, 1)
+		}
+		if qerr != nil && slices.ContainsFunc(crows, func(r collRow) bool { return r.backAway }) {
+			// pinched: back-away rows can't all be met, so no further approach plus a soft retreat (spec "The row for a live pair")
+			next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt, crows, 2)
+			pinched = qerr == nil
 		}
 		switch {
 		case qerr != nil && len(crows) > 0: // brake: DLS ignores obstacles
@@ -717,16 +785,24 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	}
 	if l.coll != nil {
 		st.Collision = "on"
-		if len(l.coll.pairs) == 0 {
-			st.Collision = "off"
-		} else {
+		if l.coll.hasPairs() {
 			st.CollisionMinMM, st.CollisionPair, st.CollisionRows = cmin, "", len(crows)
 			if cpair >= 0 {
 				st.CollisionPair = l.coll.pairName(cpair)
 			}
+		} else if l.live == nil {
+			st.Collision = "off"
 		}
 		if relaxed {
 			st.CollisionRelaxed++
+		}
+		if pinched {
+			st.LivePinched++
+		}
+		if l.live != nil {
+			st.LiveCount, st.LiveAgeMS, st.LiveWaiting = l.coll.liveCount(), float64(liveAge)/float64(time.Millisecond), liveWaiting
+			st.LiveStale = liveAge > time.Duration(l.live.staleMS*float64(time.Millisecond))
+			st.LiveBackingAway = slices.ContainsFunc(crows, func(r collRow) bool { return r.backAway })
 		}
 		if braked {
 			st.CollisionBrakes++

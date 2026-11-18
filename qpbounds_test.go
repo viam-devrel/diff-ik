@@ -100,7 +100,7 @@ func TestQPNextRejectsNonFinite(t *testing.T) {
 	l, _, _ := newTestLoop(t, home, LoopConfig{Solver: SolverQP})
 	runTicks(t, l, 1)
 	rows := taskRows{A: mat.NewDense(1, 6, []float64{1, 0, 0, 0, 0, 0}), b: []float64{math.NaN()}}
-	next, _, _, err := l.qpNext(rows, 1, 1/l.cfg.RateHz, nil, false)
+	next, _, _, err := l.qpNext(rows, 1, 1/l.cfg.RateHz, nil, 0)
 	if err == nil || next != nil {
 		t.Fatalf("next %v err %v, want nil and an error", next, err)
 	}
@@ -132,7 +132,7 @@ func qpVsDLS(t *testing.T, l *Loop, target spatialmath.Pose, keepLast bool) (qp,
 	if !keepLast {
 		copy(l.lastStep, dq)
 	}
-	next, _, _, err := l.qpNext(rows, 1, dt, nil, false)
+	next, _, _, err := l.qpNext(rows, 1, dt, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestQPBeatsClampsNearLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	qpNext, _, _, err := l.qpNext(rows, 1, dt, nil, false)
+	qpNext, _, _, err := l.qpNext(rows, 1, dt, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

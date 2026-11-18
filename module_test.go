@@ -14,6 +14,7 @@ import (
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	motion "go.viam.com/rdk/services/motion"
+	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/spatialmath"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -572,5 +573,146 @@ func TestStatusMapCollisionKeys(t *testing.T) {
 	m = statusMap(st)
 	if _, ok := m["collision_rows"]; ok || m["collision"] != "off" {
 		t.Fatalf("off status = %v", m)
+	}
+}
+
+func TestValidateVisionServices(t *testing.T) {
+	deps, _, err := Config{Arms: []string{"a"}, VisionServices: []string{"v1", "v2"}}.Validate("services.0")
+	if err != nil || !slices.Equal(deps, []string{"a", "rdk:service:vision/v1", "rdk:service:vision/v2"}) {
+		t.Fatalf("deps = %v err = %v", deps, err)
+	}
+	for _, vs := range [][]string{{""}, {"v", "v"}, {"a"}} {
+		if _, _, err := (Config{Arms: []string{"a"}, VisionServices: vs}).Validate("p"); err == nil {
+			t.Errorf("vision_services %q: want error", vs)
+		}
+	}
+}
+
+func liveManager(t *testing.T) (*servoManager, *fakeSrc) {
+	t.Helper()
+	m, _, _ := newFramedTestManager(t, camPose)
+	src := &fakeSrc{props: vision.Properties{Detections3DSupported: true}}
+	m.visions = map[string]LiveSource{"v": src}
+	return m, src
+}
+
+func TestServoStartLiveObstacles(t *testing.T) {
+	obj := func(kv ...interface{}) map[string]interface{} {
+		o := map[string]interface{}{}
+		for i := 0; i < len(kv); i += 2 {
+			o[kv[i].(string)] = kv[i+1]
+		}
+		return o
+	}
+	good := func(kv ...interface{}) map[string]interface{} {
+		l := obj("vision", "v", "camera", "cam")
+		for i := 0; i < len(kv); i += 2 {
+			l[kv[i].(string)] = kv[i+1]
+		}
+		return l
+	}
+	start := func(live interface{}, kv ...interface{}) map[string]interface{} {
+		c := obj("command", "servo_start", "component_name", "arm", "frame", "arm_origin", "solver", "qp", "live_obstacles", live)
+		for i := 0; i < len(kv); i += 2 {
+			c[kv[i].(string)] = kv[i+1]
+		}
+		return c
+	}
+	vec := func(x, y, z float64) []interface{} { return []interface{}{x, y, z} }
+	for _, c := range []struct {
+		cmd  map[string]interface{}
+		want string
+	}{
+		{start("x"), "live_obstacles must be an object"},
+		{start(good(), "solver", "dls"), `needs "solver": "qp"`},
+		{start(good(), "collision", false), "collision"},
+		{start(obj("camera", "cam")), "live_obstacles.vision is required"},
+		{start(obj("vision", "v")), "live_obstacles.camera is required"},
+		{start(good("vision", "other")), "not in this service's vision_services"},
+		{start(good("bogus", 1.0)), `unknown live_obstacles key "bogus"`},
+		{start(good("rate_hz", "fast")), "live_obstacles.rate_hz"},
+		{start(good("rate_hz", 100.0)), "live_obstacles.rate_hz"},
+		{start(good("stale_ms", 50.0)), "live_obstacles.stale_ms"},
+		{start(good("timeout_ms", 1e6)), "live_obstacles.timeout_ms"},
+		{start(good("inflate_mm", -1.0)), "live_obstacles.inflate_mm"},
+		{start(good("max", 65.0)), "live_obstacles.max"},
+		{start(good("rate_hz", 0.0)), "live_obstacles.rate_hz must be > 0"},
+		{start(good("stale_ms", 0.0)), "live_obstacles.stale_ms must be > 0"},
+		{start(good("timeout_ms", 0.0)), "live_obstacles.timeout_ms must be > 0"},
+		{start(good("max", 0.0)), "live_obstacles.max must be > 0"},
+		{start(good("min_points", 0.0)), "live_obstacles.min_points must be > 0"},
+		{start(good("max", 1e300)), "live_obstacles.max"},
+		{start(good("max", 1.5)), "live_obstacles.max"},
+		{start(good("min_points", -1.0)), "live_obstacles.min_points"},
+		{start(good("workspace", obj("min_mm", vec(0, 0, 0)))), "workspace"},
+		{start(good("workspace", obj("min_mm", vec(0, 0, 0), "max_mm", vec(1, 1, 1), "x", 1.0))), "workspace"},
+		{start(good("workspace", obj("min_mm", vec(1, 1, 1), "max_mm", vec(0, 0, 0)))), "workspace"},
+		{start(good("workspace", obj("min_mm", []interface{}{1.0}, "max_mm", vec(2, 2, 2)))), "live_obstacles.workspace.min_mm"},
+		{start(good("extrude_to_z_mm", "low")), "live_obstacles.extrude_to_z_mm"},
+		{start(good("workspace", obj("min_mm", vec(0, 0, 0), "max_mm", vec(1, 1, 1)), "extrude_to_z_mm", 5.0)), "extrude_to_z_mm"},
+	} {
+		m, _ := liveManager(t)
+		_, err := testServo(t, m).DoCommand(context.Background(), c.cmd)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%v: err = %v, want %q", c.cmd["live_obstacles"], err, c.want)
+		}
+	}
+
+	m, src := liveManager(t)
+	s := testServo(t, m)
+	id := do(t, s, start(good("rate_hz", 20.0, "inflate_mm", 0.0, "max", 8,
+		"workspace", obj("min_mm", vec(-1000, -1000, -500), "max_mm", vec(1000, 1000, 1000)))))["session_id"]
+	sess, _ := m.get(id.(string))
+	t.Cleanup(sess.cancel)
+	if c := sess.poller.cfg; *c.InflateMM != 0 || c.Max != 8 || c.RateHz != 20 || c.WorkspaceMax.Z != 1000 || c.Camera != "cam" {
+		t.Fatalf("live config = %+v", c)
+	}
+	if sess.poller.src != LiveSource(src) {
+		t.Fatal("session did not get the vision service")
+	}
+	st := do(t, s, map[string]interface{}{"command": "servo_status", "session_id": id})
+	if st["collision"] != "on" {
+		t.Fatalf("collision = %v", st["collision"])
+	}
+	for _, k := range []string{"live_count", "live_age_ms", "live_updates", "live_errors", "live_self_dropped", "live_skipped",
+		"live_overflow", "live_clipped", "live_backing_away", "live_pinched", "live_waiting", "live_method"} {
+		if _, ok := st[k]; !ok {
+			t.Errorf("missing %s", k)
+		}
+	}
+	if st["live_method"] != "detections3d" {
+		t.Fatalf("live_method = %v", st["live_method"])
+	}
+	if _, ok := st["live_last_error"]; ok {
+		t.Fatal("live_last_error present with no error")
+	}
+
+}
+
+func TestStatusMapLiveKeys(t *testing.T) {
+	m := statusMap(SessionStatus{})
+	for k := range m {
+		if strings.HasPrefix(k, "live_") {
+			t.Fatalf("unexpected %s", k)
+		}
+	}
+	m = statusMap(SessionStatus{LiveMethod: "object_point_clouds", LiveLastError: "boom"})
+	if m["live_last_error"] != "boom" || m["live_method"] != "object_point_clouds" {
+		t.Fatalf("status = %v", m)
+	}
+}
+
+func TestTeleopLiveObstacles(t *testing.T) {
+	s, m, _ := newTeleopServo(t, map[string]interface{}{"solver": "qp",
+		"live_obstacles": map[string]interface{}{"vision": "v", "camera": "cam"}})
+	f := m.fs.(teleopFS)
+	f.parts = []*referenceframe.FrameSystemPart{{FrameConfig: referenceframe.NewLinkInFrame("arm", camPose, "cam", nil)}}
+	src := &fakeSrc{props: vision.Properties{Detections3DSupported: true}}
+	m.visions = map[string]LiveSource{"v": src}
+	do(t, s, startCmd(t, "arm"))
+	sess := teleSession(t, m)
+	t.Cleanup(sess.cancel)
+	if sess.poller == nil || sess.poller.cfg.Camera != "cam" || sess.poller.src != LiveSource(src) {
+		t.Fatalf("teleop session has no live poller: %+v", sess.poller)
 	}
 }

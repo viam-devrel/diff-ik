@@ -102,7 +102,7 @@ func TestCollisionGradient(t *testing.T) {
 			extra = append(extra, staticPart("arm", "grip", mountOff, gripBox))
 		}
 		c := buildColl(t, m, CollisionRequest{}, pandaHold, extra...)
-		rows, _, _, err := c.rows(pandaHold, make([]float64, 7), 0.02)
+		rows, _, _, err := c.rows(pandaHold, make([]float64, 7), 0.02, 1e9)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -322,7 +322,7 @@ func TestCollisionSuspendRearm(t *testing.T) {
 	q := slices.Clone(pandaHold)
 	q[1] -= 0.8 // lift away
 	q[3] += 0.8
-	rows, _, _, err := c.rows(q, make([]float64, 7), 0.02)
+	rows, _, _, err := c.rows(q, make([]float64, 7), 0.02, 1e9)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestCollisionActivationAndCap(t *testing.T) {
 	fp := eePoint(t, m, pandaHold)
 	far := staticPart(referenceframe.World, "far", spatialmath.NewPoseFromPoint(r3.Vector{X: fp.X, Y: fp.Y, Z: fp.Z - 1000}), mustSphere(t, 10))
 	c := buildColl(t, m, CollisionRequest{}, pandaHold, far)
-	rows, minD, _, err := c.rows(pandaHold, make([]float64, 7), 0.02)
+	rows, minD, _, err := c.rows(pandaHold, make([]float64, 7), 0.02, 1e9)
 	if err != nil || len(rows) != 0 || minD < c.dAct {
 		t.Fatalf("far pair: rows %d minD %v err %v", len(rows), minD, err)
 	}
@@ -353,7 +353,7 @@ func TestCollisionActivationAndCap(t *testing.T) {
 			spatialmath.NewPoseFromPoint(r3.Vector{X: fp.X + 60*math.Cos(a), Y: fp.Y + 60*math.Sin(a), Z: fp.Z - 40}), mustSphere(t, 5)))
 	}
 	c = buildColl(t, m, CollisionRequest{}, pandaHold, spheres...)
-	rows, _, _, err = c.rows(pandaHold, make([]float64, 7), 0.02)
+	rows, _, _, err = c.rows(pandaHold, make([]float64, 7), 0.02, 1e9)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +384,7 @@ func TestCollisionRowsTime(t *testing.T) {
 	nrows := 0
 	for i := 0; i < 1000; i++ {
 		s := time.Now()
-		r, _, _, err := c.rows(pandaHold, acc, 0.02)
+		r, _, _, err := c.rows(pandaHold, acc, 0.02, 1e9)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -442,7 +442,7 @@ func TestCollisionRowsNonFiniteDistance(t *testing.T) {
 	}
 	nan := spatialmath.NewPoseFromPoint(r3.Vector{X: math.NaN()})
 	c.obs[0].geom = c.obs[0].geom.Transform(nan)
-	if _, _, _, err := c.rows(pandaHold, make([]float64, 7), 0.02); err == nil {
+	if _, _, _, err := c.rows(pandaHold, make([]float64, 7), 0.02, 1e9); err == nil {
 		t.Fatal("NaN distance did not error")
 	}
 }

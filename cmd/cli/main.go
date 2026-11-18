@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -19,13 +20,15 @@ import (
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/robot/client"
+	"go.viam.com/rdk/services/vision"
 	"go.viam.com/utils/rpc"
 )
 
 const usage = `usage: cli [flags] validate
        cli [flags] run static|singular|circle|hold|orbit
        cli [flags] probe
-       cli [flags] pose`
+       cli [flags] pose
+       cli clearance --csv RUN.csv --props PROPS.csv --arm NAME [--world-state F] [--address A] [--insecure]`
 
 func main() {
 	if err := realMain(); err != nil {
@@ -35,6 +38,9 @@ func main() {
 }
 
 func realMain() error {
+	if len(os.Args) > 1 && os.Args[1] == "clearance" { // its own flags, after the subcommand
+		return clearanceCmd(os.Args[2:])
+	}
 	address := flag.String("address", "localhost:8080", "machine address, e.g. <machine>.local.viam.cloud:8080 (or use --insecure for a plaintext local server)")
 	insecure := flag.Bool("insecure", false, "dial without TLS (plaintext local server)")
 	armName := flag.String("arm", "", "arm component name (required)")
@@ -81,9 +87,42 @@ func realMain() error {
 	dActMM := flag.Float64("d-act-mm", 0, "run: distance at which the collision damper starts acting, mm (0 = default 100)")
 	descendMM := flag.Float64("descend-mm", 100, "descend: how far the target moves down (-z, base frame), mm")
 	descendMMs := flag.Float64("descend-mm-s", 20, "descend: speed of the target, mm/s")
+	liveVision := flag.String("live-vision", "", "run: vision service to take live obstacles from (needs --solver qp; turns collision on)")
+	liveCamera := flag.String("live-camera", "", "run: camera name passed to the vision service (and the frame for point-cloud objects)")
+	liveRate := flag.Float64("live-rate-hz", 0, "run: live poll rate (0 = default 10)")
+	liveStale := flag.Float64("live-stale-ms", 0, "run: stop if no detections arrive for this long (0 = default 500)")
+	liveInflate := flag.Float64("live-inflate-mm", 0, "run: inflate each live obstacle by this much (default 10; 0 is allowed)")
+	liveWorkspace := flag.String("live-workspace", "", "run: clip live obstacles to this world box, mm: x0,y0,z0,x1,y1,z1")
+	liveExtrude := flag.Float64("live-extrude-z", 0, "run: extrude live obstacles down to this world z, mm (enabled whenever the flag is given)")
 	flag.Parse()
 	args := flag.Args()
-	collision := (*collisionOn || *worldState != "") && !*collisionOff
+	collision := (*collisionOn || *worldState != "" || *liveVision != "") && !*collisionOff
+	var live *diffik.LiveConfig
+	if *liveVision != "" {
+		if *solver != diffik.SolverQP || *collisionOff {
+			return errors.New("--live-vision needs --solver qp and collision on")
+		}
+		live = &diffik.LiveConfig{Vision: *liveVision, Camera: *liveCamera, RateHz: *liveRate, StaleMS: *liveStale}
+		if *liveWorkspace != "" {
+			var err error
+			if live.WorkspaceMin, live.WorkspaceMax, err = parseWorkspace(*liveWorkspace); err != nil {
+				return err
+			}
+		}
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "live-extrude-z":
+				live.ExtrudeToZ = liveExtrude
+			case "live-inflate-mm":
+				live.InflateMM = liveInflate
+			}
+		})
+		if err := live.Validate(); err != nil {
+			return fmt.Errorf("--live-*: %w", err)
+		}
+	} else if *liveCamera != "" || *liveRate != 0 || *liveStale != 0 || *liveWorkspace != "" || liveFlagSet("live-inflate-mm", "live-extrude-z") {
+		return errors.New("--live-* flags need --live-vision")
+	}
 	if collision && *solver != diffik.SolverQP {
 		return errors.New("collision avoidance needs --solver qp")
 	}
@@ -202,12 +241,28 @@ func realMain() error {
 		}
 	}
 
+	var liveSrc vision.Service
+	if live != nil && len(args) == 2 {
+		if liveSrc, err = vision.FromProvider(machine, live.Vision); err != nil {
+			return fmt.Errorf("--live-vision: %w", err)
+		}
+	}
+
 	var startQ []float64
+	if live != nil && len(args) == 2 { // dry check before anything moves: properties call and camera frame
+		q0, err := a.JointPositions(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if err := diffik.CheckLive(ctx, liveSrc, parts, model, *armName, q0, *live); err != nil {
+			return err
+		}
+	}
 	if *startJoints != "" {
 		if startQ, err = parseJoints(*startJoints, model.DoF()); err != nil {
 			return err
 		}
-		fmt.Printf("moving to start joints %v (profiled, 30°/s on the SO-101 driver)\n", startQ)
+		fmt.Printf("moving to start joints %v (profiled move)\n", startQ)
 		if err := sa.MoveToJointPositions(ctx, startQ, nil); err != nil {
 			return err
 		}
@@ -227,7 +282,7 @@ func realMain() error {
 			hold: *hold, circleMMs: *circleMMs, guard: guard, lead: msDur(*leadMS),
 			solver: *solver, postureJoint: *postureJoint, postureDeg: *postureDeg, postureW: *postureW, postureK: *postureK,
 			descendMM: *descendMM, descendMMs: *descendMMs, armName: *armName, collision: req, parts: parts,
-			orbitDegS: *orbitDegS, orbitDeg: *orbitDeg, maxJointDegS2: *maxDegS2,
+			orbitDegS: *orbitDegS, orbitDeg: *orbitDeg, maxJointDegS2: *maxDegS2, live: live, liveSrc: liveSrc,
 		})
 	default:
 		return errors.New(usage)
@@ -267,4 +322,14 @@ func parseAllow(s string) ([2]string, error) {
 		return [2]string{}, fmt.Errorf("--allow %q: want frame1:frame2", s)
 	}
 	return [2]string{a, b}, nil
+}
+
+// liveFlagSet reports whether any of the named flags was given.
+func liveFlagSet(names ...string) (set bool) {
+	flag.Visit(func(f *flag.Flag) {
+		if slices.Contains(names, f.Name) {
+			set = true
+		}
+	})
+	return
 }

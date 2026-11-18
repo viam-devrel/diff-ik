@@ -1,0 +1,336 @@
+{
+  "network": {
+    "bind_address": "localhost:8084"
+  },
+  "modules": [
+    {
+      "type": "local",
+      "name": "mujoco-sim",
+      "executable_path": "/Users/nick.hehr/src/viam-mujoco-sim/run.sh"
+    },
+    {
+      "type": "local",
+      "name": "diff-ik",
+      "executable_path": "/Users/nick.hehr/src/diff-ik/bin/diff-ik"
+    },
+    {
+      "type": "local",
+      "name": "obstacles-pointcloud",
+      "executable_path": "/Users/nick.hehr/src/obstacles-pointcloud/bin/obstacles-pointcloud"
+    },
+    {
+      "type": "local",
+      "name": "detections-to-segments",
+      "executable_path": "/Users/nick.hehr/src/detections-to-segments/bin/detections-to-segments"
+    }
+  ],
+  "components": [
+    {
+      "name": "sim-world",
+      "api": "rdk:component:generic",
+      "model": "viam-labs:mujoco-sim:world",
+      "attributes": {
+        "props": [
+          {
+            "name": "mug",
+            "type": "mesh",
+            "mesh": "/Users/nick.hehr/viam-sim-demos/franka-mug/assets/mug-centered/mug.obj",
+            "texture": "/Users/nick.hehr/viam-sim-demos/franka-mug/assets/mug-centered/texture_map.png",
+            "position": [
+              0.5,
+              0.1,
+              0.0615
+            ],
+            "orientation_wxyz": [
+              0.7071068,
+              0,
+              0,
+              0.7071068
+            ],
+            "scale": 1,
+            "mass": 0.3,
+            "static_friction": 2,
+            "color": [
+              0.8,
+              0.2,
+              0.2
+            ]
+          },
+          {
+            "name": "intruder",
+            "size": 0.08,
+            "scale": [
+              1,
+              1,
+              1.5
+            ],
+            "position": [
+              0.85,
+              0.45,
+              0.081
+            ],
+            "mass": 0.2,
+            "color": [
+              0.9,
+              0.05,
+              0.05
+            ]
+          },
+          {
+            "name": "parked",
+            "size": 0.08,
+            "scale": [
+              1,
+              1,
+              1.5
+            ],
+            "position": [
+              0.85,
+              -0.45,
+              0.081
+            ],
+            "mass": 0.2,
+            "color": [
+              0.9,
+              0.05,
+              0.05
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "table",
+      "api": "rdk:component:generic",
+      "model": "viam-labs:mujoco-sim:obstacle",
+      "attributes": {
+        "world": "sim-world",
+        "color": [
+          0.55,
+          0.45,
+          0.35
+        ]
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 600,
+          "y": 0,
+          "z": 10
+        },
+        "geometry": {
+          "type": "box",
+          "x": 800,
+          "y": 1200,
+          "z": 20
+        }
+      }
+    },
+    {
+      "name": "bin",
+      "api": "rdk:component:generic",
+      "model": "viam-labs:mujoco-sim:obstacle",
+      "attributes": {
+        "world": "sim-world",
+        "color": [
+          0.3,
+          0.5,
+          0.8
+        ],
+        "mesh": "meshes/bin.stl"
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 450,
+          "y": -350,
+          "z": 0
+        }
+      }
+    },
+    {
+      "name": "pick-arm",
+      "api": "rdk:component:arm",
+      "model": "viam-labs:mujoco-sim:arm",
+      "attributes": {
+        "world": "sim-world",
+        "max_joint_deg_s": 30,
+        "max_joint_deg_s2": 60,
+        "mjcf": "/Users/nick.hehr/viam-sim-demos/franka-mug/assets/franka_emika_panda/panda_nohand.xml"
+      },
+      "frame": {
+        "parent": "world"
+      }
+    },
+    {
+      "name": "pick-gripper",
+      "api": "rdk:component:gripper",
+      "model": "viam-labs:mujoco-sim:gripper",
+      "attributes": {
+        "world": "sim-world",
+        "arm": "pick-arm",
+        "asset": "robotiq_2f85",
+        "sensorless": true
+      },
+      "frame": {
+        "parent": "pick-arm",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": 155.8
+        }
+      }
+    },
+    {
+      "name": "overview",
+      "api": "rdk:component:camera",
+      "model": "viam-labs:mujoco-sim:camera",
+      "attributes": {
+        "world": "sim-world",
+        "width": 1280,
+        "height": 720,
+        "target": [
+          0.45,
+          -0.15,
+          0.05
+        ]
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 1450,
+          "y": 300,
+          "z": 700
+        }
+      }
+    },
+    {
+      "name": "top-depth",
+      "api": "rdk:component:camera",
+      "model": "viam-labs:mujoco-sim:camera",
+      "attributes": {
+        "world": "sim-world",
+        "fov_deg": 70,
+        "width": 640,
+        "height": 480,
+        "depth": true,
+        "depth_width": 320,
+        "depth_height": 240
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 550,
+          "y": 0,
+          "z": 1300
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": -1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "wrist-depth",
+      "api": "rdk:component:camera",
+      "model": "viam-labs:mujoco-sim:camera",
+      "attributes": {
+        "world": "sim-world",
+        "fov_deg": 70,
+        "width": 640,
+        "height": 480,
+        "depth": true,
+        "depth_width": 320,
+        "depth_height": 240
+      },
+      "frame": {
+        "parent": "pick-arm",
+        "translation": {
+          "x": 0,
+          "y": 70,
+          "z": 40
+        }
+      }
+    }
+  ],
+  "services": [
+    {
+      "name": "world-state",
+      "api": "rdk:service:world_state_store",
+      "model": "viam-labs:mujoco-sim:world_state",
+      "attributes": {
+        "world": "sim-world"
+      }
+    },
+    {
+      "name": "servo",
+      "api": "rdk:service:motion",
+      "model": "devrel:diff-ik:servo",
+      "attributes": {
+        "arms": [
+          "pick-arm"
+        ]
+      }
+    },
+    {
+      "name": "obstacles-top",
+      "api": "rdk:service:vision",
+      "model": "viam:obstacles-pointcloud:obstacles-pointcloud",
+      "attributes": {
+        "camera_name": "top-depth",
+        "ground_plane_normal_vec": {
+          "x": 0,
+          "y": 0,
+          "z": -1
+        },
+        "max_dist_from_plane_mm": 25,
+        "min_points_in_plane": 2000,
+        "min_points_in_segment": 50,
+        "ground_angle_tolerance_degs": 10
+      }
+    },
+    {
+      "name": "obstacles-wrist",
+      "api": "rdk:service:vision",
+      "model": "viam:obstacles-pointcloud:obstacles-pointcloud",
+      "attributes": {
+        "camera_name": "wrist-depth",
+        "ground_plane_normal_vec": {
+          "x": 0,
+          "y": 0,
+          "z": -1
+        },
+        "max_dist_from_plane_mm": 10,
+        "min_points_in_segment": 50
+      }
+    },
+    {
+      "name": "red",
+      "api": "rdk:service:vision",
+      "model": "color_detector",
+      "attributes": {
+        "detect_color": "#E60D0D",
+        "hue_tolerance_pct": 0.06,
+        "segment_size_px": 200
+      }
+    },
+    {
+      "name": "segments-top",
+      "api": "rdk:service:vision",
+      "model": "viam:vision:detections-to-segments",
+      "attributes": {
+        "camera_name": "top-depth",
+        "detector_name": "red",
+        "confidence_threshold_pct": 0.5,
+        "mean_k": 5,
+        "sigma": 1.25,
+        "infer_minimum_depth": true
+      }
+    }
+  ]
+}

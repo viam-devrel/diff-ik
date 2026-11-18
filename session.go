@@ -93,6 +93,22 @@ type SessionConfig struct {
 	Filter    TargetFilter      // the zero value means DefaultTargetFilter
 
 	NoPointVelocities bool // armIO only: stream positions without per-point target velocities
+
+	Live       *LiveConfig // nil: no live obstacles (solver qp only)
+	LiveSource LiveSource  // the vision service; Task 6's startSession fills it, tests set it directly
+	// LiveJoints reads the joints for the poller; nil means the arm's JointPositions. Tests inject it.
+	LiveJoints JointReader
+}
+
+// armJoints adapts an arm's JointPositions to a JointReader.
+type armJoints struct{ a arm.Arm }
+
+func (j armJoints) Joints(ctx context.Context) ([]float64, error) {
+	in, err := j.a.JointPositions(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return in, nil
 }
 
 // SessionStatus is a snapshot of a session, live or final.
@@ -103,6 +119,10 @@ type SessionStatus struct {
 	RollIgnored bool // servo_twist only: an angular component about the tool axis was dropped (pointing mode)
 	Filter      TargetFilter
 	Clamps      int // targets the floor clamp has raised
+
+	// live obstacles: the poller's session totals (zero when live_obstacles is off)
+	LiveUpdates, LiveErrors, LiveSelfDropped, LiveSkipped, LiveOverflow, LiveClipped int64
+	LiveLastError, LiveMethod                                                        string
 }
 
 // TargetResult is servo_target's outcome. Raw is the target in the session frame before the filter,
@@ -125,6 +145,7 @@ type session struct {
 	cancel        context.CancelFunc
 	logger        logging.Logger
 	armName       string
+	poller        *poller // nil unless live obstacles
 
 	// Set once in start() and read-only after, so the frame transform needs no s.mu.
 	fs     *referenceframe.FrameSystem // nil unless Frames
@@ -151,7 +172,7 @@ func (s *session) run(ctx context.Context) { s.finish(s.loop.Run(ctx)) }
 func (s *session) finish(err error) {
 	st := s.status()
 	switch st.State {
-	case StateStopped, StateStoppedTimeout, StateFaulted:
+	case StateStopped, StateStoppedTimeout, StateStoppedStale, StateFaulted:
 	default:
 		st.State = StateStopped // Run ended by context cancel
 	}
@@ -208,6 +229,10 @@ func (s *session) onTick(st Status) {
 	if s.stopping == "" && s.now().Sub(s.lastCmd) > s.timeout {
 		s.stopping = StateStoppedTimeout
 		s.loop.RampStop(s.ramp, StateStoppedTimeout)
+	}
+	if st.LiveStale && s.stopping == "" { // s.mu is held: not beginStop
+		s.stopping = StateStoppedStale
+		s.loop.RampStop(s.ramp, StateStoppedStale)
 	}
 }
 
@@ -368,7 +393,19 @@ func (s *session) status() SessionStatus {
 	s.mu.Lock()
 	age, filt, clamps := s.now().Sub(s.lastCmd), s.filt.cfg, s.filt.clamps
 	s.mu.Unlock()
-	return SessionStatus{Status: s.loop.Status(), Config: s.loop.Config(), LastCmdAge: age, Filter: filt, Clamps: clamps}
+	ss := SessionStatus{Status: s.loop.Status(), Config: s.loop.Config(), LastCmdAge: age, Filter: filt, Clamps: clamps}
+	s.addLive(&ss)
+	return ss
+}
+
+// addLive copies the poller's counters into ss.
+func (s *session) addLive(ss *SessionStatus) {
+	if p := s.poller; p != nil {
+		st := p.stats()
+		ss.LiveUpdates, ss.LiveErrors, ss.LiveSelfDropped = st.Updates, st.Errors, st.Self
+		ss.LiveSkipped, ss.LiveOverflow, ss.LiveClipped = st.Skipped, st.Overflow, st.Clipped
+		ss.LiveLastError, ss.LiveMethod = st.LastError, st.Method
+	}
 }
 
 // servoManager owns the sessions, at most one live session per arm.
@@ -379,6 +416,8 @@ type servoManager struct {
 	now    func() time.Time
 	newIO  func(arm.Arm, float64) JointIO
 	manual bool // tests: don't start Run, drive ticks by hand
+	// visions are the vision services a live_obstacles session may poll, by name.
+	visions map[string]LiveSource
 
 	mu     sync.Mutex
 	byArm  map[string]*session
@@ -460,13 +499,17 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 	var fsys *referenceframe.FrameSystem
 	var zeroIn referenceframe.FrameSystemInputs
 	var cfgFS *framesystem.Config
-	if cfg.Frames || cfg.Collision != nil {
+	if cfg.Frames || cfg.Collision != nil || cfg.Live != nil {
 		if cfgFS, err = m.fs.FrameSystemConfig(ctx); err != nil {
 			return nil, nil, fmt.Errorf("reading the frame system: %w", err)
 		}
 	}
-	if cfg.Collision != nil {
-		cm, err := NewCollisionModel(cfgFS.Parts, model, armName, *cfg.Collision, q)
+	creq := cfg.Collision
+	if creq == nil && cfg.Live != nil {
+		creq = &CollisionRequest{} // live mode needs a model even with no static obstacles
+	}
+	if creq != nil {
+		cm, err := NewCollisionModel(cfgFS.Parts, model, armName, *creq, q)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -476,7 +519,7 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 		for _, w := range cm.Warnings() {
 			m.logger.Warnw("collision", "warning", w)
 		}
-		if len(cm.pairs) == 0 {
+		if len(cm.pairs) == 0 && cfg.Live == nil {
 			m.logger.Warnw("collision requested but no robot-part/obstacle pairs; collision is off", "arm", armName)
 		}
 	}
@@ -500,6 +543,19 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 		lastCmd: m.now(),
 		fs:      fsys, frame: cfg.Frame, startQ: q, zeroIn: zeroIn, chains: map[string]error{},
 		filt: newTargetFilter(cfg.Filter), ff: cfg.Filter.Feedforward,
+	}
+	if cfg.Live != nil {
+		jr := cfg.LiveJoints
+		if jr == nil {
+			jr = armJoints{a}
+		}
+		h, err := StartLive(ctx, l, cfg.LiveSource, jr, cfgFS.Parts, model, armName, q, *cfg.Live)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		s.poller = h.p
+		s.cancel = func() { cancel(); h.Stop() }
 	}
 	l.OnTick = s.onTick
 	m.byArm[armName] = s

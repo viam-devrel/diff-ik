@@ -93,7 +93,7 @@ Validation, each rejected with a message naming the field:
    - With the gap `g = d − d_min`, the row is `J_d·Δq ≥ −v_max`.
    - `A_d = Σ_j |J_d[j]|·a_j·dt²` (mm per tick²) is the most `J_d·Δq` can change in one tick inside the acceleration bounds.
    - `v_max = max(√(2·A_d·g) − A_d/2, min(g, A_d), 0)`. This is `brakeCap`'s discrete rule with c = A_d, so an approach at `v_max` that is slowed by up to A_d per tick stops within g, and the next tick's `v_max` is at least the current approach minus A_d. A_d changes a little with configuration; the relaxation below covers that.
-6. **Activation.** `d_act` must be at least the stopping distance at the arm's top approach speed. Status reports `collision_rows`, and the session logs a warning if a pair enters with an approach faster than its `v_max`, meaning `d_act` was too small. The warning names the pair and gives its approach speed and `v_max` in mm per tick, so the default can be tuned from the evidence runs.
+6. **Activation.** `d_act` must be at least the stopping distance at the arm's top approach speed. Status reports `collision_rows`, and the session logs a warning if a pair enters with an approach faster than its `v_max`, meaning `d_act` was too small (it fires above `v_max + A_d + tol`; live pairs are excluded). The warning names the pair and gives its approach speed and `v_max` in mm per tick, so the default can be tuned from the evidence runs.
 7. **Solve:** `qpNext` passes these rows as `A`/`b` with the bounds.
 
 The rows only ever forbid motion. At `scale` = 0 (ramp-stop or dead-man) the task asks for no motion, so stopping is unchanged.

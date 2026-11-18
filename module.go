@@ -16,6 +16,7 @@ import (
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot/framesystem"
 	motion "go.viam.com/rdk/services/motion"
+	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/spatialmath"
 )
 
@@ -35,6 +36,8 @@ func init() {
 // Config lists the arms this service may servo.
 type Config struct {
 	Arms []string `json:"arms"`
+	// VisionServices names the vision services a live_obstacles session may poll.
+	VisionServices []string `json:"vision_services,omitempty"`
 	// Teleop holds servo_start defaults (limits, rate_hz, timeout_ms, ...) for viam:teleop sessions.
 	Teleop map[string]interface{} `json:"teleop,omitempty"`
 }
@@ -52,7 +55,17 @@ func (cfg Config) Validate(path string) ([]string, []string, error) {
 		}
 		seen[a] = true
 	}
-	return slices.Clone(cfg.Arms), nil, nil
+	for _, v := range cfg.VisionServices {
+		if v == "" || seen[v] {
+			return nil, nil, fmt.Errorf("%s: vision_services must be unique, non-empty names that differ from the arms", path)
+		}
+		seen[v] = true
+	}
+	deps := slices.Clone(cfg.Arms)
+	for _, v := range cfg.VisionServices {
+		deps = append(deps, vision.Named(v).String()) // full names: a plain name clashes with a camera of the same name
+	}
+	return deps, nil, nil
 }
 
 type diffIkServo struct {
@@ -91,7 +104,18 @@ func NewServo(ctx context.Context, deps resource.Dependencies, name resource.Nam
 	if err != nil {
 		return nil, err
 	}
-	srv := newServo(name, logger, newServoManager(arms, fs, logger))
+	m := newServoManager(arms, fs, logger)
+	if len(conf.VisionServices) > 0 {
+		m.visions = map[string]LiveSource{}
+	}
+	for _, n := range conf.VisionServices {
+		v, err := vision.FromProvider(deps, n)
+		if err != nil {
+			return nil, err
+		}
+		m.visions[n] = v
+	}
+	srv := newServo(name, logger, m)
 	srv.teleopConf = conf.Teleop
 	return srv, nil
 }
@@ -372,6 +396,13 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 	if err != nil {
 		return nil, nil, err
 	}
+	live, src, err := s.parseLive(cmd, solver)
+	if err != nil {
+		return nil, nil, err
+	}
+	if live != nil && coll == nil {
+		coll = &CollisionRequest{DMinMM: 10, DActMM: 100}
+	}
 	frames, err := optBool(cmd, "frames", false)
 	if err != nil {
 		return nil, nil, err
@@ -385,10 +416,127 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 		return nil, nil, err
 	}
 	return s.m.start(ctx, armName, SessionConfig{
-		Frame: frame, Mode: Mode(mode), Loop: lc, Collision: coll, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
+		Frame: frame, Mode: Mode(mode), Loop: lc, Collision: coll, Live: live, LiveSource: src, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
 		Timeout: time.Duration(timeout * float64(time.Millisecond)),
 		Ramp:    time.Duration(ramp * float64(time.Millisecond)),
 	})
+}
+
+// parseLive reads live_obstacles; nil means off. It returns the vision service named by its "vision".
+func (s *diffIkServo) parseLive(cmd map[string]interface{}, solver string) (*LiveConfig, LiveSource, error) {
+	raw, ok := cmd["live_obstacles"]
+	if !ok {
+		return nil, nil, nil
+	}
+	lm, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, nil, errors.New("live_obstacles must be an object")
+	}
+	if solver != SolverQP {
+		return nil, nil, errors.New(`live_obstacles needs "solver": "qp"`)
+	}
+	if b, ok := cmd["collision"].(bool); ok && !b {
+		return nil, nil, errors.New(`live_obstacles needs collision, not "collision": false`)
+	}
+	c := &LiveConfig{}
+	var err error
+	for k, v := range lm {
+		key := "live_obstacles." + k
+		pos := func(f float64) error {
+			if !(f > 0) {
+				return fmt.Errorf("%s must be > 0, got %v", key, f)
+			}
+			return nil
+		}
+		switch k {
+		case "vision", "camera":
+			str, ok := v.(string)
+			if !ok {
+				return nil, nil, fmt.Errorf("%s must be a string, got %v", key, v)
+			}
+			if k == "vision" {
+				c.Vision = str
+			} else {
+				c.Camera = str
+			}
+		case "rate_hz":
+			if c.RateHz, err = num(v, key); err == nil {
+				err = pos(c.RateHz)
+			}
+		case "stale_ms":
+			if c.StaleMS, err = num(v, key); err == nil {
+				err = pos(c.StaleMS)
+			}
+		case "timeout_ms":
+			if c.TimeoutMS, err = num(v, key); err == nil {
+				err = pos(c.TimeoutMS)
+			}
+		case "inflate_mm":
+			var f float64
+			if f, err = num(v, key); err == nil {
+				c.InflateMM = &f
+			}
+		case "max", "min_points":
+			var f float64
+			if f, err = num(v, key); err == nil {
+				if err = pos(f); err == nil && f != math.Trunc(f) {
+					err = fmt.Errorf("%s must be an integer, got %v", key, f)
+				}
+			}
+			if k == "max" {
+				c.Max = int(f)
+			} else {
+				c.MinPoints = int(f)
+			}
+		case "extrude_to_z_mm":
+			var f float64
+			if f, err = num(v, key); err == nil {
+				c.ExtrudeToZ = &f
+			}
+		case "workspace":
+			wm, ok := v.(map[string]interface{})
+			if !ok {
+				return nil, nil, errors.New("live_obstacles.workspace must be an object")
+			}
+			for wk := range wm {
+				if wk != "min_mm" && wk != "max_mm" {
+					return nil, nil, fmt.Errorf("unknown live_obstacles.workspace key %q", wk)
+				}
+			}
+			for _, w := range []struct {
+				k   string
+				dst **r3.Vector
+			}{{"min_mm", &c.WorkspaceMin}, {"max_mm", &c.WorkspaceMax}} {
+				if _, ok := wm[w.k]; !ok {
+					continue
+				}
+				var vec r3.Vector
+				if vec, err = vec3(wm, w.k); err != nil {
+					return nil, nil, fmt.Errorf("live_obstacles.workspace.%w", err)
+				}
+				*w.dst = &vec
+			}
+		default:
+			return nil, nil, fmt.Errorf("unknown live_obstacles key %q", k)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if c.Vision == "" {
+		return nil, nil, errors.New("live_obstacles.vision is required")
+	}
+	if c.Camera == "" {
+		return nil, nil, errors.New("live_obstacles.camera is required")
+	}
+	src, ok := s.m.visions[c.Vision]
+	if !ok {
+		return nil, nil, fmt.Errorf("live_obstacles.vision %q is not in this service's vision_services", c.Vision)
+	}
+	if err := c.withDefaults().validate(); err != nil {
+		return nil, nil, err
+	}
+	return c, src, nil
 }
 
 // parseCollision reads collision, world_state and collision_specification; nil means off.
@@ -673,6 +821,17 @@ func statusMap(st SessionStatus) map[string]interface{} {
 		out["pointing_residual_deg"] = st.PointingResidualDeg
 	}
 	out["solver"] = st.Config.Solver
+	if st.LiveMethod != "" {
+		out["live_count"], out["live_age_ms"] = float64(st.LiveCount), st.LiveAgeMS
+		out["live_updates"], out["live_errors"] = float64(st.LiveUpdates), float64(st.LiveErrors)
+		out["live_self_dropped"], out["live_skipped"] = float64(st.LiveSelfDropped), float64(st.LiveSkipped)
+		out["live_overflow"], out["live_clipped"] = float64(st.LiveOverflow), float64(st.LiveClipped)
+		out["live_backing_away"], out["live_pinched"], out["live_waiting"] = st.LiveBackingAway, float64(st.LivePinched), st.LiveWaiting
+		out["live_method"] = st.LiveMethod
+		if st.LiveLastError != "" {
+			out["live_last_error"] = st.LiveLastError
+		}
+	}
 	qc := make([]interface{}, len(st.QCmd))
 	for i, v := range st.QCmd {
 		qc[i] = rad2deg(v)

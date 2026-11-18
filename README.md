@@ -27,6 +27,13 @@ the motion service's `WorldState` and `CollisionSpecification` shapes. Boxes, ca
 [`docs/superpowers/specs/2026-11-18-diff-ik-collision-design.md`](docs/superpowers/specs/2026-11-18-diff-ik-collision-design.md).
 Results: [`docs/results/2026-11-qp-collision.md`](docs/results/2026-11-qp-collision.md).
 
+Collision can also take obstacles from a vision service while a session runs (`live_obstacles`, with the service named
+in the module's `vision_services`). The module polls it, backs the arm away from anything inside `d_min`, stops its approach and retreats softly when
+pinched, waits for the first detections before moving, and ramp-stops as `stopped_stale` if they stop arriving. It has no
+velocity prediction. Design:
+[`docs/superpowers/specs/2026-11-18-diff-ik-live-obstacles-design.md`](docs/superpowers/specs/2026-11-18-diff-ik-live-obstacles-design.md).
+Results: [`docs/results/2026-11-live-obstacles.md`](docs/results/2026-11-live-obstacles.md).
+
 ## Local SO-101 simulation (Phase 3a)
 
 No cloud machine needed:

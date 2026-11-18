@@ -36,13 +36,14 @@ func (r *recorder) add(s diffik.Status) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	el := time.Since(r.start)
+	epoch := float64(time.Now().UnixNano()) / 1e9
 	r.rows = append(r.rows, s)
 	r.times = append(r.times, el)
 	if r.csv == nil {
 		return
 	}
 	f := func(v float64) string { return strconv.FormatFloat(v, 'f', 6, 64) }
-	row := []string{f(el.Seconds()), string(s.State),
+	row := []string{f(el.Seconds()), strconv.FormatFloat(epoch, 'f', 3, 64), string(s.State),
 		f(s.TargetMM.X), f(s.TargetMM.Y), f(s.TargetMM.Z),
 		f(s.ErrMM), f(s.ErrDeg), f(s.CmdErrMM), f(s.CmdErrDeg), f(s.Damping), strconv.FormatBool(s.Limited), f(s.LastTick.Seconds() * 1000)}
 	for _, v := range s.QCmd {
@@ -86,6 +87,8 @@ type runOpts struct {
 	armName                                     string
 	collision                                   *diffik.CollisionRequest // nil = off
 	parts                                       []*referenceframe.FrameSystemPart
+	live                                        *diffik.LiveConfig // nil = off
+	liveSrc                                     diffik.LiveSource
 }
 
 func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario string, o runOpts) (err error) {
@@ -165,7 +168,7 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 		}
 		defer f.Close()
 		rec.csv = csv.NewWriter(f)
-		hdr := []string{"elapsed_s", "state", "target_x_mm", "target_y_mm", "target_z_mm", "err_mm", "err_deg",
+		hdr := []string{"elapsed_s", "epoch_s", "state", "target_x_mm", "target_y_mm", "target_z_mm", "err_mm", "err_deg",
 			"cmd_err_mm", "cmd_err_deg", "damping", "limited", "tick_ms"}
 		for _, pre := range []string{"q_cmd_", "q_meas_"} {
 			for i := range model.DoF() {
@@ -181,6 +184,11 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 		}()
 	}
 	l.OnTick = rec.add
+	var stale *staleStopper
+	if o.live != nil {
+		stale = &staleStopper{l: l, next: rec.add, ramp: liveStaleRamp}
+		l.OnTick = stale.onTick
+	}
 
 	q, err := a.JointPositions(ctx, nil)
 	if err != nil {
@@ -204,6 +212,13 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 		}
 	}
 
+	var lh *diffik.LiveHandle
+	if o.live != nil {
+		if lh, err = diffik.StartLive(ctx, l, o.liveSrc, armJoints{a}, o.parts, model, o.armName, q, *o.live); err != nil {
+			return err
+		}
+		defer lh.Stop()
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	loopErr := make(chan error, 1)
@@ -233,6 +248,13 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 			late = "none"
 		}
 		fmt.Printf("collision: min %s  brakes %d  relaxed %d  late: %s\n", min, s.CollisionBrakes, s.CollisionRelaxed, late)
+	}
+	if stale != nil && stale.fired && errors.Is(scenarioErr, context.Canceled) {
+		scenarioErr = nil // the stale stop ended the scenario, as intended
+	}
+	if lh != nil {
+		rows, _ := rec.since(0)
+		fmt.Println(liveSummary(lh.Stats(), rows, stale.fired))
 	}
 	if !(s.RateHz >= minRate) { // NaN-safe
 		scenarioErr = errors.Join(scenarioErr, fmt.Errorf("loop rate %.2f Hz below %.2f", s.RateHz, minRate))

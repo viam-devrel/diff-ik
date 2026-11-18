@@ -26,11 +26,19 @@ type collPart struct {
 type collObstacle struct {
 	names []string
 	geom  spatialmath.Geometry // in the arm's base frame (<arm>_origin), fixed
+	live  bool                 // from the live set (setLive); the last obstacles in the list
+}
+
+// liveObstacle is one live obstacle (spec "Data flow"): a geometry in the arm's base frame, already inflated.
+type liveObstacle struct {
+	geom  spatialmath.Geometry
+	label string // may be empty
 }
 
 type collPair struct {
 	part, obs int
 	suspended bool // closer than d_min at start; re-armed beyond d_act (spec "Pairs")
+	live      bool // never suspended
 }
 
 // collisionModel is a session's robot parts, obstacles and checked pairs (spec "The collision model").
@@ -39,6 +47,7 @@ type collisionModel struct {
 	parts      []collPart
 	obs        []collObstacle
 	pairs      []collPair
+	allows     [][2]string // the request's allows, reused by setLive
 	dMin, dAct float64
 	skipped    []string // movable frames and unsupported frame-system shapes left out
 	warnings   []string
@@ -122,7 +131,7 @@ func NewCollisionModel(parts []*referenceframe.FrameSystemPart, model referencef
 	if !(req.DActMM > req.DMinMM) {
 		return nil, fmt.Errorf("collision: d_act_mm (%v) must exceed d_min_mm (%v)", req.DActMM, req.DMinMM)
 	}
-	c := &collisionModel{model: model, dMin: req.DMinMM, dAct: req.DActMM}
+	c := &collisionModel{model: model, dMin: req.DMinMM, dAct: req.DActMM, allows: req.Allows}
 
 	var transforms []*referenceframe.LinkInFrame
 	heldNames := map[string]bool{}
@@ -287,7 +296,7 @@ func NewCollisionModel(parts []*referenceframe.FrameSystemPart, model referencef
 	}
 
 	known := func(n string) bool {
-		if skipNames[n] {
+		if skipNames[n] || n == "live" { // live is always known, even before any live obstacle exists
 			return true
 		}
 		for _, p := range c.parts {
@@ -312,17 +321,9 @@ func NewCollisionModel(parts []*referenceframe.FrameSystemPart, model referencef
 			}
 		}
 	}
-	allowed := func(p collPart, o collObstacle) bool {
-		for _, a := range req.Allows {
-			if (hasName(p.names, a[0]) && hasName(o.names, a[1])) || (hasName(p.names, a[1]) && hasName(o.names, a[0])) {
-				return true
-			}
-		}
-		return false
-	}
 	for pi, p := range c.parts {
 		for oi, o := range c.obs {
-			if !allowed(p, o) {
+			if !c.allowed(p, o) {
 				c.pairs = append(c.pairs, collPair{part: pi, obs: oi})
 			}
 		}
@@ -344,6 +345,48 @@ func NewCollisionModel(parts []*referenceframe.FrameSystemPart, model referencef
 		}
 	}
 	return c, nil
+}
+
+func (c *collisionModel) allowed(p collPart, o collObstacle) bool {
+	for _, a := range c.allows {
+		if (hasName(p.names, a[0]) && hasName(o.names, a[1])) || (hasName(p.names, a[1]) && hasName(o.names, a[0])) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPairs reports whether any pair, static or live, is checked.
+func (c *collisionModel) hasPairs() bool { return len(c.pairs) > 0 }
+
+// setLive replaces the live obstacles and their pairs (spec "Data flow"). Static obstacles, pairs and
+// suspension flags are untouched. Loop goroutine only.
+func (c *collisionModel) setLive(obs []liveObstacle) {
+	n := 0
+	for n < len(c.obs) && !c.obs[n].live {
+		n++
+	}
+	c.obs = c.obs[:n]
+	pairs := c.pairs[:0]
+	for _, p := range c.pairs {
+		if !p.live {
+			pairs = append(pairs, p)
+		}
+	}
+	c.pairs = pairs
+	for k, o := range obs {
+		name := fmt.Sprintf("live:%d", k)
+		if o.label != "" {
+			name += ":" + o.label
+		}
+		c.obs = append(c.obs, collObstacle{names: []string{name, "live"}, geom: o.geom, live: true})
+		oi := len(c.obs) - 1
+		for pi, p := range c.parts {
+			if !c.allowed(p, c.obs[oi]) {
+				c.pairs = append(c.pairs, collPair{part: pi, obs: oi, live: true})
+			}
+		}
+	}
 }
 
 func nonEmptyLabel(a, b string) string {
@@ -371,4 +414,14 @@ func classifyFrame(fsys *referenceframe.FrameSystem, f referenceframe.Frame, arm
 		cur = p
 	}
 	return false, "", nil
+}
+
+// liveCount is the number of live obstacles currently in the model.
+func (c *collisionModel) liveCount() (n int) {
+	for _, o := range c.obs {
+		if o.live {
+			n++
+		}
+	}
+	return n
 }

@@ -115,7 +115,7 @@ func TestCollisionLoopRelaxedRowBinds(t *testing.T) {
 	runTicks(t, l, 1)
 	copy(l.qCmd, pandaHold)
 	acc := repeat(deg2rad(60), 7)
-	rows, _, _, err := r.c.rows(l.qCmd, acc, dt)
+	rows, _, _, err := r.c.rows(l.qCmd, acc, dt, 1e9)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("rows %d err %v", len(rows), err)
 	}
@@ -159,7 +159,7 @@ func TestCollisionLoopRelaxedRowBinds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, _, _, err := l.qpNext(trows, 1, dt, rows, true)
+	next, _, _, err := l.qpNext(trows, 1, dt, rows, 1)
 	if err != nil {
 		t.Fatalf("relaxed solve: %v", err)
 	}
@@ -368,5 +368,24 @@ func TestCollisionBrakeWhileMovingResetsQPFails(t *testing.T) {
 	r.tick(t) // braking while moving: must not trip the 10th failure
 	if r.l.qpFails != 0 {
 		t.Fatalf("qpFails = %d", r.l.qpFails)
+	}
+}
+
+// A normal braking approach to a static box does not trip the late warning.
+func TestCollisionLoopApproachNotLate(t *testing.T) {
+	m := panda(t)
+	fp := eePoint(t, m, pandaHold)
+	pose := spatialmath.NewPoseFromPoint(r3.Vector{X: fp.X, Y: fp.Y, Z: fp.Z - 60 - 50})
+	r := newPandaRig(t, CollisionRequest{}, 90, 360, 100, pose, mustBox(t, r3.Vector{X: 300, Y: 300, Z: 100}), pandaHold)
+	runTicks(t, r.l, 5)
+	r.l.SetTarget(r.at(r.fp.X, r.fp.Y, r.fp.Z-110))
+	for i := 0; i < 400; i++ {
+		r.tick(t)
+		if late := r.l.Status().CollisionLate; late != "" {
+			t.Fatalf("tick %d: %q", i, late)
+		}
+	}
+	if r.l.Status().CollisionRows == 0 {
+		t.Fatal("damper never engaged")
 	}
 }

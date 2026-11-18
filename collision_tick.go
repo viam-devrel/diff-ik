@@ -39,9 +39,13 @@ func (c *collisionModel) poseParts(q []float64) ([]spatialmath.Geometry, error) 
 
 // collRow is one damper row J_d·Δq ≥ −vmax (mm per tick), for pair index pair at distance d (mm).
 type collRow struct {
-	jd      []float64 // mm/rad
-	vmax, d float64
-	pair    int
+	jd       []float64 // mm/rad
+	vmax, d  float64
+	pair     int
+	live     bool    // pair is from the live set
+	backAway bool    // live pair inside d_min: the row is J_d·Δq ≥ r, not ≥ −vmax
+	r        float64 // mm per tick
+	ad       float64 // A_d: mm per tick² the arm can decelerate this pair, summed over joints
 }
 
 const maxCollRows = 16
@@ -52,8 +56,9 @@ func (c *collisionModel) pairDist(posed []spatialmath.Geometry, i int) (float64,
 }
 
 // rows measures every pair at q, re-arms suspended pairs beyond d_act, and returns a damper row per active
-// pair (closest maxCollRows), plus the closest unsuspended pair (spec "Each tick"). accel is rad/s² per joint.
-func (c *collisionModel) rows(q, accel []float64, dt float64) (rows []collRow, minD float64, minPair int, err error) {
+// pair (closest maxCollRows), plus the closest unsuspended pair (spec "Each tick"). accel is rad/s² per joint; vRetreat is the fastest
+// back-away (mm per tick).
+func (c *collisionModel) rows(q, accel []float64, dt, vRetreat float64) (rows []collRow, minD float64, minPair int, err error) {
 	minD, minPair = math.Inf(1), -1
 	posed, err := c.poseParts(q)
 	if err != nil {
@@ -124,7 +129,11 @@ func (c *collisionModel) rows(q, accel []float64, dt float64) (rows []collRow, m
 		for j := range q {
 			Ad += math.Abs(jd[k][j]) * accel[j] * dt * dt
 		}
-		rows[k] = collRow{jd: jd[k], vmax: collisionVmax(Ad, ds[i]-c.dMin), d: ds[i], pair: i}
+		g := ds[i] - c.dMin
+		rows[k] = collRow{jd: jd[k], vmax: collisionVmax(Ad, g), d: ds[i], pair: i, ad: Ad, live: c.pairs[i].live}
+		if c.pairs[i].live && g < 0 {
+			rows[k].backAway, rows[k].r = true, math.Min(-g/2, vRetreat)
+		}
 	}
 	return rows, minD, minPair, nil
 }

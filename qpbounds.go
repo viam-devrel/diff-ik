@@ -47,9 +47,18 @@ var qpSolver = solveQP
 // one box corner, which the solver reports infeasible.
 const relaxEps = 1e-6 // mm per tick
 
+// retreatWeight is w_b for tier 2's soft retreat term w_b·(J_d·Δq − r)² (spec "The row for a live pair").
+// Task rows are in metres (A·Δq − b, so 1 mm of task error costs 1e-6) while J_d·Δq and r are in mm, so w_b is
+// m² per mm²: 1e-6 makes 1 mm of retreat shortfall cost about the same as 1 mm of task error. 1e-5 overshot in the
+// sim (-12 mm true clearance); 1e-4 broke the 0.1 mm static-pinch bar (0.2 mm dips in the static pinch tests).
+const retreatWeight = 1e-6
+
+// tier2SoftRetreat gates the soft retreat; tests clear it to get the old hold-still tier 2.
+var tier2SoftRetreat = true
+
 // qpNext builds this tick's QP from the weighted task rows, the damping λ, the posture pull (scaled by
 // the ramp scale) and qpBounds, solves it, and returns the joints to send (spec "Objective").
-func (l *Loop) qpNext(rows taskRows, scale, dt float64, coll []collRow, relax bool) (next []float64, active, iters int, err error) {
+func (l *Loop) qpNext(rows taskRows, scale, dt float64, coll []collRow, tier int) (next []float64, active, iters int, err error) {
 	n := len(l.qCmd)
 	m, _ := rows.A.Dims()
 	wp, pull := 0.0, make([]float64, n)
@@ -79,13 +88,29 @@ func (l *Loop) qpNext(rows taskRows, scale, dt float64, coll []collRow, relax bo
 	}
 	lb, ub := l.qpBounds(dt)
 	prob := qpProblem{H: H, g: g, lb: lb, ub: ub}
-	if len(coll) > 0 { // collision damper rows: J_d·Δq ≥ −v_max, relaxed to what the bounds can reach on a retry
+	if len(coll) > 0 { // collision damper rows: J_d·Δq ≥ −v_max (back-away rows: ≥ r), relaxed on a retry
+		// tier 1: min(bound, M) − ε. tier 2: back-away rows are also capped at 0 (no further approach) and pulled back by a soft retreat term.
 		A, b := mat.NewDense(len(coll), n, nil), make([]float64, len(coll))
 		for k, r := range coll {
 			A.SetRow(k, r.jd)
 			b[k] = -r.vmax
-			if relax {
-				b[k] = math.Min(b[k], relaxBound(r.jd, lb, ub)) - relaxEps
+			if r.backAway {
+				b[k] = r.r
+			}
+			if tier > 0 {
+				M := relaxBound(r.jd, lb, ub)
+				if tier == 2 && r.backAway {
+					M = math.Min(M, 0)
+				}
+				b[k] = math.Min(b[k], M) - relaxEps
+				if tier == 2 && r.backAway && tier2SoftRetreat { // retreat as far as the capped rows allow together
+					for i := 0; i < n; i++ {
+						for j := i; j < n; j++ {
+							H.SetSym(i, j, H.At(i, j)+retreatWeight*r.jd[i]*r.jd[j])
+						}
+						g[i] -= retreatWeight * r.r * r.jd[i]
+					}
+				}
 			}
 		}
 		prob.A, prob.b = A, b

@@ -89,3 +89,40 @@ go run ./cmd/cli --address localhost:8083 --insecure --arm pick-arm --solver qp 
 
 Each run prints the minimum distance, its pair, and the relax and brake counts.
 
+## Live obstacles
+
+Spec: `docs/superpowers/specs/2026-11-18-diff-ik-live-obstacles-design.md`. Results: `docs/results/2026-11-live-obstacles.md`.
+
+`dev/panda-live.json` (port 8084) is this cell plus overhead and wrist depth cameras (`top-depth`, `wrist-depth`), two red
+box props (`intruder` and `parked`, 80 x 80 x 120 mm) and four vision services: `obstacles-top`, `obstacles-wrist`, `red`
+and `segments-top`. The segmenter modules are built from source, because registry modules don't load from a local config:
+`~/src/obstacles-pointcloud` and `~/src/detections-to-segments` (tag 1.4.0), each with its binary at `bin/<name>`. Build
+`bin/diff-ik` here as well.
+
+Check the segmenters against a prop's true pose:
+
+```
+go run ./dev/liveprobe
+```
+
+Evidence workflow, in two shells. In the first, run the CLI with the `--live-*` flags; the workspace is over the table and
+extruded to its top (z 20). `--live-camera` is also the frame for point-cloud objects:
+
+```
+go run ./cmd/cli --address localhost:8084 --insecure --arm pick-arm --solver qp --max-joint-deg-s 30 --max-joint-deg-s2 60 --start-joints 0,0.3501,0,-2.2073,0,2.5576,-0.785 --world-state dev/panda-collision-ws.json --live-vision obstacles-top --live-camera top-depth --live-rate-hz 8 --live-workspace 200,-600,20,1000,600,600 --live-extrude-z 20 --hold 30s --csv .runs/run.csv run hold
+```
+
+In the second, slide the prop into the arm's path. It logs the prop's true pose and size with Unix time:
+
+```
+uv run clients/python/prop_mover.py --address localhost:8084 --insecure --prop intruder --from 555,350,81 --to 555,70,81 --mm-s 50 --hold-s 3 --back --size-mm 80,80,120 --csv .runs/props.csv
+```
+
+Then replay the run's commanded joints against the true, uninflated prop:
+
+```
+go run ./cmd/cli clearance --csv .runs/run.csv --props .runs/props.csv --arm pick-arm --world-state dev/panda-collision-ws.json --address localhost:8084 --insecure
+```
+
+Rates: 8 Hz for `obstacles-top` and 12 Hz for `segments-top`, each below 1/p95 of its latency (94 ms and 66 ms). For
+`segments-top`, use `--live-vision segments-top`.
