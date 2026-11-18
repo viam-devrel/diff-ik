@@ -14,7 +14,15 @@ import os
 import time
 
 POSE_KEYS = ("x", "y", "z", "o_x", "o_y", "o_z", "theta")
-FOLLOW_COLS = ["t", "kind", *[f"f_{k}" for k in POSE_KEYS], "rate_hz", "tick_p99_ms", "overruns", "resyncs"]
+FOLLOW_COLS = ["t", "kind", *[f"f_{k}" for k in POSE_KEYS], "rate_hz", "tick_p99_ms", "overruns", "resyncs", "lag_ms"]
+
+
+def follow_row(t: float, fp: dict, st: dict | None = None) -> list:
+    """One follower-CSV row: a "pose" row, or a "status" row from a servo_status reply st."""
+    if st is None:
+        return [f"{t:.4f}", "pose", *[fp[q] for q in POSE_KEYS], "", "", "", "", ""]
+    return [f"{t:.4f}", "status", *[fp[q] for q in POSE_KEYS], st.get("rate_hz"), st.get("tick_p99_ms"),
+            st.get("overruns"), st.get("resyncs"), st.get("lag_ms")]
 
 
 def pose_dict(p) -> dict:
@@ -176,14 +184,13 @@ class ServoClient:
             while True:
                 fp = pose_dict(await self.follower2.get_end_position())
                 tp = self.now()  # stamp the pose read, not the later status RPC
-                row = [f"{tp:.4f}", "pose", *[fp[q] for q in POSE_KEYS], "", "", "", ""]
+                row = follow_row(tp, fp)
                 if lowest_z(fp, a.tip_mm) < a.min_z_mm:
                     self.fault = f"follower below the floor: lowest z {lowest_z(fp, a.tip_mm):.1f} mm"
                 if k % 2 == 0 and self.sid:
                     try:
                         st = await self.svc2.do_command({"command": "servo_status", "session_id": self.sid})
-                        row = [f"{tp:.4f}", "status", *[fp[q] for q in POSE_KEYS],
-                               st.get("rate_hz"), st.get("tick_p99_ms"), st.get("overruns"), st.get("resyncs")]
+                        row = follow_row(tp, fp, st)
                     except Exception:
                         pass  # the session may be between engage and track
                 if self.follow_csv:

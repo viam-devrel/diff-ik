@@ -124,6 +124,12 @@ class TagServo(ServoClient):
         self.last_send = 0.0
 
     # ---- setup -------------------------------------------------------------------------------
+    async def open(self):
+        # the robot client only builds clients for APIs imported before it connects
+        import viam.components.pose_tracker  # noqa: F401
+
+        await super().open()
+
     async def open_extras(self):
         if not self.args.fake_tag_base:
             from viam.components.pose_tracker import PoseTracker
@@ -292,10 +298,10 @@ class TagServo(ServoClient):
         except TagLost:
             print("tag lost: stopped")  # exit 0; close() stops the session
 
-    async def run(self):
+    async def start_tracking(self):
+        """Floor check, the detection and watchdog tasks, the first tag, the half-limit engage session until
+        settled, then the full-limit track session. Keep the tag still until this returns."""
         a = self.args
-        if a.final_hover_mm is not None and a.final_hover_mm >= a.hover_mm:
-            raise RuntimeError("--final-hover-mm must be below --hover-mm")
         fp = pose_dict(await self.follower2.get_end_position())  # the watchdog's first read may lag
         if lowest_z(fp, a.tip_mm) < a.min_z_mm:
             raise RuntimeError(f"follower is below the floor (lowest z {lowest_z(fp, a.tip_mm):.1f} mm); "
@@ -318,6 +324,12 @@ class TagServo(ServoClient):
         await self.stop_session()
         print("tracking. Ctrl-C to stop.")
         await self.start_session("pointing", half=False, **kw)
+
+    async def run(self):
+        a = self.args
+        if a.final_hover_mm is not None and a.final_hover_mm >= a.hover_mm:
+            raise RuntimeError("--final-hover-mm must be below --hover-mm")
+        await self.start_tracking()
         end = math.inf
         if a.final_hover_mm is None:
             if a.duration > 0:
@@ -335,8 +347,8 @@ class TagServo(ServoClient):
         await self.stream("hold", lambda rep, t: t >= end, frozen=frozen)
 
 
-def main() -> int:
-    ap = base_parser(__doc__)
+def tag_parser(doc: str) -> argparse.ArgumentParser:
+    ap = base_parser(doc)
     ap.set_defaults(min_z_mm=-10)
     ap.add_argument("--camera", default="wrist-cam")
     ap.add_argument("--tracker", default="tag-tracker")
@@ -353,7 +365,11 @@ def main() -> int:
     ap.add_argument("--gate-stale-s", type=float, default=0.2)
     ap.add_argument("--fake-tag-base", default=None, help=argparse.SUPPRESS)  # rehearsal: x,y,z mm in <follower>_origin
     ap.add_argument("--fake-tag-drop-after", type=float, default=0, help=argparse.SUPPRESS)  # rehearsal: tag loss
-    return run_client(TagServo, ap)
+    return ap
+
+
+def main() -> int:
+    return run_client(TagServo, tag_parser(__doc__))
 
 
 if __name__ == "__main__":

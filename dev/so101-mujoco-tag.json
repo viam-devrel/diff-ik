@@ -1,0 +1,37 @@
+{
+  "network": {"bind_address": "localhost:8082"},
+  "modules": [
+    {"type": "local", "name": "mujoco-sim", "executable_path": "/Users/nick.hehr/src/viam-mujoco-sim-so101/run.sh"},
+    {"type": "local", "name": "diff-ik", "executable_path": "/Users/nick.hehr/src/diff-ik/bin/diff-ik"},
+    {"type": "local", "name": "viam_apriltag", "executable_path": "/Users/nick.hehr/src/diff-ik/dev/apriltag-run.sh"}
+  ],
+  "components": [
+    {"name": "sim-world", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:world",
+     "attributes": {"lighting": {"shadows": false, "reflections": false}, "props": [
+       {"name": "tag", "size": 0.075, "scale": [1, 1, 0.02667], "position": [0.28, 0, 0.001], "mass": 0.05,
+        "color": [1, 1, 1], "texture": "/Users/nick.hehr/src/diff-ik/dev/assets/tag36h11_0.png"}]}},
+    {"name": "table", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:obstacle",
+     "attributes": {"world": "sim-world"},
+     "frame": {"parent": "world", "translation": {"x": 250, "y": 0, "z": -10},
+               "geometry": {"type": "box", "x": 600, "y": 600, "z": 20}}},
+    {"name": "arm", "api": "rdk:component:arm", "model": "viam-labs:mujoco-sim:arm",
+     "attributes": {"world": "sim-world", "asset": "so101"},
+     "frame": {"parent": "world", "translation": {"x": 0, "y": 0, "z": 100}}},
+    {"name": "gripper", "api": "rdk:component:gripper", "model": "viam-labs:mujoco-sim:gripper",
+     "attributes": {"world": "sim-world", "mount": "arm", "asset": "so101"}, "frame": {"parent": "arm"}},
+    {"name": "wrist-cam", "api": "rdk:component:camera", "model": "viam-labs:mujoco-sim:camera",
+     "attributes": {"world": "sim-world", "fov_deg": 60, "width": 640, "height": 480},
+     "frame": {"parent": "arm", "translation": {"x": 0, "y": 60, "z": 30}}},
+    {"name": "scene-cam", "api": "rdk:component:camera", "model": "viam-labs:mujoco-sim:camera",
+     "attributes": {"world": "sim-world", "fov_deg": 60, "width": 1280, "height": 720},
+     "frame": {"parent": "world", "translation": {"x": 220, "y": 318, "z": 318},
+               "orientation": {"type": "ov_degrees", "value": {"x": 0, "y": -0.707107, "z": -0.707107, "th": -90}}}},
+    {"name": "wrist-tags", "api": "rdk:component:pose_tracker", "model": "viam:apriltag:pose_tracker",
+     "attributes": {"camera_name": "wrist-cam", "tag_family": "tag36h11", "tag_width_mm": 60}},
+    {"name": "scene-tags", "api": "rdk:component:pose_tracker", "model": "viam:apriltag:pose_tracker",
+     "attributes": {"camera_name": "scene-cam", "tag_family": "tag36h11", "tag_width_mm": 60}}
+  ],
+  "services": [
+    {"name": "servo", "api": "rdk:service:motion", "model": "devrel:diff-ik:servo", "attributes": {"arms": ["arm"]}}
+  ]
+}
