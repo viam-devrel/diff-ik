@@ -83,13 +83,14 @@ type poseTransformer interface {
 // SessionConfig is a parsed servo_start request. Loop.RateHz must be set. A one-element
 // Loop.MaxJointDegPerS or Loop.MaxJointDegPerS2 applies to every joint.
 type SessionConfig struct {
-	Frame   string // "world" or "<arm>_origin"
-	Mode    Mode
-	Loop    LoopConfig
-	Timeout time.Duration // dead-man
-	Ramp    time.Duration
-	Frames  bool         // build a local frame system at start so servo_target can take a camera frame
-	Filter  TargetFilter // the zero value means DefaultTargetFilter
+	Frame     string // "world" or "<arm>_origin"
+	Mode      Mode
+	Loop      LoopConfig
+	Timeout   time.Duration // dead-man
+	Ramp      time.Duration
+	Collision *CollisionRequest // nil: no collision avoidance (solver qp only)
+	Frames    bool              // build a local frame system at start so servo_target can take a camera frame
+	Filter    TargetFilter      // the zero value means DefaultTargetFilter
 
 	NoPointVelocities bool // armIO only: stream positions without per-point target velocities
 }
@@ -135,6 +136,7 @@ type session struct {
 	chains map[string]error // checkChain results per frame, under cmu
 
 	mu       sync.Mutex
+	lastLate string // last logged Status.CollisionLate
 	est      velEstimator
 	filt     *targetFilter
 	lastCmd  time.Time
@@ -196,9 +198,13 @@ func (s *session) beginStop(final State) {
 }
 
 // onTick is the loop's OnTick: the dead-man check, once per tick.
-func (s *session) onTick(Status) {
+func (s *session) onTick(st Status) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if st.CollisionLate != s.lastLate {
+		s.lastLate = st.CollisionLate
+		s.logger.Warnw("collision", "late", st.CollisionLate)
+	}
 	if s.stopping == "" && s.now().Sub(s.lastCmd) > s.timeout {
 		s.stopping = StateStoppedTimeout
 		s.loop.RampStop(s.ramp, StateStoppedTimeout)
@@ -453,11 +459,28 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 	l.SetTarget(fk)
 	var fsys *referenceframe.FrameSystem
 	var zeroIn referenceframe.FrameSystemInputs
-	if cfg.Frames {
-		cfgFS, err := m.fs.FrameSystemConfig(ctx)
-		if err != nil {
+	var cfgFS *framesystem.Config
+	if cfg.Frames || cfg.Collision != nil {
+		if cfgFS, err = m.fs.FrameSystemConfig(ctx); err != nil {
 			return nil, nil, fmt.Errorf("reading the frame system: %w", err)
 		}
+	}
+	if cfg.Collision != nil {
+		cm, err := NewCollisionModel(cfgFS.Parts, model, armName, *cfg.Collision, q)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := l.SetCollision(cm); err != nil {
+			return nil, nil, err
+		}
+		for _, w := range cm.Warnings() {
+			m.logger.Warnw("collision", "warning", w)
+		}
+		if len(cm.pairs) == 0 {
+			m.logger.Warnw("collision requested but no robot-part/obstacle pairs; collision is off", "arm", armName)
+		}
+	}
+	if cfg.Frames {
 		if fsys, err = referenceframe.NewFrameSystem("servo", cfgFS.Parts, nil); err != nil {
 			return nil, nil, fmt.Errorf("building the frame system: %w", err)
 		}

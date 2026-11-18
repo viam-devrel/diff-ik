@@ -368,6 +368,10 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 		}
 		lc.Posture = p
 	}
+	coll, err := parseCollision(cmd, solver)
+	if err != nil {
+		return nil, nil, err
+	}
 	frames, err := optBool(cmd, "frames", false)
 	if err != nil {
 		return nil, nil, err
@@ -381,10 +385,71 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 		return nil, nil, err
 	}
 	return s.m.start(ctx, armName, SessionConfig{
-		Frame: frame, Mode: Mode(mode), Loop: lc, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
+		Frame: frame, Mode: Mode(mode), Loop: lc, Collision: coll, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
 		Timeout: time.Duration(timeout * float64(time.Millisecond)),
 		Ramp:    time.Duration(ramp * float64(time.Millisecond)),
 	})
+}
+
+// parseCollision reads collision, world_state and collision_specification; nil means off.
+func parseCollision(cmd map[string]interface{}, solver string) (*CollisionRequest, error) {
+	rawC, hasC := cmd["collision"]
+	wsRaw, hasWS := cmd["world_state"]
+	specRaw, hasSpec := cmd["collision_specification"]
+	if !hasC && !hasWS && !hasSpec {
+		return nil, nil
+	}
+	if b, isBool := rawC.(bool); hasC && isBool && !b && !hasWS && !hasSpec {
+		return nil, nil
+	}
+	if solver != SolverQP {
+		return nil, errors.New(`world_state, collision_specification and collision need "solver": "qp"`)
+	}
+	req := &CollisionRequest{DMinMM: 10, DActMM: 100}
+	on := hasWS || hasSpec
+	if hasC {
+		switch c := rawC.(type) {
+		case bool:
+			on = c
+		case map[string]interface{}:
+			on = true
+			for k := range c {
+				if k != "d_min_mm" && k != "d_act_mm" {
+					return nil, fmt.Errorf("unknown collision key %q", k)
+				}
+			}
+			var err error
+			if req.DMinMM, err = optNum(c, "d_min_mm", 10); err != nil {
+				return nil, err
+			}
+			if req.DActMM, err = optNum(c, "d_act_mm", 100); err != nil {
+				return nil, err
+			}
+			if !(req.DMinMM > 0) {
+				return nil, fmt.Errorf("collision.d_min_mm must be > 0, got %v", req.DMinMM)
+			}
+			if !(req.DActMM > req.DMinMM) {
+				return nil, fmt.Errorf("collision.d_act_mm must be > d_min_mm, got %v", req.DActMM)
+			}
+		default:
+			return nil, errors.New("collision must be a bool or an object")
+		}
+	}
+	var err error
+	if hasWS {
+		if req.WorldState, err = ParseWorldState(wsRaw); err != nil {
+			return nil, err
+		}
+	}
+	if hasSpec {
+		if req.Allows, err = ParseCollisionSpecs(specRaw); err != nil {
+			return nil, err
+		}
+	}
+	if !on {
+		return nil, nil
+	}
+	return req, nil
 }
 
 func (s *diffIkServo) Status(ctx context.Context) (map[string]interface{}, error) {
@@ -616,6 +681,25 @@ func statusMap(st SessionStatus) map[string]interface{} {
 	out["peak_accel_ratio"] = st.PeakAccelRatio
 	if st.Config.Solver == SolverQP {
 		out["qp_active"], out["qp_iters"], out["qp_fallbacks"] = float64(st.QPActive), float64(st.QPIters), float64(st.QPFallbacks)
+	}
+	if st.Collision != "" {
+		out["collision"] = st.Collision
+		if st.Collision == "on" {
+			if !math.IsInf(st.CollisionMinMM, 0) && !math.IsNaN(st.CollisionMinMM) {
+				out["collision_min_mm"] = st.CollisionMinMM
+			}
+			out["collision_pair"] = st.CollisionPair
+			out["collision_rows"], out["collision_relaxed"] = float64(st.CollisionRows), float64(st.CollisionRelaxed)
+			out["collision_brakes"] = float64(st.CollisionBrakes)
+		}
+		strs := func(v []string) []interface{} {
+			o := make([]interface{}, len(v))
+			for i, x := range v {
+				o[i] = x
+			}
+			return o
+		}
+		out["collision_ignored"], out["collision_skipped"] = strs(st.CollisionIgnored), strs(st.CollisionSkipped)
 	}
 	return out
 }

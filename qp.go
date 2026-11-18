@@ -53,12 +53,48 @@ func solveQP(p qpProblem) (x []float64, active, iters int, err error) {
 	return r.x, len(r.act), r.iters, err
 }
 
+// checkFinite rejects a NaN or ±Inf anywhere in p: a NaN row would compare as satisfied and silently drop a
+// constraint.
+func checkFinite(p qpProblem) error {
+	bad := func(name string, xs ...float64) error {
+		for _, v := range xs {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return fmt.Errorf("qp: non-finite %s", name)
+			}
+		}
+		return nil
+	}
+	if err := errors.Join(bad("g", p.g...), bad("lb", p.lb...), bad("ub", p.ub...), bad("b", p.b...)); err != nil {
+		return err
+	}
+	n := len(p.g)
+	for i := 0; i < n; i++ {
+		for j := i; j < n; j++ {
+			if err := bad("H", p.H.At(i, j)); err != nil {
+				return err
+			}
+		}
+	}
+	if p.A != nil {
+		m, _ := p.A.Dims()
+		for k := 0; k < m; k++ {
+			if err := bad("A", mat.Row(nil, k, p.A)...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // qpCore is Goldfarb–Idnani's dual active-set method (Math. Programming 27, 1983), the method behind
 // quadprog. It starts at the unconstrained minimum and adds the most-violated constraint, dropping
 // constraints whose multipliers reach zero, so it needs no feasible start. J is an H-orthonormal basis
 // (JᵀHJ = I) whose first q columns span the active normals; R (q×q, upper triangular) is J₁ᵀN.
 func qpCore(p qpProblem) (qpResult, error) {
 	n := len(p.g)
+	if err := checkFinite(p); err != nil {
+		return qpResult{}, err
+	}
 	C, d := qpRows(p)
 	var ch mat.Cholesky
 	if !ch.Factorize(p.H) {

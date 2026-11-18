@@ -21,6 +21,12 @@ position, velocity and acceleration limits as hard bounds and adds a null-space 
 Results: [`docs/results/2026-11-qp-solver.md`](docs/results/2026-11-qp-solver.md). Fields are in
 [`devrel_diff-ik_servo.md`](devrel_diff-ik_servo.md).
 
+With `qp`, collision avoidance is also opt-in (`collision`, `world_state`, `collision_specification`). It keeps the arm
+and its mounted parts at least `d_min` (10 mm) from fixed obstacles with a per-pair distance damper in the QP, and takes
+the motion service's `WorldState` and `CollisionSpecification` shapes. Boxes, capsules, spheres and points only. Design:
+[`docs/superpowers/specs/2026-11-18-diff-ik-collision-design.md`](docs/superpowers/specs/2026-11-18-diff-ik-collision-design.md).
+Results: [`docs/results/2026-11-qp-collision.md`](docs/results/2026-11-qp-collision.md).
+
 ## Local SO-101 simulation (Phase 3a)
 
 No cloud machine needed:

@@ -11,6 +11,7 @@ import (
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
+	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	motion "go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/spatialmath"
@@ -467,5 +468,109 @@ func TestStatusSolverFields(t *testing.T) {
 				t.Errorf("%s: %s present = %v", solver, k, ok)
 			}
 		}
+	}
+}
+
+// collManager is newTestManager with a frame system holding the arm and a table box beside it.
+func collManager(t *testing.T) (*servoManager, *fakeFS) {
+	t.Helper()
+	m, _, _ := newTestManager(t, spatialmath.NewZeroPose())
+	box, err := spatialmath.NewBox(spatialmath.NewZeroPose(), r3.Vector{X: 600, Y: 600, Z: 20}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := m.fs.(*fakeFS)
+	f.parts = []*referenceframe.FrameSystemPart{
+		{FrameConfig: referenceframe.NewLinkInFrame(referenceframe.World, spatialmath.NewZeroPose(), "arm", nil), ModelFrame: ur5e(t)},
+		{FrameConfig: referenceframe.NewLinkInFrame(referenceframe.World, spatialmath.NewPoseFromPoint(r3.Vector{X: 400, Z: -200}), "table", box)},
+	}
+	return m, f
+}
+
+func TestServoStartCollision(t *testing.T) {
+	start := func(kv ...interface{}) map[string]interface{} {
+		c := map[string]interface{}{"command": "servo_start", "component_name": "arm", "frame": "arm_origin", "solver": "qp"}
+		for i := 0; i < len(kv); i += 2 {
+			c[kv[i].(string)] = kv[i+1]
+		}
+		return c
+	}
+	obj := func(kv ...interface{}) map[string]interface{} {
+		o := map[string]interface{}{}
+		for i := 0; i < len(kv); i += 2 {
+			o[kv[i].(string)] = kv[i+1]
+		}
+		return o
+	}
+	for _, c := range []struct {
+		cmd  map[string]interface{}
+		want string
+	}{
+		{start("solver", "dls", "world_state", obj()), `need "solver": "qp"`},
+		{start("solver", "dls", "collision", true), `need "solver": "qp"`},
+		{start("world_state", obj("bogus", 1.0)), "world_state"},
+		{start("collision_specification", "x"), "collision_specification"},
+		{start("collision_specification", []interface{}{obj("allows", []interface{}{obj("frame1", "nope", "frame2", "table")})}, "collision", true), "nope"},
+		{start("collision_specification", []interface{}{obj("allows", []interface{}{obj("frame1", "nope", "frame2", "table")})}), "nope"},
+		{start("collision", obj("d_min_mm", 0.0)), "d_min_mm"},
+		{start("collision", obj("d_min_mm", 50.0, "d_act_mm", 50.0)), "d_act_mm"},
+		{start("collision", obj("bogus", 1.0)), `unknown collision key "bogus"`},
+	} {
+		m, _ := collManager(t)
+		_, err := testServo(t, m).DoCommand(context.Background(), c.cmd)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%v: err = %v, want %q", c.cmd, err, c.want)
+		}
+	}
+
+	m, f := collManager(t)
+	s := testServo(t, m)
+	id := do(t, s, start("collision", true))["session_id"]
+	st := do(t, s, map[string]interface{}{"command": "servo_status", "session_id": id})
+	if st["collision"] != "on" {
+		t.Fatalf("collision = %v", st["collision"])
+	}
+	// +Inf (nothing in range yet) is omitted, so the key is absent until a pair is measured
+	if d, ok := st["collision_min_mm"]; ok && math.IsInf(d.(float64), 0) {
+		t.Fatalf("collision_min_mm = %v", d)
+	}
+	for _, k := range []string{"collision_pair", "collision_rows", "collision_relaxed", "collision_brakes", "collision_ignored", "collision_skipped"} {
+		if _, ok := st[k]; !ok {
+			t.Errorf("missing %s", k)
+		}
+	}
+	if n := f.cfgCalls.Load(); n != 1 {
+		t.Fatalf("FrameSystemConfig calls = %d, want 1", n)
+	}
+
+	// "collision": false alone is fine with dls.
+	m, _ = collManager(t)
+	do(t, testServo(t, m), start("solver", "dls", "collision", false))
+
+	// Default is off, with no extra FrameSystemConfig call.
+	m, f = collManager(t)
+	s = testServo(t, m)
+	id = do(t, s, start())["session_id"]
+	st = do(t, s, map[string]interface{}{"command": "servo_status", "session_id": id})
+	for k := range st {
+		if strings.HasPrefix(k, "collision") {
+			t.Errorf("unexpected key %s", k)
+		}
+	}
+	if n := f.cfgCalls.Load(); n != 0 {
+		t.Fatalf("FrameSystemConfig calls = %d, want 0", n)
+	}
+}
+
+func TestStatusMapCollisionKeys(t *testing.T) {
+	st := SessionStatus{Status: Status{Collision: "on", CollisionMinMM: math.Inf(1)}}
+	m := statusMap(st)
+	if _, ok := m["collision_min_mm"]; ok {
+		t.Fatal("Inf collision_min_mm not omitted")
+	}
+	st.Collision = "off"
+	m = statusMap(st)
+	if _, ok := m["collision_rows"]; ok || m["collision"] != "off" {
+		t.Fatalf("off status = %v", m)
 	}
 }

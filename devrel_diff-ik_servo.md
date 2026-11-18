@@ -82,6 +82,9 @@ second session on a busy arm fails.
 | `task_weights` | `[1,1,1,1,1,1]` | x, y, z, rx, ry, rz weights for the pose task. |
 | `target_filter` | pass-through, feed-forward on | `ema_alpha` (1 = off), hold deadband `hold_mm` + `hold_deg` with `dwell_ms`, `feedforward`, and `floor` (`min_z_mm` required). The floor raises targets so the flange and a tip `tip_mm` along the tool axis stay `margin_mm` above `min_z_mm`. |
 | `frames` | false | When true, `servo_target` accepts a `frame` from the frame system. That frame may hang off static frames or this arm. |
+| `world_state` | none | `qp` only. Obstacles, as the motion service's `WorldState` (protojson: a JSON object or a string). Boxes, capsules, spheres and points only; a mesh is rejected. Resolved into the arm's base frame at start and fixed for the session. An obstacle in a movable frame other than this arm is an error. One in a frame that moves with the arm is placed at the start pose, then fixed. Transforms parented to the arm or a mounted frame become robot parts (a held object). Giving it turns collision on. |
+| `collision_specification` | none | `qp` only. Allowed contacts, as the motion service's `CollisionSpecification` list (protojson: a JSON list or a string): `[{"allows": [{"frame1", "frame2"}]}]`. A name is a geometry label (links are `<arm>:<link>`), a frame name (the arm's name covers all its links), or `<frame>_origin`. An unknown name is an error. The name of a frame skipped as movable is a no-op, with a warning. Giving it turns collision on. |
+| `collision` | off | `qp` only. `true`, or `{"d_min_mm", "d_act_mm"}` (defaults 10 and 100; `d_act_mm` must exceed `d_min_mm`; unknown keys are rejected). Collision is also on when `world_state` or `collision_specification` is given. `"collision": false` turns it off even then. |
 | `point_velocities` | true | Send per-point target joint velocities to the driver. |
 
 ### `servo_target`
@@ -122,7 +125,8 @@ States: `idle` (no target yet), `running`, `converged`, `stalled` (limit-bound o
 - the active `limits` and `target_filter`;
 - `solver`, `q_cmd_deg` (the commanded joints, in degrees) and `peak_accel_ratio`;
 - `pointing_residual_deg`, for the pointing task;
-- with `qp`: `qp_active`, `qp_iters` and `qp_fallbacks`.
+- with `qp`: `qp_active`, `qp_iters` and `qp_fallbacks`;
+- with `qp` and collision: `collision` (`on` or `off`), `collision_ignored` (pairs suspended at start, listed until re-armed), `collision_skipped` (frames and geometries left out), `collision_pair` (the closest unsuspended pair, `<part>↔<obstacle>`; empty only when every pair is suspended or before the first tick), `collision_min_mm` (its distance, at any distance; absent only in those same cases), `collision_rows` (active rows this tick), `collision_relaxed` and `collision_brakes` (session totals).
 
 `peak_accel_ratio` is the session's maximum of |Δstep| / (a·dt²). At or below 1, the acceleration limit held on every
 tick.
@@ -141,8 +145,37 @@ With `"solver": "qp"`, each tick solves a weighted least-squares QP over the joi
 ones the DLS path uses, and the pointing task's axis rows get weight 1e-4, so position wins. Joint position, velocity
 and acceleration limits are hard bounds, with a discrete braking cap near a position limit. The posture task pulls the
 joints toward `posture.joints_deg` in the null space. Its pull is scaled by the ramp, so stops aren't delayed. If the QP
-fails on a tick, that tick uses the DLS path (`qp_fallbacks` counts them). After 10 failures in a row the session
+fails on a tick (and no collision row is active), that tick uses the DLS path (`qp_fallbacks` counts them). After 10 failures in a row the session
 faults with `qp: <error>`. `qp` is experimental. See `docs/results/2026-11-qp-solver.md`.
+
+## Collision avoidance
+
+Opt-in, `qp` only (see the `world_state`, `collision_specification` and `collision` fields). It keeps the arm and parts
+rigidly mounted on it at least `d_min` from known obstacles, without self-collision. Obstacles are the fixed geometries
+in the machine's frame system plus `world_state`, read once at `servo_start`.
+
+- **Shapes.** Boxes, capsules, spheres and points. Frame-system meshes and cylinders are skipped with a warning and
+  listed in `collision_skipped`, so they are unprotected unless the client passes a primitive for them in
+  `world_state` (`dev/panda-collision-ws.json` boxes in the Panda cell's bin and gripper). Meshes in `world_state` and
+  link meshes are rejected. Movable frames (another arm, a gripper with DoF) are skipped too.
+- **Damper.** Each pair closer than `d_act` adds a row `J_d·Δq ≥ −v_max`, where `J_d` is the finite-difference gradient
+  of the distance. With gap `g = d − d_min` and `A_d = Σ|J_d[j]|·a_j·dt²`,
+  `v_max = max(√(2·A_d·g) − A_d/2, min(g, A_d), 0)`. It is the fastest approach from which the joint acceleration
+  limits can still stop the arm before `d_min`, so the arm slows into an obstacle, or slides along it where the task
+  leaves freedom.
+- **Starting close.** A pair closer than `d_min` at start is suspended and listed in `collision_ignored`. It is
+  re-armed once it is beyond `d_act`.
+- **Fallback.** If the QP fails with rows active, the tick retries with each row relaxed to the strongest move away the
+  step bounds allow (`collision_relaxed`), then brakes (`collision_brakes`). It never falls back to DLS, which ignores
+  obstacles. A brake tick counts toward the 10-in-a-row fault only once the arm is at rest.
+- **Limits.**
+  - Capsule↔box distances can jump near contact, where the RDK switches to SAT.
+  - Sliding along a face can drift slightly below `d_min` (about 0.2 mm in tests): the damper doesn't push back once
+    inside.
+  - Distances are measured at the commanded joints, not the measured ones.
+  - Obstacles are fixed for the session, and there is no self-collision.
+
+Design: `docs/superpowers/specs/2026-11-18-diff-ik-collision-design.md`.
 
 ## viam:teleop compatibility
 

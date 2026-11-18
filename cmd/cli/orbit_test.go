@@ -34,3 +34,36 @@ func TestLimitReached(t *testing.T) {
 		t.Errorf("got row %d, want none", k)
 	}
 }
+
+func TestDescendTarget(t *testing.T) {
+	start := spatialmath.NewPose(r3.Vector{X: 500, Z: 300}, &spatialmath.OrientationVectorDegrees{OZ: -1})
+	got := descendTarget(start, 100)
+	if got.Point().Sub(r3.Vector{X: 500, Z: 200}).Norm() > 1e-9 || !spatialmath.OrientationAlmostEqual(got.Orientation(), start.Orientation()) {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestParseAllow(t *testing.T) {
+	if p, err := parseAllow("a:b"); err != nil || p != [2]string{"a", "b"} {
+		t.Errorf("got %v, %v", p, err)
+	}
+	if p, err := parseAllow("pick-arm:link7:table"); err != nil || p != [2]string{"pick-arm:link7", "table"} {
+		t.Errorf("got %v, %v", p, err)
+	}
+	for _, s := range []string{"", "a", "a:", ":b", "a:b:"} {
+		if _, err := parseAllow(s); err == nil {
+			t.Errorf("%q: want error", s)
+		}
+	}
+}
+
+func TestCollisionMin(t *testing.T) {
+	inf := math.Inf(1)
+	if got := collisionMin([]diffik.Status{{CollisionMinMM: inf}, {CollisionMinMM: 0, CollisionPair: ""}}); got != "none" {
+		t.Errorf("got %q", got)
+	}
+	rows := []diffik.Status{{CollisionMinMM: 30, CollisionPair: "a"}, {CollisionMinMM: inf}, {CollisionMinMM: 12.5, CollisionPair: "b"}}
+	if got := collisionMin(rows); got != "12.50 mm (b)" {
+		t.Errorf("got %q", got)
+	}
+}

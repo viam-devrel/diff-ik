@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -64,11 +65,44 @@ func realMain() error {
 	postureDeg := flag.Float64("posture-deg", 0, "run: with --solver qp, posture q0 = the start joints moved this many degrees on --posture-joint along the self-motion (0 = q0 is the start joints)")
 	postureW := flag.Float64("posture-weight", 0, "run: posture weight (0 = no posture task)")
 	postureK := flag.Float64("posture-gain", 0, "run: posture gain 1/s (0 = default 1)")
-	orbitDegS := flag.Float64("orbit-deg-s", 8, "orbit: rate the target pose rotates about base z, deg/s")
+	orbitDegS := flag.Float64("orbit-deg-s", 8, "orbit: rate the target pose rotates about base z, deg/s (negative reverses)")
 	orbitDeg := flag.Float64("orbit-deg", 320, "orbit: total rotation, deg")
 	maxDegS2 := flag.Float64("max-joint-deg-s2", 0, "run: per-joint acceleration limit in deg/s² (0 = the model's, else 360)")
+	worldState := flag.String("world-state", "", "run: JSON file with a motion-service WorldState; turns collision avoidance on (needs --solver qp)")
+	var allows [][2]string
+	flag.Func("allow", "run: frame1:frame2 pair allowed to touch (repeatable; needs collision on)", func(s string) error {
+		p, err := parseAllow(s)
+		allows = append(allows, p)
+		return err
+	})
+	collisionOn := flag.Bool("collision", false, "run: collision avoidance on without a world state (arm and mounted parts vs frame-system obstacles; needs --solver qp)")
+	collisionOff := flag.Bool("collision-off", false, "run: collision avoidance off, even with --world-state")
+	dMinMM := flag.Float64("d-min-mm", 0, "run: collision clearance to keep, mm (0 = default 10)")
+	dActMM := flag.Float64("d-act-mm", 0, "run: distance at which the collision damper starts acting, mm (0 = default 100)")
+	descendMM := flag.Float64("descend-mm", 100, "descend: how far the target moves down (-z, base frame), mm")
+	descendMMs := flag.Float64("descend-mm-s", 20, "descend: speed of the target, mm/s")
 	flag.Parse()
 	args := flag.Args()
+	collision := (*collisionOn || *worldState != "") && !*collisionOff
+	if collision && *solver != diffik.SolverQP {
+		return errors.New("collision avoidance needs --solver qp")
+	}
+	if len(allows) > 0 && !collision {
+		return errors.New("--allow needs collision on (--collision or --world-state)")
+	}
+	if !(*dMinMM >= 0) || !(*dActMM >= 0) || math.IsInf(*dMinMM, 0) || math.IsInf(*dActMM, 0) || !(*descendMM > 0) || !(*descendMMs > 0) {
+		return errors.New("--d-min-mm and --d-act-mm must be finite and >= 0; --descend-mm and --descend-mm-s must be > 0")
+	}
+	var ws *referenceframe.WorldState
+	if *worldState != "" {
+		b, err := os.ReadFile(*worldState)
+		if err != nil {
+			return err
+		}
+		if ws, err = diffik.ParseWorldState(b); err != nil {
+			return fmt.Errorf("--world-state: %w", err)
+		}
+	}
 	minZSet := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "min-z-mm" {
@@ -90,8 +124,8 @@ func realMain() error {
 	if *singEps < 0 || *maxDamp < 0 {
 		return errors.New("--singular-eps and --max-damping must be >= 0")
 	}
-	if !(*orbitDegS > 0) || *maxDegS2 < 0 {
-		return errors.New("--orbit-deg-s must be > 0 and --max-joint-deg-s2 >= 0")
+	if *orbitDegS == 0 || math.IsNaN(*orbitDegS) || math.IsInf(*orbitDegS, 0) || *maxDegS2 < 0 {
+		return errors.New("--orbit-deg-s must be non-zero and --max-joint-deg-s2 >= 0")
 	}
 	if *solver != "" && *solver != diffik.SolverDLS && *solver != diffik.SolverQP {
 		return fmt.Errorf("--solver must be %q or %q", diffik.SolverDLS, diffik.SolverQP)
@@ -103,7 +137,7 @@ func realMain() error {
 		return errors.New("--rate must be >= 1")
 	}
 	validCmd := len(args) == 1 && (args[0] == "validate" || args[0] == "probe" || args[0] == "pose") ||
-		len(args) == 2 && args[0] == "run" && (args[1] == "static" || args[1] == "singular" || args[1] == "circle" || args[1] == "hold" || args[1] == "orbit")
+		len(args) == 2 && args[0] == "run" && (args[1] == "static" || args[1] == "singular" || args[1] == "circle" || args[1] == "hold" || args[1] == "orbit" || args[1] == "descend")
 	if *armName == "" || !validCmd {
 		return errors.New(usage)
 	}
@@ -149,6 +183,25 @@ func realMain() error {
 	}
 	var sa arm.Arm = &safeArm{Arm: a, guard: guard}
 
+	var req *diffik.CollisionRequest
+	var parts []*referenceframe.FrameSystemPart
+	if collision && len(args) == 2 { // run only
+		fsCfg, err := machine.FrameSystemConfig(ctx)
+		if err != nil {
+			return fmt.Errorf("reading the frame system: %w", err)
+		}
+		parts = fsCfg.Parts
+		req = &diffik.CollisionRequest{WorldState: ws, Allows: allows, DMinMM: *dMinMM, DActMM: *dActMM}
+		// throwaway build: a bad --allow or a mesh fails before the arm moves
+		q0, err := a.JointPositions(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := diffik.NewCollisionModel(parts, model, *armName, *req, q0); err != nil {
+			return err
+		}
+	}
+
 	var startQ []float64
 	if *startJoints != "" {
 		if startQ, err = parseJoints(*startJoints, model.DoF()); err != nil {
@@ -173,6 +226,7 @@ func realMain() error {
 			resync: *resyncDeg, maxLagMS: *maxLagMS, tolMM: *tolMM, tolDeg: *tolDeg, task: *task, singEps: *singEps, maxDamp: *maxDamp, singDeg: *singDeg,
 			hold: *hold, circleMMs: *circleMMs, guard: guard, lead: msDur(*leadMS),
 			solver: *solver, postureJoint: *postureJoint, postureDeg: *postureDeg, postureW: *postureW, postureK: *postureK,
+			descendMM: *descendMM, descendMMs: *descendMMs, armName: *armName, collision: req, parts: parts,
 			orbitDegS: *orbitDegS, orbitDeg: *orbitDeg, maxJointDegS2: *maxDegS2,
 		})
 	default:
@@ -201,3 +255,16 @@ func parseJoints(s string, limits []referenceframe.Limit) ([]float64, error) {
 }
 
 func msDur(ms float64) time.Duration { return time.Duration(ms * float64(time.Millisecond)) }
+
+// parseAllow parses "frame1:frame2".
+func parseAllow(s string) ([2]string, error) {
+	i := strings.LastIndex(s, ":")
+	if i < 0 {
+		return [2]string{}, fmt.Errorf("--allow %q: want frame1:frame2", s)
+	}
+	a, b := s[:i], s[i+1:]
+	if a == "" || b == "" {
+		return [2]string{}, fmt.Errorf("--allow %q: want frame1:frame2", s)
+	}
+	return [2]string{a, b}, nil
+}

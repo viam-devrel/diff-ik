@@ -1,0 +1,12 @@
+{
+  "obstacles": [
+    {"reference_frame": "world", "geometries": [
+      {"center": {"x": 450, "y": -350, "z": 40, "o_z": 1}, "box": {"dims_mm": {"x": 152, "y": 152, "z": 82}}, "label": "bin-box"}
+    ]}
+  ],
+  "transforms": [
+    {"reference_frame": "pick-gripper-box",
+     "pose_in_observer_frame": {"reference_frame": "pick-arm", "pose": {"z": 80, "o_z": 1}},
+     "physical_object": {"center": {"o_z": 1}, "box": {"dims_mm": {"x": 90, "y": 140, "z": 160}}, "label": "pick-gripper-box"}}
+  ]
+}

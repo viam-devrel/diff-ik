@@ -76,6 +76,7 @@ def base_parser(doc: str) -> argparse.ArgumentParser:
     ap.add_argument("--follower", default="follower-arm")
     ap.add_argument("--joint-deg-s", type=float, default=60)
     ap.add_argument("--solver", choices=["dls", "qp"], default=None, help="servo_start solver (default: the server's, dls)")
+    ap.add_argument("--collision", action="store_true", help="servo_start collision: true (needs --solver qp; frame-system obstacles)")
     ap.add_argument("--linear-mm-s", type=float, default=70)
     ap.add_argument("--angular-deg-s", type=float, default=30)
     ap.add_argument("--resync-deg", type=float, default=9.6)
@@ -164,7 +165,8 @@ class ServoClient:
         r = await self.svc.do_command({
             "command": "servo_start", "component_name": a.follower, "frame": f"{a.follower}_origin",
             "mode": "pose", "task": task, "rate_hz": a.rate, "timeout_ms": a.timeout_ms,
-            "limits": level_limits(a, half=half), **({"solver": a.solver} if a.solver else {}), **extra})
+            "limits": level_limits(a, half=half), **({"solver": a.solver} if a.solver else {}),
+            **({"collision": True} if getattr(a, "collision", False) else {}), **extra})
         self.sid = r["session_id"]
         return r["pose"]
 

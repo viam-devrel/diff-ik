@@ -225,3 +225,20 @@ func TestQPSolveTime(t *testing.T) {
 		t.Fatalf("p99 %v exceeds 0.5 ms", p99)
 	}
 }
+
+func TestQPRejectsNonFinite(t *testing.T) {
+	for name, mut := range map[string]func(p *qpProblem){
+		"b":  func(p *qpProblem) { p.b[0] = math.NaN() },
+		"g":  func(p *qpProblem) { p.g[0] = math.Inf(1) },
+		"lb": func(p *qpProblem) { p.lb[0] = math.NaN() },
+		"A":  func(p *qpProblem) { p.A.Set(0, 0, math.NaN()) },
+	} {
+		lb, ub := wide(2)
+		p := qpProblem{H: sym(2, 2, 0, 0, 4), g: []float64{-2, -8}, lb: lb, ub: ub,
+			A: mat.NewDense(1, 2, []float64{1, 0}), b: []float64{0}}
+		mut(&p)
+		if _, _, _, err := solveQP(p); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+}

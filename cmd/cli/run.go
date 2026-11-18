@@ -82,6 +82,10 @@ type runOpts struct {
 	postureJoint                                int
 	postureDeg, postureW, postureK              float64
 	orbitDegS, orbitDeg, maxJointDegS2          float64
+	descendMM, descendMMs                       float64
+	armName                                     string
+	collision                                   *diffik.CollisionRequest // nil = off
+	parts                                       []*referenceframe.FrameSystemPart
 }
 
 func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario string, o runOpts) (err error) {
@@ -118,6 +122,8 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 		body = holdScenario(o.hold, o.postureW > 0 || o.postureDeg != 0)
 	case "orbit":
 		body = orbit(model, o.orbitDegS, o.orbitDeg)
+	case "descend":
+		body = descend(o.descendMM, o.descendMMs)
 	default:
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}
@@ -185,6 +191,18 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 		return err
 	}
 	start := poseMM(p, ori)
+	if o.collision != nil {
+		cm, cerr := diffik.NewCollisionModel(o.parts, model, o.armName, *o.collision, q)
+		if cerr != nil {
+			return cerr
+		}
+		for _, w := range cm.Warnings() {
+			fmt.Println("collision warning:", w)
+		}
+		if cerr := l.SetCollision(cm); cerr != nil {
+			return cerr
+		}
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -205,6 +223,17 @@ func run(ctx context.Context, a arm.Arm, model referenceframe.Model, scenario st
 	fmt.Printf("tick:     p50 %v  p99 %v\n", s.TickP50, s.TickP99)
 	fmt.Printf("overruns: %d   resyncs: %d\n", s.Overruns, s.Resyncs)
 	fmt.Printf("peak accel ratio: %.3f   qp fallbacks: %d\n", s.PeakAccelRatio, s.QPFallbacks)
+	if s.Collision == "off" {
+		fmt.Println("collision: off (no pairs)")
+	} else if s.Collision != "" {
+		rows, _ := rec.since(0)
+		min := collisionMin(rows)
+		late := s.CollisionLate
+		if late == "" {
+			late = "none"
+		}
+		fmt.Printf("collision: min %s  brakes %d  relaxed %d  late: %s\n", min, s.CollisionBrakes, s.CollisionRelaxed, late)
+	}
 	if !(s.RateHz >= minRate) { // NaN-safe
 		scenarioErr = errors.Join(scenarioErr, fmt.Errorf("loop rate %.2f Hz below %.2f", s.RateHz, minRate))
 	}
@@ -542,15 +571,16 @@ func orbit(model referenceframe.Model, degS, total float64) func(context.Context
 		t := time.NewTicker(time.Duration(float64(time.Second) / l.Config().RateHz))
 		defer t.Stop()
 		t0 := time.Now()
-		for deg := 0.0; deg < total; deg = degS * time.Since(t0).Seconds() {
-			l.SetTarget(orbitTarget(start, math.Min(deg, total)))
+		sgn := math.Copysign(1, degS)
+		for a := 0.0; a < total; a = math.Abs(degS) * time.Since(t0).Seconds() {
+			l.SetTarget(orbitTarget(start, sgn*math.Min(a, total)))
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-t.C:
 			}
 		}
-		l.SetTarget(orbitTarget(start, total))
+		l.SetTarget(orbitTarget(start, sgn*total))
 		orbitEnd := rec.len()
 		select {
 		case <-ctx.Done():
@@ -613,4 +643,49 @@ func limitReached(rows []diffik.Status, lims []referenceframe.Limit, marginDeg f
 		}
 	}
 	return -1, -1
+}
+
+// collisionMin is the smallest finite CollisionMinMM over rows, formatted with its pair, or "none".
+func collisionMin(rows []diffik.Status) string {
+	best, pair := math.Inf(1), ""
+	for _, r := range rows {
+		if r.CollisionPair != "" && r.CollisionMinMM < best { // +Inf and NaN never win
+			best, pair = r.CollisionMinMM, r.CollisionPair
+		}
+	}
+	if math.IsInf(best, 1) {
+		return "none"
+	}
+	return fmt.Sprintf("%.2f mm (%s)", best, pair)
+}
+
+// descendTarget is start moved mm down (-z, base frame).
+func descendTarget(start spatialmath.Pose, mm float64) spatialmath.Pose {
+	return spatialmath.NewPose(start.Point().Sub(r3.Vector{Z: mm}), start.Orientation())
+}
+
+// descend moves the target down mm at mmS from the start pose, then holds 2 s, and reports the final error.
+func descend(mm, mmS float64) func(context.Context, *diffik.Loop, *recorder, spatialmath.Pose) error {
+	return func(ctx context.Context, l *diffik.Loop, rec *recorder, start spatialmath.Pose) error {
+		fmt.Printf("descend: start z %.1f mm -> target z %.1f mm\n", start.Point().Z, start.Point().Z-mm)
+		t := time.NewTicker(time.Duration(float64(time.Second) / l.Config().RateHz))
+		defer t.Stop()
+		t0 := time.Now()
+		for d := 0.0; d < mm; d = mmS * time.Since(t0).Seconds() {
+			l.SetTarget(descendTarget(start, d))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+			}
+		}
+		l.SetTarget(descendTarget(start, mm))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+		fmt.Printf("descend: final err %.2f mm\n", l.Status().ErrMM)
+		return nil
+	}
 }

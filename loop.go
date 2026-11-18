@@ -209,6 +209,14 @@ type Status struct {
 	QPActive, QPIters   int       // solver qp: active constraints and iterations this tick
 	QPFallbacks         int       // solver qp: ticks that fell back to the DLS path, session total
 	PeakAccelRatio      float64   // max over ticks and joints of |step − lastStep| / (a·dt²); ≤ 1 means the limit held
+
+	Collision                          string  // "", "on" or "off" (requested, but no pairs)
+	CollisionMinMM                     float64 // closest unsuspended pair this tick; +Inf if none
+	CollisionPair                      string
+	CollisionRows, CollisionRelaxed    int
+	CollisionBrakes                    int
+	CollisionIgnored, CollisionSkipped []string
+	CollisionLate                      string // last "approach faster than v_max" warning
 }
 
 const tickWindow = 500 // ticks kept for p50/p99
@@ -219,6 +227,8 @@ const (
 	// travel at the top joint speed. Below it, a still arm's sensor noise cannot raise the lag estimate.
 	moveFrac = 0.1
 )
+
+const lateTolMM = 0.01 // mm per tick; smaller overshoots are second-order sliding drift, not a d_act too small
 
 // Loop is a differential-IK servo loop for one arm.
 type Loop struct {
@@ -239,9 +249,10 @@ type Loop struct {
 	qCmd     []float64
 	lastStep []float64 // q_cmd change on the last tick, rad; loop goroutine only
 
-	q0        []float64 // posture target, rad; set at NewLoop or the first tick
-	qpFails   int       // consecutive QP fallbacks; loop goroutine only
-	peakAccel float64   // see Status.PeakAccelRatio; loop goroutine only
+	q0        []float64       // posture target, rad; set at NewLoop or the first tick
+	qpFails   int             // consecutive QP fallbacks; loop goroutine only
+	coll      *collisionModel // nil: collision avoidance off; rows() is called from the loop goroutine only
+	peakAccel float64         // see Status.PeakAccelRatio; loop goroutine only
 
 	sent     [][]float64 // last sent commands, oldest first, at most MaxLagMS of ticks; loop goroutine only
 	lagTicks float64     // estimated arm lag in ticks; loop goroutine only
@@ -265,6 +276,23 @@ type Loop struct {
 	ticks    int
 	first    time.Time // start of the first tick
 	last     time.Time // start of the latest tick
+}
+
+// SetCollision turns on collision avoidance (solver qp only). Call it before Run.
+func (l *Loop) SetCollision(c *collisionModel) error {
+	if l.cfg.Solver != SolverQP {
+		return errors.New(`collision avoidance needs solver "qp"`)
+	}
+	l.coll = c
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.status.Collision = "on"
+	l.status.CollisionMinMM = math.Inf(1)
+	if len(c.pairs) == 0 {
+		l.status.Collision = "off"
+	}
+	l.status.CollisionIgnored, l.status.CollisionSkipped = c.ignored(), slices.Clone(c.skipped)
+	return nil
 }
 
 // NewLoop builds a loop for model, driven through io.
@@ -426,6 +454,7 @@ func (l *Loop) Status() Status {
 	s := l.status
 	s.QCmd = slices.Clone(s.QCmd)
 	s.QMeas = slices.Clone(s.QMeas)
+	s.CollisionIgnored, s.CollisionSkipped = slices.Clone(s.CollisionIgnored), slices.Clone(s.CollisionSkipped)
 	if n := len(l.tickDurs); n > 0 {
 		d := slices.Clone(l.tickDurs)
 		slices.Sort(d)
@@ -575,17 +604,57 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	var next []float64
 	var limStep bool
 	var qpActive, qpIters int
-	fellBack := false
+	fellBack, relaxed, braked := false, false, false
+	var crows []collRow
+	var cmin float64
+	var cpair int
+	var late string
 	if l.cfg.Solver == SolverQP {
 		var qerr error
-		next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt)
-		if qerr != nil {
+		var accel []float64
+		if l.coll != nil && len(l.coll.pairs) > 0 {
+			accel = make([]float64, len(l.qCmd))
+			for i := range accel {
+				accel[i] = deg2rad(l.cfg.MaxJointDegPerS2[i])
+			}
+			var cerr error
+			crows, cmin, cpair, cerr = l.coll.rows(l.qCmd, accel, dt)
+			if cerr != nil {
+				return fmt.Errorf("collision: %w", cerr)
+			}
+			for _, r := range crows { // entered faster than it can stop: d_act was too small
+				if v := dotf(r.jd, l.lastStep); -v > r.vmax+lateTolMM {
+					late = fmt.Sprintf("%s: approach %.3g mm/tick > v_max %.3g", l.coll.pairName(r.pair), -v, r.vmax)
+				}
+			}
+		}
+		next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt, crows, false)
+		if qerr != nil && len(crows) > 0 {
+			relaxed = true
+			next, qpActive, qpIters, qerr = l.qpNext(rows, scale, dt, crows, true)
+		}
+		switch {
+		case qerr != nil && len(crows) > 0: // brake: DLS ignores obstacles
+			bs := brakeStep(l.lastStep, accel, dt, l.qCmd, l.lo, l.hi)
+			next = make([]float64, len(l.qCmd))
+			for i := range next {
+				next[i] = l.qCmd[i] + bs[i]
+			}
+			braked, fellBack, limStep = true, true, true
+			if maxAbs(l.lastStep) != 0 {
+				l.qpFails = 0 // earlier DLS-fallback failures don't count toward the at-rest fault
+			} else { // at rest Δq = 0 is feasible: a real fault
+				if l.qpFails++; l.qpFails >= 10 {
+					return fmt.Errorf("qp: %w", qerr)
+				}
+			}
+		case qerr != nil:
 			l.qpFails++
 			fellBack, next = true, nil
 			if l.qpFails >= 10 {
 				return fmt.Errorf("qp: %w", qerr)
 			}
-		} else {
+		default:
 			l.qpFails, limStep = 0, qpActive > 0
 		}
 	}
@@ -645,6 +714,27 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	st.QPActive, st.QPIters, st.PeakAccelRatio = qpActive, qpIters, l.peakAccel
 	if fellBack {
 		st.QPFallbacks++
+	}
+	if l.coll != nil {
+		st.Collision = "on"
+		if len(l.coll.pairs) == 0 {
+			st.Collision = "off"
+		} else {
+			st.CollisionMinMM, st.CollisionPair, st.CollisionRows = cmin, "", len(crows)
+			if cpair >= 0 {
+				st.CollisionPair = l.coll.pairName(cpair)
+			}
+		}
+		if relaxed {
+			st.CollisionRelaxed++
+		}
+		if braked {
+			st.CollisionBrakes++
+		}
+		st.CollisionIgnored, st.CollisionSkipped = l.coll.ignored(), slices.Clone(l.coll.skipped)
+		if late != "" {
+			st.CollisionLate = late
+		}
 	}
 	l.lastReach = deg2rad(ms.convDeg)
 	st.State = l.nextState(ms, limited, vel != ([6]float64{}))
@@ -984,6 +1074,22 @@ func maxAbsDiff(a, b []float64) float64 {
 	m := 0.0
 	for i := range a {
 		m = math.Max(m, math.Abs(a[i]-b[i]))
+	}
+	return m
+}
+
+func dotf(a, b []float64) float64 {
+	s := 0.0
+	for i := range a {
+		s += a[i] * b[i]
+	}
+	return s
+}
+
+func maxAbs(a []float64) float64 {
+	m := 0.0
+	for _, v := range a {
+		m = math.Max(m, math.Abs(v))
 	}
 	return m
 }

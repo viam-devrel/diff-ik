@@ -43,9 +43,13 @@ const qpMu = 1e-6
 // qpSolver is solveQP; tests replace it to force failures.
 var qpSolver = solveQP
 
+// relaxEps is the slack under a relaxed row's bound: at exactly the reachable maximum the feasible set is
+// one box corner, which the solver reports infeasible.
+const relaxEps = 1e-6 // mm per tick
+
 // qpNext builds this tick's QP from the weighted task rows, the damping λ, the posture pull (scaled by
 // the ramp scale) and qpBounds, solves it, and returns the joints to send (spec "Objective").
-func (l *Loop) qpNext(rows taskRows, scale, dt float64) (next []float64, active, iters int, err error) {
+func (l *Loop) qpNext(rows taskRows, scale, dt float64, coll []collRow, relax bool) (next []float64, active, iters int, err error) {
 	n := len(l.qCmd)
 	m, _ := rows.A.Dims()
 	wp, pull := 0.0, make([]float64, n)
@@ -74,7 +78,19 @@ func (l *Loop) qpNext(rows taskRows, scale, dt float64) (next []float64, active,
 		g[i] = -(s + wp*pull[i])
 	}
 	lb, ub := l.qpBounds(dt)
-	x, active, iters, err := qpSolver(qpProblem{H: H, g: g, lb: lb, ub: ub})
+	prob := qpProblem{H: H, g: g, lb: lb, ub: ub}
+	if len(coll) > 0 { // collision damper rows: J_d·Δq ≥ −v_max, relaxed to what the bounds can reach on a retry
+		A, b := mat.NewDense(len(coll), n, nil), make([]float64, len(coll))
+		for k, r := range coll {
+			A.SetRow(k, r.jd)
+			b[k] = -r.vmax
+			if relax {
+				b[k] = math.Min(b[k], relaxBound(r.jd, lb, ub)) - relaxEps
+			}
+		}
+		prob.A, prob.b = A, b
+	}
+	x, active, iters, err := qpSolver(prob)
 	if err != nil {
 		return nil, 0, iters, err
 	}

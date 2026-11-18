@@ -27,10 +27,10 @@ var gripPose = spatialmath.NewPose(r3.Vector{Z: 105}, &spatialmath.OrientationVe
 type teleopFS struct{ *fakeFS }
 
 func (f teleopFS) FrameSystemConfig(context.Context) (*framesystem.Config, error) {
-	return &framesystem.Config{Parts: []*referenceframe.FrameSystemPart{
+	return &framesystem.Config{Parts: append([]*referenceframe.FrameSystemPart{
 		{FrameConfig: referenceframe.NewLinkInFrame(referenceframe.World, spatialmath.NewZeroPose(), "arm", nil), ModelFrame: ur5eModel()},
 		{FrameConfig: referenceframe.NewLinkInFrame("arm", gripPose, "grip", nil)},
-	}}, nil
+	}, f.parts...)}, nil
 }
 
 func (f teleopFS) TransformPose(ctx context.Context, p *referenceframe.PoseInFrame, dst string,
@@ -395,5 +395,20 @@ func TestSessionTouchDoesNotReviveStopping(t *testing.T) {
 	sess.touch()
 	if !sess.lastCmd.Equal(before) {
 		t.Fatal("touch refreshed a stopping session")
+	}
+}
+
+func TestTeleopCollisionFromDefaults(t *testing.T) {
+	s, m, _ := newTeleopServo(t, map[string]interface{}{"solver": "qp", "collision": true})
+	box, err := spatialmath.NewBox(spatialmath.NewZeroPose(), r3.Vector{X: 600, Y: 600, Z: 20}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.fs.(teleopFS).fakeFS.parts = []*referenceframe.FrameSystemPart{{
+		FrameConfig: referenceframe.NewLinkInFrame(referenceframe.World, spatialmath.NewPoseFromPoint(r3.Vector{X: 400, Z: -200}), "table", box)}}
+	do(t, s, startCmd(t, "arm"))
+	st := teleStatus(t, s)["sessions"].(map[string]interface{})["arm"].(map[string]interface{})
+	if st["collision"] != "on" {
+		t.Fatalf("collision = %v", st["collision"])
 	}
 }
