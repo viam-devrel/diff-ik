@@ -692,3 +692,28 @@ func TestLiveTopClassificationByScore(t *testing.T) {
 		t.Fatalf("label %q", l)
 	}
 }
+
+// A depth camera's no-reading pixels land at its own origin; one such point joined to a real cluster must not
+// stretch the refit box up to the camera. The detection frame here is the camera frame.
+func TestLiveDropsCameraOriginPoint(t *testing.T) {
+	lo, hi := r3.Vector{X: -2000, Y: -2000, Z: -2000}, r3.Vector{X: 2000, Y: 2000, Z: 2000}
+	e := newLV(t, idPose(), LiveConfig{WorkspaceMin: &lo, WorkspaceMax: &hi, InflateMM: fp(0)}, props3D)
+	var cube []r3.Vector
+	for _, a := range []float64{-20, 0, 20} {
+		for _, b := range []float64{-20, 0, 20} {
+			for _, c := range []float64{0, 20} {
+				cube = append(cube, r3.Vector{X: 600 + a, Y: 300 + b, Z: 100 + c})
+			}
+		}
+	}
+	e.src.dets = []*detection3d.Detection{det3("world", idPose(), box(t, r3.Vector{X: 40, Y: 40, Z: 20}), cloud(append(cube, r3.Vector{})...), idPose(), "")}
+	e.p.pollOnce(context.Background())
+	set := e.out.last(t)
+	if len(set) != 1 {
+		t.Fatalf("set %d", len(set))
+	}
+	g, c := set[0].geom, cfgOf(t, set[0].geom)
+	if !lnear(g.Pose().Point(), r3.Vector{X: 600, Y: 300, Z: 110}, 1e-9) || math.Abs(c.X-40) > 1e-9 || math.Abs(c.Z-20) > 1e-9 {
+		t.Fatalf("refit %v %+v, want the cube", g.Pose().Point(), c)
+	}
+}

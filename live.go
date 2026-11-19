@@ -270,7 +270,7 @@ func (p *poller) pollOnce(ctx context.Context) {
 			c := cand{geom: root.Geometry().Transform(spatialmath.Compose(w, root.Pose()))}
 			for _, t := range d.Transforms[1:] {
 				if pc, ok := t.Geometry().(pointcloud.PointCloud); ok {
-					c.pts = cloudPoints(pc, spatialmath.Compose(w, spatialmath.Compose(root.Pose(), t.Pose())))
+					c.pts = cloudPoints(pc, spatialmath.Compose(root.Pose(), t.Pose()), w)
 					break
 				}
 			}
@@ -303,7 +303,7 @@ func (p *poller) pollOnce(ctx context.Context) {
 			}
 			c := cand{geom: o.Geometry.Transform(w), label: o.Geometry.Label()}
 			if o.PointCloud != nil {
-				c.pts = cloudPoints(o.PointCloud, w)
+				c.pts = cloudPoints(o.PointCloud, spatialmath.NewZeroPose(), w)
 			}
 			cands = append(cands, c)
 		}
@@ -369,11 +369,17 @@ func isPoint(g spatialmath.Geometry) bool {
 }
 
 // cloudPoints returns pc's finite points, moved through pose.
-func cloudPoints(pc pointcloud.PointCloud, through spatialmath.Pose) []r3.Vector {
+// cloudPoints maps a detection's points into world: inner takes them to the source (camera) frame, w to world.
+// A point at the camera's own origin is dropped: depth cameras map no-reading pixels there, and segmenters can
+// attach it to a real cluster, stretching the refit box up to the camera.
+func cloudPoints(pc pointcloud.PointCloud, inner, w spatialmath.Pose) []r3.Vector {
 	pts := make([]r3.Vector, 0, pc.Size())
 	pc.Iterate(0, 0, func(v r3.Vector, _ pointcloud.Data) bool {
-		if finiteVec(v) {
-			pts = append(pts, spatialmath.TransformPointByPose(through, v))
+		if !finiteVec(v) {
+			return true
+		}
+		if c := spatialmath.TransformPointByPose(inner, v); c.Norm() >= 1 {
+			pts = append(pts, spatialmath.TransformPointByPose(w, c))
 		}
 		return true
 	})
