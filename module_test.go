@@ -716,3 +716,39 @@ func TestTeleopLiveObstacles(t *testing.T) {
 		t.Fatalf("teleop session has no live poller: %+v", sess.poller)
 	}
 }
+
+func TestServoStartGain(t *testing.T) {
+	start := func(gain interface{}) (map[string]interface{}, error) {
+		m, _, clk := newTestManager(t, spatialmath.NewZeroPose())
+		s := testServo(t, m)
+		c := map[string]interface{}{"command": "servo_start", "component_name": "arm", "frame": "arm_origin"}
+		if gain != nil {
+			c["gain"] = gain
+		}
+		r, err := s.DoCommand(context.Background(), c)
+		if err != nil {
+			return nil, err
+		}
+		sess, err := m.get(r["session_id"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		step(t, sess, clk, 1)
+		return do(t, s, map[string]interface{}{"command": "servo_status", "session_id": r["session_id"]}), nil
+	}
+	for _, tc := range []struct {
+		in   interface{}
+		want float64
+	}{{nil, 2}, {6.0, 6}} {
+		st, err := start(tc.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g := st["limits"].(map[string]interface{})["gain"]; g != tc.want {
+			t.Fatalf("gain %v: got %v, want %v", tc.in, g, tc.want)
+		}
+	}
+	if _, err := start(0.0); err == nil || !strings.Contains(err.Error(), "gain") {
+		t.Fatalf("gain 0 err = %v", err)
+	}
+}

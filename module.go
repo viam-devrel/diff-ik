@@ -266,6 +266,12 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 		return nil, nil, fmt.Errorf("ramp_ms must be in (0, 5000], got %v", ramp)
 	}
 	lc := LoopConfig{RateHz: rate}
+	if lc.Gain, err = optNum(cmd, "gain", 0); err != nil { // 0: the loop's default (2/s)
+		return nil, nil, err
+	}
+	if _, ok := cmd["gain"]; ok && !(lc.Gain > 0) {
+		return nil, nil, fmt.Errorf("gain must be > 0, got %v", lc.Gain)
+	}
 	if v, ok := cmd["task"]; ok {
 		t, ok := v.(string)
 		if !ok || (t != TaskPose && t != TaskPointing) {
@@ -810,7 +816,7 @@ func statusMap(st SessionStatus) map[string]interface{} {
 			"joint_deg_s": js, "joint_deg_s2": as, "linear_mm_s": st.Config.MaxLinearMMPerS,
 			"angular_deg_s": st.Config.MaxAngularDegPerS, "resync_deg": st.Config.ResyncDeg, "max_lag_ms": st.Config.MaxLagMS,
 			"singular_eps": st.Config.SingularEps, "max_damping": st.Config.MaxDamping,
-			"tol_mm": st.Config.TolMM, "tol_deg": st.Config.TolDeg,
+			"tol_mm": st.Config.TolMM, "tol_deg": st.Config.TolDeg, "gain": st.Config.Gain,
 		},
 		"tick_p50_ms": ms(st.TickP50), "tick_p99_ms": ms(st.TickP99),
 		"overruns": float64(st.Overruns), "resyncs": float64(st.Resyncs), "lag_ms": st.LagMS, "damping": st.Damping,

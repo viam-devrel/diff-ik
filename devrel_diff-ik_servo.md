@@ -71,6 +71,7 @@ second session on a busy arm fails.
 | `mode` | `pose` | `pose` (`servo_target`) or `twist` (`servo_twist`). |
 | `task` | `pose`; `pointing` below 6 DOF | `pointing` tracks position and tool-axis direction. |
 | `rate_hz` | 50 | 1–1000. |
+| `gain` | 2 | Tracking gain in 1/s: the commanded TCP velocity is the target's feed-forward velocity plus `gain` × the error, so an error closes with a time constant of about 1/`gain`. Must be > 0. Reported in the status `limits`. |
 | `timeout_ms` | 500 | Dead-man, in (0, 10000]. It can't be disabled. |
 | `ramp_ms` | 200 | Stop ramp: the velocity scales to zero over this time. The stop lasts longer if the acceleration limit needs it. |
 | `limits.joint_deg_s` | 90 | A number, or one per joint. |
@@ -86,7 +87,7 @@ second session on a busy arm fails.
 | `frames` | false | When true, `servo_target` accepts a `frame` from the frame system. That frame may hang off static frames or this arm. |
 | `world_state` | none | `qp` only. Obstacles, as the motion service's `WorldState` (protojson: a JSON object or a string). Boxes, capsules, spheres and points only; a mesh is rejected. Resolved into the arm's base frame at start and fixed for the session. An obstacle in a movable frame other than this arm is an error. One in a frame that moves with the arm is placed at the start pose, then fixed. Transforms parented to the arm or a mounted frame become robot parts (a held object). Giving it turns collision on. |
 | `collision_specification` | none | `qp` only. Allowed contacts, as the motion service's `CollisionSpecification` list (protojson: a JSON list or a string): `[{"allows": [{"frame1", "frame2"}]}]`. A name is a geometry label (links are `<arm>:<link>`), a frame name (the arm's name covers all its links), or `<frame>_origin`. An unknown name is an error. The name of a frame skipped as movable is a no-op, with a warning. Giving it turns collision on. |
-| `collision` | off | `qp` only. `true`, or `{"d_min_mm", "d_act_mm"}` (defaults 10 and 100; `d_act_mm` must exceed `d_min_mm`; unknown keys are rejected). Collision is also on when `world_state` or `collision_specification` is given. `"collision": false` turns it off even then. |
+| `collision` | off | `qp` only. `true`, or `{"d_min_mm", "d_act_mm"}` (defaults 10 and 100; `d_act_mm` must exceed `d_min_mm`; unknown keys are rejected). Collision is also on when `world_state` or `collision_specification` is given. `"collision": false` turns it off even then. Frame-system meshes on the arm or around it (a gripper model, a fixture) are checked as their bounding box in the mesh's own frame, with a warning; cylinders are still skipped. |
 | `live_obstacles` | off | `qp` only. Obstacles from a vision service, polled while the session runs. Turns collision on; `"collision": false` with it is rejected. See below and "Live obstacles". |
 | `point_velocities` | true | Send per-point target joint velocities to the driver. |
 

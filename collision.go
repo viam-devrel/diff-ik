@@ -1,10 +1,13 @@
 package diffik
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
+	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
 )
@@ -98,6 +101,23 @@ func shapeType(g spatialmath.Geometry) (spatialmath.GeometryType, bool, error) {
 		return cfg.Type, true, nil
 	}
 	return cfg.Type, false, nil
+}
+
+// meshBox is m's bounding box in m's own frame (at least 1 mm on each side): conservative, so a clearance
+// against it never exceeds the mesh's. ponytail: a box per mesh; a tighter fit (a convex decomposition) if a
+// gripper's box is too coarse to get near things.
+func meshBox(m *spatialmath.Mesh) (spatialmath.Geometry, error) {
+	var pts []r3.Vector
+	for _, t := range m.Triangles() {
+		pts = append(pts, t.Points()...)
+	}
+	if len(pts) == 0 {
+		return nil, errors.New("empty mesh")
+	}
+	lo, hi := bounds(pts)
+	d := hi.Sub(lo)
+	d = r3.Vector{X: math.Max(d.X, 1), Y: math.Max(d.Y, 1), Z: math.Max(d.Z, 1)}
+	return spatialmath.NewBox(spatialmath.Compose(m.Pose(), spatialmath.NewPoseFromPoint(lo.Add(hi).Mul(0.5))), d, m.Label())
 }
 
 func unsupported(label string, t spatialmath.GeometryType) error {
@@ -213,6 +233,12 @@ func NewCollisionModel(parts []*referenceframe.FrameSystemPart, model referencef
 			continue
 		}
 		for _, g := range geoms[name].Geometries() {
+			if mesh, ok := g.(*spatialmath.Mesh); ok && !heldNames[trimOrigin(name)] {
+				if b, err := meshBox(mesh); err == nil {
+					c.warnings = append(c.warnings, fmt.Sprintf("collision: %s is a mesh; checked as its bounding box", nonEmptyLabel(g.Label(), name)))
+					g = b
+				}
+			}
 			typ, ok, err := shapeType(g)
 			if err != nil {
 				return nil, fmt.Errorf("collision: %s: %w", name, err)

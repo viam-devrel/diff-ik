@@ -232,8 +232,17 @@ func TestCollisionMeshHandling(t *testing.T) {
 	}, "bin")
 	bin := staticPart(referenceframe.World, "bin", spatialmath.NewPoseFromPoint(r3.Vector{X: 800}), mesh)
 	c := buildColl(t, m, CollisionRequest{Allows: [][2]string{{"arm", "bin"}}}, pandaHold, bin)
-	if len(c.skipped) != 1 || len(c.Warnings()) == 0 || len(c.obs) != 0 {
+	// a frame-system mesh is checked as its bounding box, in the mesh's own frame
+	if len(c.skipped) != 0 || len(c.Warnings()) == 0 || len(c.obs) != 1 {
 		t.Fatalf("skipped %v warnings %v obs %d", c.skipped, c.Warnings(), len(c.obs))
+	}
+	cfg, err := spatialmath.NewGeometryConfig(c.obs[0].geom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Type != spatialmath.BoxType || cfg.X != 100 || cfg.Y != 100 || cfg.Z != 1 ||
+		!lnear(c.obs[0].geom.Pose().Point(), r3.Vector{X: 850, Y: 50}, 1e-9) {
+		t.Fatalf("bin as %+v at %v, want a 100x100x1 box at (850, 50, 0)", cfg, c.obs[0].geom.Pose().Point())
 	}
 
 	ws, err := referenceframe.NewWorldState([]*referenceframe.GeometriesInFrame{
