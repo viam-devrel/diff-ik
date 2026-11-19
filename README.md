@@ -84,7 +84,8 @@ The service is a drop-in `motion_service` for [`viam:teleop`](https://github.com
   replaces its session; an arm with a plain `servo_*` session returns "busy".
 - `teleop_move` composes the leader pose with that transform and sets the session target (latest wins, `seq` ignored).
   A missing or ended session returns `component "<name>" not registered in teleop pipeline`.
-- `teleop_stop` ramp-stops the session. An unknown component is not an error.
+- `teleop_stop` ramp-stops the session; without `component_name` it stops every teleop session, as builtin does. An
+  unknown component is not an error.
 - `teleop_status` returns `{"teleop_status": {running, components, error, last_plan_ms, sessions}}`. **A status call also
   refreshes the dead-man of each live teleop session**, because the module sends no moves while the leader is still but
   polls status every 200 ms. The refresh applies only while the session's last `teleop_start` or `teleop_move` is at most

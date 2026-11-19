@@ -141,9 +141,21 @@ func TestTeleopErrors(t *testing.T) {
 	bad["teleop_move"] = string(b)
 	_, err = s.DoCommand(ctx, bad)
 	wantErr(t, err, "reference_frame")
-	if _, err := s.DoCommand(ctx, map[string]interface{}{"teleop_stop": true}); err == nil {
-		t.Fatal("teleop_stop without component_name: want error")
+}
+
+func TestTeleopStopAll(t *testing.T) {
+	s, m, clk := newTeleopServo(t, map[string]interface{}{"ramp_ms": 40.0})
+	do(t, s, startCmd(t, "arm"))
+	sess := teleSession(t, m)
+	pump(sess, clk)
+	do(t, s, map[string]interface{}{"teleop_stop": true}) // no component_name: stops every session
+	if !sess.ended() {
+		t.Fatal("bare teleop_stop should end the session")
 	}
+	if st := teleStatus(t, s); st["running"] != false {
+		t.Fatalf("running after bare teleop_stop: %v", st)
+	}
+	do(t, s, map[string]interface{}{"teleop_stop": true}) // nothing running: not an error
 }
 
 // pump ticks sess on the fake clock until it ends, for operations that wait on the loop (stop).

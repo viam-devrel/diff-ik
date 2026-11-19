@@ -220,22 +220,29 @@ func (s *diffIkServo) teleopMove(cmd map[string]interface{}) error {
 	return nil
 }
 
+// teleopStop ramp-stops the named component's session, or every teleop session when no component_name is
+// given (as builtin does).
 func (s *diffIkServo) teleopStop(ctx context.Context, cmd map[string]interface{}) error {
-	name, err := componentName(cmd)
-	if err != nil {
-		return err
-	}
+	name, _ := cmd["component_name"].(string)
 	s.startMu.Lock() // so a stop can't slip between an in-flight start and its registration
 	defer s.startMu.Unlock()
 	s.tmu.Lock()
-	e := s.teleop[name]
-	delete(s.teleop, name)
-	s.tmu.Unlock()
-	if e == nil || e.sess.ended() {
-		return nil
+	var stops []*teleopEntry
+	for n, e := range s.teleop {
+		if name == "" || n == name {
+			stops = append(stops, e)
+			delete(s.teleop, n)
+		}
 	}
-	_, err = e.sess.stop(ctx)
-	return err
+	s.tmu.Unlock()
+	var errs []error
+	for _, e := range stops {
+		if !e.sess.ended() {
+			_, err := e.sess.stop(ctx)
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // teleopStatus reports the teleop sessions. Polling it is the dead-man: viam:teleop sends no moves while the

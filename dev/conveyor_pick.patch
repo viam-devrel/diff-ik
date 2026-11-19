@@ -1,0 +1,135 @@
+--- a/examples/conveyor_pick.py
++++ b/examples/conveyor_pick.py
+@@ -33,6 +33,7 @@
+ """
+ 
+ import argparse
++import os
+ import asyncio
+ import csv
+ import json
+@@ -53,9 +54,11 @@
+ from viam.proto.common import GeometriesInFrame, Geometry, Pose, PoseInFrame, RectangularPrism, Vector3, WorldState
+ from viam.proto.service.motion import MoveRequest
+ from viam.robot.client import RobotClient
++from viam.rpc.dial import DialOptions
+ from viam.services.motion import MotionClient
+ 
+ ARM, GRIPPER, MOTION = "pick-arm", "pick-gripper", "builtin"
++TELEOP = os.environ.get("TELEOP_SERVICE", MOTION)  # diff-ik: TELEOP_SERVICE=servo
+ ARM_BASE_MM = (0, 0, 400)  # pick-arm's frame in the world
+ TCP_MM = 130  # pick-gripper's frame along the arm's tool axis
+ BELT_X, BELT_TOP, BELT_W, MAX_SPEED = 600, 450, 400, 1.0  # mm, mm, mm, m/s at power 1
+@@ -81,7 +84,7 @@
+ 
+ class Teleop:
+     def __init__(self, robot: RobotClient) -> None:
+-        self.motion = MotionClient.from_robot(robot, MOTION)
++        self.motion = MotionClient.from_robot(robot, TELEOP)
+ 
+     async def start(self, x: float, y: float, z: float) -> None:
+         request = MoveRequest(name=MOTION, component_name=GRIPPER, destination=world(x, y, z), world_state=STATE)
+@@ -210,11 +213,25 @@
+     parser.add_argument("--belt", type=float, default=0.1, help="belt power, x 1.0 m/s")
+     parser.add_argument("--lookahead", type=float, help="seconds of belt travel to aim ahead")
+     parser.add_argument("--csv", help="write every tick here")
++    parser.add_argument("--hover-mm", type=float, default=HOVER_MM, help="track this far over the parcel's top")
++    parser.add_argument("--descend-mm-s", type=float, default=DESCEND_MM_S, help="descent speed onto the parcel")
++    parser.add_argument("--lock-mm", default=f"{LOCK_MM[0]},{LOCK_MM[1]}", help="along-belt,height error to lock on")
++    parser.add_argument("--lock-ticks", type=int, default=LOCK_TICKS, help="ticks within --lock-mm to lock on")
++    parser.add_argument("--ramp-accel", type=float, default=0,
++                        help="m/s^2: start the goal moving before the parcel arrives, meeting it at belt speed")
+     args = parser.parse_args()
+     address, key_id, key, mode, power, out = args.address, args.key_id, args.key, args.mode, args.belt, args.csv
+     lookahead = LOOKAHEAD_S[mode] if args.lookahead is None else args.lookahead
+     speed = power * MAX_SPEED * 1000  # mm/s
+-    opts = RobotClient.Options.with_api_key(api_key=key, api_key_id=key_id)
++    hover, descend_mm_s = args.hover_mm, args.descend_mm_s
++    lock_mm, lock_ticks = tuple(float(v) for v in args.lock_mm.split(",")), args.lock_ticks
++    # ramp: the goal leaves the park point when the (led) parcel is RAMP_D upstream of it, accelerates at
++    # --ramp-accel and meets the parcel RAMP_D past the park point at belt speed, with no jump in position or speed
++    ramp_d = speed ** 2 / (2 * args.ramp_accel * 1000) if args.ramp_accel > 0 else 0.0  # mm
++    if key == "-":  # a local plaintext viam-server: no credentials
++        opts = RobotClient.Options(dial_options=DialOptions(insecure=True, disable_webrtc=True))
++    else:
++        opts = RobotClient.Options.with_api_key(api_key=key, api_key_id=key_id)
+     async with await RobotClient.at_address(address, opts) as robot:
+         belt, feed = Motor.from_robot(robot, "belt"), Sensor.from_robot(robot, "feed")
+         gripper, motion = Gripper.from_robot(robot, GRIPPER), MotionClient.from_robot(robot, MOTION)
+@@ -224,10 +241,12 @@
+             return (await feed.do_command({"command": "get_parcels"}))["parcels"]
+ 
+         await motion.do_command({"teleop_stop": True})  # a teleop pipeline left by a stopped run
++        if TELEOP != MOTION:
++            await MotionClient.from_robot(robot, TELEOP).do_command({"teleop_stop": True})
+         await gripper.open()  # let go of a parcel the last run lifted
+         # park over the start of the reach, so the arm tracks instead of chasing
+         await motion.move(component_name=GRIPPER, world_state=STATE,
+-                          destination=world(BELT_X, REACH_Y[0], BELT_TOP + 150 + HOVER_MM))
++                          destination=world(BELT_X, REACH_Y[0], BELT_TOP + 150 + hover))
+         await feed.do_command({"command": "spawn", "force": True})
+         await belt.set_power(power)
+ 
+@@ -237,13 +256,13 @@
+ 
+         deadline = time.monotonic() + 60
+         while not (on := [p for p in await parcels() if coming(p)]) or max(
+-                p["pose"]["position"][1] for p in on) * 1000 < REACH_Y[0]:
++                p["pose"]["position"][1] for p in on) * 1000 + speed * lookahead < REACH_Y[0] - ramp_d:
+             if time.monotonic() > deadline:
+                 raise RuntimeError("no parcel reached the arm in 60 s")
+             await asyncio.sleep(0.02)
+         name = max(on, key=lambda p: p["pose"]["position"][1])["name"]
+ 
+-        rows, phase, above, locked = [], "track", HOVER_MM, 0
++        rows, phase, above, locked = [], "track", hover, 0
+         held = grabbed_at = grab = None
+         t0 = last = time.monotonic()
+         started = False
+@@ -259,16 +278,21 @@
+                     x, y, z = grab
+                     y += min(speed * (tick - grabbed_at), REACH_Y[1] - y)
+                 if phase == "descend":
+-                    above = max(CUP_GAP_MM, above - DESCEND_MM_S * dt)
++                    above = max(CUP_GAP_MM, above - descend_mm_s * dt)
+                 elif phase in ("grab", "lift") and tick - grabbed_at > 0.5:  # the cup has had time to seal
+                     if held is None:
+                         held = (await gripper.is_holding_something()).is_holding_something
+                         phase = "lift"
+                     above = min(CUP_GAP_MM + LIFT_MM, above + LIFT_MM_S * dt)
+                 # lead the height ramps by the lookahead too, as the belt is led
+-                lead = {"descend": -DESCEND_MM_S, "lift": LIFT_MM_S}.get(phase, 0) * lookahead
++                lead = {"descend": -descend_mm_s, "lift": LIFT_MM_S}.get(phase, 0) * lookahead
+                 goal_above = min(max(CUP_GAP_MM, above + lead), CUP_GAP_MM + LIFT_MM)
+-                goal = (x, min(y + speed * lookahead, REACH_Y[1]), z + goal_above)  # never past the reach
++                led = y + speed * lookahead
++                if ramp_d and grab is None:
++                    s_in = led - (REACH_Y[0] - ramp_d)  # how far the led parcel is past the ramp's start
++                    if s_in < 2 * ramp_d:
++                        led = REACH_Y[0] + max(s_in, 0) ** 2 / (4 * ramp_d)
++                goal = (x, min(led, REACH_Y[1]), z + goal_above)  # never past the reach
+                 await (driver.send if started else driver.start)(*goal)
+                 started = True
+                 g = (await motion.get_pose(component_name=GRIPPER, destination_frame="world")).pose
+@@ -278,13 +302,18 @@
+                     now_y = min(now_y, REACH_Y[1])
+                 err = (g.x - x, g.y - now_y, g.z - (z + above))
+                 if phase == "track":
+-                    locked = locked + 1 if abs(err[1]) < LOCK_MM[0] and abs(err[2]) < LOCK_MM[1] else 0
+-                    if locked >= LOCK_TICKS:
++                    locked = locked + 1 if abs(err[1]) < lock_mm[0] and abs(err[2]) < lock_mm[1] else 0
++                    if locked >= lock_ticks:
+                         phase = "descend"
+                 elif phase == "descend" and above == CUP_GAP_MM and abs(err[2]) < 3:
+                     await gripper.grab()
+                     phase, grabbed_at, grab = "grab", time.monotonic(), (x, y, z)
+-                rows.append({"t": round(tick - t0, 3), "phase": phase, "above": round(above, 1),
++                dk = {}
++                if TELEOP != MOTION:  # diff-ik's own view: measured flange error, lag, clearance
++                    ss = (await driver.motion.do_command({"teleop_status": True}))["teleop_status"]["sessions"].get(GRIPPER, {})
++                    dk = {k: round(ss[k], 2) if isinstance(ss.get(k), float) else ss.get(k)
++                          for k in ("err_mm", "err_deg", "lag_ms", "collision_min_mm", "collision_pair", "clamps")}
++                rows.append({**dk, "t": round(tick - t0, 3), "phase": phase, "above": round(above, 1),
+                              "parcel_y": round(top(live)[1], 1), "parcel_z": round(top(live)[2], 1),
+                              **{f"err_{a}": round(e, 1) for a, e in zip("xyz", err)},
+                              "runway_ms": getattr(driver, "runway_ms", None)})
