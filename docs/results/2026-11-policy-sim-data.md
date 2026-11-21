@@ -133,7 +133,10 @@ Date 2026-11-21. Laptop viam-server v1.17.0, `viam` CLI 1.17.0, viam-sdk 0.85+.
   `--capture diff-ik-pick-v2-eval` over 9000-9014 (15). **All 80 were kept (0 discarded)**, so no discard reasons;
   expert success 80/80 (the batch summary for 1005-1064 reads 60/60). Seeds 1050-1064 and 9010-9014 were captured as
   spare and not added to the datasets. Logs: `.runs/policy-sim/expert-diff-ik-pick-v2{,-eval}.jsonl` (untracked).
-  `add` was run on the first 50 / 10 log rows, so the datasets hold exactly 50 / 10.
+  The 50 / 10 subsets were added by trimming the logs and passing the trimmed copy to `add`:
+  `head -50 .runs/policy-sim/expert-diff-ik-pick-v2.jsonl > v2-50.jsonl` and
+  `head -10 .runs/policy-sim/expert-diff-ik-pick-v2-eval.jsonl > v2e-10.jsonl` (verified identical to the copies used),
+  then `expert_pick.py add --log v2-50.jsonl ...` (and `--log v2e-10.jsonl` for eval), so the datasets hold exactly 50 / 10.
 - **Instruction:** "Pick up the red block and place it in the bin" (`cmd:` tag). Tags per episode:
   `episode:<dataset>-<seed>`, `expert:v1`.
 - **Randomization** (`bc_pick.sample_scene(seed)`): block centre world x 425-675 mm, y -60-140 mm; block yaw +-45 deg;
@@ -153,21 +156,32 @@ Date 2026-11-21. Laptop viam-server v1.17.0, `viam` CLI 1.17.0, viam-sdk 0.85+.
   Outputs (untracked): `.runs/policy-sim/lerobot-v2`, `lerobot-v2-eval`.
 - **Episode length:** v2 78-110 frames (median 90, 7.8-11.0 s); eval 79-104 (median 92).
 
-### Sanity checks (`LeRobotDataset`; state and action are 10-d: x, y, z, r00..r12, gripper)
+### Sanity checks (`dev/check_policy_dataset.py`; state and action are 10-d: x, y, z, r00..r12, gripper)
+Run: `cd ~/src/viam-sequence-to-lerobot && uv run python ~/src/diff-ik/dev/check_policy_dataset.py <dataset root>`.
 - Counts and lengths: as above.
 - NaNs in state or action: **0** in both datasets.
-- Gripper: range 43.7-99.7. The closed value is ~44, not 0: the 40 mm block holds the 2F-85 open. Distribution: 61.3%
-  of v2 frames >= 90 (open), 36.1% in 40-50 (holding), 2.5% in transit; **97.6% are within 10 of 100 or of 44**. So the
-  plan's "within 10 of 0 or 100" does not hold literally; it is bimodal at 44 and 100. (Eval: 60.9% >= 90.)
-- Position ranges (arm frame, mm, flange): v2 x 430.5-675.5, y -199.7-163.1, z 84.2-517.7. First closing frame: x 430-675,
-  y -53-136, z 84.2-85.5 (the block area, flange z = 328 - 400 + 155.8 = 83.8 plus a few mm of lag). Last frame of every
-  episode: (550.5, -199.5, 306.0), above the bin (bin at world (550, -200)). Eval ranges are the same.
-- `action[t][:3]` vs `state[t+1][:3]`: max difference **0 mm over all episodes** (both datasets), well inside 1e-4.
-- Images: `observation.images.scene_cam` and `wrist_cam` frames are 3 x 224 x 224 (CHW) in both datasets; task string
-  "Pick up the red block and place it in the bin".
+- Gripper: range 43.7-99.7. The closed value is ~44, not 0: the 40 mm block holds the 2F-85 open. v2: 61.3% of frames
+  >= 90 (open), 36.1% in 40-50 (holding), **97.6% within 10 of 44 or of 100** (bimodal). Eval: 60.9% / 36.7% / 97.8%.
+  The plan's "within 10 of 0 or 100" does not hold literally.
+- Position ranges (arm frame, mm, flange): v2 x 430.5-675.5, y -199.7-163.1, z 84.2-517.7 (eval x 434.9-673.8,
+  y -199.7-154.7, z 84.3-515.6). First frame with gripper < 60 (the grasp), v2: x 430.5-674.8, y -53.3-135.8,
+  z 84.2-86.0 (eval x 434.9-673.1, y -9.9-130.0, z 84.3-86.1); the block area, flange z = 328 - 400 + 155.8 = 83.8 plus a
+  few mm of lag. Last frame of every episode (release pose, both datasets): (550.5, -199.5, 306.0), above the bin
+  (bin at world (550, -200)).
+- `action[t][:3]` vs `state[t+1][:3]`: max difference 0 mm in both datasets. This holds by construction (the converter's
+  action is the next state), so it checks the layout, not data quality.
+- Images: `observation.images.scene_cam` and `observation.images.wrist_cam` frames are 3 x 224 x 224 (CHW) in both
+  datasets; task string "Pick up the red block and place it in the bin".
 - Real-episode skew re-check (Task 0 caveat) not done; frames were consumed at the camera clock with 0 dropped sequences.
 - Note: torchcodec fails to load in the converter venv; `LeRobotDataset` falls back to pyav, which decoded fine.
 
 ### Follow-ups from review (commit 168f02b)
 - `expert_pick.py add` is now idempotent (skips sequence ids already in the dataset; reports `added` and `already`); re-run
   on `diff-ik-pick-v1` gave `added 0, already 5`. `run` summary counts the episodes actually run.
+
+### Notes for sub-project 2
+- Image feature keys are `observation.images.scene_cam` / `observation.images.wrist_cam` (the converter derives them from
+  the camera names); the spec's `scene` / `wrist` means these.
+- The gripper action is ~100 open and ~44 holding, never near 0. A runner must treat values below ~70 as "close"; a 30/70
+  hysteresis with "close below 30" would never close.
+- action == next state is by construction (a layout check), not evidence of data quality.
