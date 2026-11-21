@@ -83,8 +83,10 @@ Date 2026-11-21. Laptop viam-server v1.17.0, `viam` CLI 1.17.0, viam-sdk 0.85+.
 
 ## Task 2: cell, wood texture, renders
 
-- `dev/make_wood_texture.py` writes `dev/assets/wood.png` (procedural oak). The grain reads as wavy stripes at close range;
-  on the table at render distance it passes as wood, but it is regular. Say if you want it more irregular.
+- `dev/make_wood_texture.py` first wrote `dev/assets/wood.png`, a regular procedural oak that read as stripes. After
+  the user's review it was replaced by `dev/assets/wood-v2.png` (see "Visual fix" below).
+- `dev/bc-pick-mujoco.json` has three machine-local absolute paths (the mujoco-sim `run.sh`, `bin/diff-ik`, and the
+  table texture). Running the cell elsewhere means rewriting them.
 - `dev/bc-pick-mujoco.json` is the cell: ur5e + 2F-85 on a pedestal, wood-textured table, cardboard bin, red 40 mm block
   at world (550, 50, 320), `scene-cam`/`wrist-cam` 448 x 448, `overview` 1280 x 720, capture-control 0.1.1,
   `viam-labs:vla` pinned 0.3.0, local mujoco-sim (patched build).

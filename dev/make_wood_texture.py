@@ -15,7 +15,7 @@ y, x = np.mgrid[0:n, 0:n] / n
 
 
 def noise(fx, fy, octaves=5):
-    """Multi-octave value noise, tileable-ish, stretched by (fx, fy) base frequencies."""
+    """Multi-octave value noise (not tileable), stretched by (fx, fy) base frequencies."""
     out = np.zeros((n, n))
     for o in range(octaves):
         gx, gy = max(2, int(fx * 2**o)), max(2, int(fy * 2**o))
