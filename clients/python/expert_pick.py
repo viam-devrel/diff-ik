@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bc_pick as C  # noqa: E402
-from viam.components.arm import Arm  # noqa: E402  (imported before connecting so the client registers every API)
 from viam.components.generic import Generic  # noqa: E402
 from viam.components.gripper import Gripper  # noqa: E402
 from viam.components.sensor import Sensor  # noqa: E402
@@ -30,6 +29,14 @@ TICK_HZ = 30
 BASE_MM_S = 150.0  # expert speed at scale 1
 
 
+class Discard(Exception):
+    pass
+
+
+class StartPoseError(Exception):
+    pass
+
+
 class Episode:
     def __init__(self, robot_conns, a):
         r0, r1 = robot_conns
@@ -37,7 +44,6 @@ class Episode:
         self.svc = MotionClient.from_robot(r0, a.service)
         self.world = Generic.from_robot(r1, a.world)
         self.gripper = Gripper.from_robot(r1, a.gripper)
-        self.arm = Arm.from_robot(r1, a.arm)
         self.capture = Sensor.from_robot(r1, a.capture_sensor)
         self.sid = None
 
@@ -64,6 +70,16 @@ class Episode:
             await self.target(p)
             await asyncio.sleep(0.1)
 
+    async def hold_during(self, p, seconds, coro):
+        """Run coro as a task while holding p, then await it; cancel it if hold() raises."""
+        task = asyncio.create_task(coro)
+        try:
+            await self.hold(p, seconds)
+        finally:
+            if not task.done():
+                task.cancel()
+        await task
+
     async def block_world_mm(self):
         r = await self.world.do_command({"command": "get_prop_pose", "prop": "block"})
         pos, q = r["pose"]["position"], r["pose"]["orientation_wxyz"]
@@ -89,7 +105,7 @@ class Episode:
         try:
             if abs(p0["o_x"]) > 0.02 or abs(p0["o_y"]) > 0.02 or p0["o_z"] > -0.99:
                 # theta is only comparable across poses when the orientation vector is (0, 0, -1)
-                raise RuntimeError(f"start pose isn't tool-down: {p0}; fix home_joints (Task 2 Step 3)")
+                raise StartPoseError(f"start pose isn't tool-down: {p0}; fix home_joints (Task 2 Step 3)")
             n = sc["nudge_xyz"]
             start = (cur[0] + n[0], cur[1] + n[1], cur[2] + n[2], cur[3] + sc["nudge_yaw_deg"])
             cur = await self.move(cur, start, sc["speed"])
@@ -105,9 +121,7 @@ class Episode:
             cur = await self.move(cur, pre, sc["speed"])
             cur = await self.move(cur, grasp, sc["speed"] * 0.6)
             await self.hold(cur, 0.2)
-            grab = asyncio.create_task(self.gripper.grab())
-            await self.hold(cur, 0.6)
-            await grab
+            await self.hold_during(cur, 0.6, self.gripper.grab())
             deadline = time.monotonic() + 2.0
             while not (await self.gripper.is_holding_something()).meta.get("firm_grasp"):
                 if time.monotonic() > deadline:
@@ -118,8 +132,7 @@ class Episode:
             bin_tcp = C.world_to_arm((C.BIN_XY[0], C.BIN_XY[1], C.BIN_RIM_Z + C.PLACE_ABOVE_RIM))
             over_bin = C.flange_from_tcp(bin_tcp) + (cur[3],)
             cur = await self.move(cur, over_bin, sc["speed"], check_grasp=True)
-            await self.gripper.open()
-            await self.hold(cur, 0.6)
+            await self.hold_during(cur, 0.6, self.gripper.open())
             cur = await self.move(cur, (cur[0], cur[1], cur[2] + C.RETREAT, cur[3]), sc["speed"])
             await self.hold(cur, 0.4)
             b1, _ = await self.block_world_mm()
@@ -130,19 +143,22 @@ class Episode:
             info["kept"] = True
         except Discard as e:
             info["reason"] = str(e)
+        except StartPoseError:
+            raise
+        except Exception as e:
+            info["reason"] = f"error: {e!r}"
         finally:
-            if capturing:
-                await self.capture.do_command({"stop_capture": True})
-                info["t_stop"] = datetime.now(timezone.utc).isoformat()
             try:
                 await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"warning: servo_stop failed: {e!r}", file=sys.stderr)
+            if capturing:
+                try:
+                    await self.capture.do_command({"stop_capture": True})
+                    info["t_stop"] = datetime.now(timezone.utc).isoformat()
+                except Exception as e:
+                    print(f"warning: stop_capture failed: {e!r}", file=sys.stderr)
         return info
-
-
-class Discard(Exception):
-    pass
 
 
 def seed_range(s: str) -> list:
@@ -156,9 +172,10 @@ async def cmd_run(a):
     os.makedirs(".runs/policy-sim", exist_ok=True)
     log_path = f".runs/policy-sim/expert-{a.capture or 'bar'}.jsonl"
     kept = 0
+    seeds = seed_range(a.seeds)
     try:
         with open(log_path, "a") as log:
-            for seed in seed_range(a.seeds):
+            for seed in seeds:
                 tags = None
                 if a.capture:
                     tags = [f"cmd:{INSTRUCTION}", f"episode:{a.capture}-{seed}", "expert:v1"]
@@ -172,7 +189,7 @@ async def cmd_run(a):
     finally:
         for c in conns:
             await c.close()
-    n = len(seed_range(a.seeds))
+    n = len(seeds)
     print(json.dumps({"episodes": n, "kept": kept, "success": kept / n, "log": log_path}))
 
 
