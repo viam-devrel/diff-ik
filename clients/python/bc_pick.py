@@ -17,6 +17,7 @@ LIFT = 100.0
 PLACE_ABOVE_RIM = 120.0
 RETREAT = 50.0
 TILT_MAX_DEG = 4.0
+TILT_MIN_DEG = 1.0  # orientation vectors lose the tilt direction near the pole (1 - |o_z| <= 1e-4, ~0.81 deg)
 TILTED = ("start", "pregrasp", "lift")  # grasp, above-bin (release) and retreat stay vertical
 
 
@@ -32,7 +33,7 @@ def sample_scene(seed: int) -> dict:
     d = {"block_xy": (r.uniform(x0, x1), r.uniform(y0, y1)), "block_yaw_deg": r.uniform(-45, 45),
          "nudge_xyz": tuple(r.uniform(-30, 30) for _ in range(3)), "nudge_yaw_deg": r.uniform(-10, 10),
          "speed": r.uniform(0.8, 1.2)}
-    d["tilts"] = {k: tilt_vector(r.uniform(0, TILT_MAX_DEG), r.uniform(0, 360)) for k in TILTED}
+    d["tilts"] = {k: tilt_vector(r.uniform(TILT_MIN_DEG, TILT_MAX_DEG), r.uniform(0, 360)) for k in TILTED}
     return d
 
 
@@ -91,7 +92,7 @@ def in_bin(block_world_mm, bin_xy=BIN_XY) -> bool:
 def pose_map(p) -> dict:
     """A servo pose map for (x, y, z, theta[, tx, ty]): tool down, then tilted by the world rotation vector
     (tx, ty) degrees."""
-    if len(p) < 6 or not (p[4] or p[5]):
+    if len(p) < 6 or math.hypot(p[4], p[5]) < TILT_MIN_DEG:
         return {"x": p[0], "y": p[1], "z": p[2], "o_x": 0, "o_y": 0, "o_z": -1, "theta": p[3]}
     import numpy as np  # here so bc_pick imports without them for callers that never tilt
     from scipy.spatial.transform import Rotation

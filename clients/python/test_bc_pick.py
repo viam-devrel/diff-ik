@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bc_pick import (  # noqa: E402
-    BIN_XY, BLOCK_AREA, TCP_MM, TILT_MAX_DEG, angle_diff, flange_from_tcp, grasp_theta, in_bin, minjerk_segment, pose_map,
+    BIN_XY, BLOCK_AREA, TCP_MM, TILT_MAX_DEG, TILT_MIN_DEG, angle_diff, flange_from_tcp, grasp_theta, in_bin, minjerk_segment, pose_map,
     sample_scene, tilt_vector, world_to_arm, yaw_from_wxyz,
 )
 
@@ -65,7 +65,7 @@ assert {k: sc[k] for k in v1} == v1
 assert set(sc["tilts"]) == {"start", "pregrasp", "lift"}
 for s in range(200):
     for tx, ty in sample_scene(s)["tilts"].values():
-        assert math.hypot(tx, ty) <= TILT_MAX_DEG + 1e-9
+        assert TILT_MIN_DEG - 1e-9 <= math.hypot(tx, ty) <= TILT_MAX_DEG + 1e-9
 assert sample_scene(7)["tilts"] == sample_scene(7)["tilts"]
 
 # 6-tuple poses: (x, y, z, theta, tx, ty); untilted matches the old tool-down map exactly
@@ -74,6 +74,10 @@ p = pose_map((1, 2, 3, 45, 0.0, 0.0))
 assert abs(p["o_z"] + 1) < 1e-9 and abs(p["theta"] - 45) < 1e-6
 p = pose_map((0, 0, 0, 180, 4.0, 0.0))  # 4 degrees about world x
 assert abs(math.degrees(math.acos(-p["o_z"])) - 4.0) < 1e-6
+assert pose_map((0, 0, 0, 180, 0.5, 0.0)) == pose_map((0, 0, 0, 180))  # inside the pole band: untilted
+from policy_layout import rotation  # noqa: E402
+ax = rotation(pose_map((0, 0, 0, 180, 1.2, 1.6))).apply([0, 0, 1])  # 2 degrees off vertical
+assert abs(math.degrees(math.acos(-ax[2])) - 2.0) < 1e-6
 assert max(abs(a - b) for a, b in zip(tilt_vector(3.0, 90.0), (0.0, 3.0))) < 1e-9
 
 # segments carry tilt: exact ends, min-jerk between

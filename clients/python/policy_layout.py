@@ -10,9 +10,6 @@ def rotation(pose: dict) -> Rotation:
     return Rotation.from_matrix(np.asarray(q.to_rotation_matrix().elements, dtype=np.float64).reshape(3, 3))
 
 
-_rotation = rotation  # old name, still imported elsewhere
-
-
 def state_vector(pose: dict, gripper: float) -> list:
     """A pose map (x, y, z mm; o_x, o_y, o_z, theta degrees) and the gripper opening as the 10-number state."""
     rows = rotation(pose).as_matrix()[:2, :].reshape(6)
