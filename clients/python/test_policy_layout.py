@@ -1,0 +1,40 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["numpy", "scipy", "viam-sdk"]
+# ///
+"""Pure-path checks for policy_layout.py, including against the converter's own pose code.
+Run: uv run clients/python/test_policy_layout.py"""
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from policy_layout import chunk_to_poses, state_vector  # noqa: E402
+
+pose = {"x": 512.3, "y": -40.1, "z": 95.0, "o_x": 0.02, "o_y": -0.03, "o_z": -0.999, "theta": 137.0}
+s = state_vector(pose, 63.0)
+assert len(s) == 10 and s[9] == 63.0 and s[:3] == [512.3, -40.1, 95.0]
+
+# round trip: state -> pose -> state
+poses, grip = chunk_to_poses([s])
+s2 = state_vector(poses[0], grip[0])
+np.testing.assert_allclose(s2, s, atol=1e-6)
+
+# noisy rotation rows (a policy's raw output) still give a valid pose
+noisy = list(s)
+noisy[3:9] = [v * 1.07 + 0.01 for v in noisy[3:9]]
+p, _ = chunk_to_poses([noisy])
+n = np.linalg.norm([p[0]["o_x"], p[0]["o_y"], p[0]["o_z"]])
+assert abs(n - 1) < 1e-6
+
+# the same layout as the converter's pose_state (the dataset's source of truth)
+conv = os.path.expanduser("~/src/viam-sequence-to-lerobot/src")
+if os.path.isdir(conv):
+    sys.path.insert(0, conv)
+    from viam_sequence_to_lerobot.pose import pose_state  # noqa: E402
+
+    np.testing.assert_allclose(pose_state({"pose": pose}), s[:9], atol=1e-9)
+else:
+    print("skipped the converter cross-check: ~/src/viam-sequence-to-lerobot not found")
+print("ok")
