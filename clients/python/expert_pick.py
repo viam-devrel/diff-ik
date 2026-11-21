@@ -24,7 +24,7 @@ from viam.components.gripper import Gripper  # noqa: E402
 from viam.components.sensor import Sensor  # noqa: E402
 from viam.services.motion import MotionClient  # noqa: E402
 
-INSTRUCTION = "put the red block in the bin"
+INSTRUCTION = "Pick up the red block and place it in the bin"
 TICK_HZ = 30
 BASE_MM_S = 150.0  # expert speed at scale 1
 

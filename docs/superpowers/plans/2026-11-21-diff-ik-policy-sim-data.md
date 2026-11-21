@@ -619,7 +619,7 @@ line 201); test in `/Users/nick.hehr/src/viam-mujoco-sim/tests/test_gripper.py`.
   sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
   import bc_pick as C  # noqa: E402
 
-  INSTRUCTION = "put the red block in the bin"
+  INSTRUCTION = "Pick up the red block and place it in the bin"
   TICK_HZ = 30
   BASE_MM_S = 150.0  # expert speed at scale 1
 
@@ -1085,22 +1085,23 @@ line 201); test in `/Users/nick.hehr/src/viam-mujoco-sim/tests/test_gripper.py`.
 
 ### Task 7: Capture the dataset, convert, and the dataset card
 
-- [ ] **Step 1: Training episodes.** Run `expert_pick.py run --seeds 1005-1069 --capture diff-ik-pick-v1` (more seeds
-  than needed, for discards), then `add`. Re-run `run` with further seeds until the dataset holds **50 kept**. Count
+- [ ] **Step 1: Training episodes.** The instruction changed after Task 5's review (now "Pick up the red block and
+  place it in the bin"), so capture starts over in **`diff-ik-pick-v2`**, from seed 1000: run `expert_pick.py run
+  --seeds 1000-1064 --capture diff-ik-pick-v2` (more seeds than needed, for discards), then `add`. Re-run `run` with further seeds until the dataset holds **50 kept**. Count
   with `sequences_by_dataset_id(dataset_id, count_only=True)`.
-- [ ] **Step 2: Eval episodes.** `run --seeds 9000-9014 --capture diff-ik-pick-v1-eval`, then `add` into
-  `diff-ik-pick-v1-eval` until it holds **10 kept**.
+- [ ] **Step 2: Eval episodes.** `run --seeds 9000-9014 --capture diff-ik-pick-v2-eval`, then `add` into
+  `diff-ik-pick-v2-eval` until it holds **10 kept**.
 - [ ] **Step 3: Export and convert.**
   ```bash
-  viam dataset export --dataset-id <v1 id> --destination .runs/policy-sim/export-v1
-  cd ~/src/viam-sequence-to-lerobot && uv run viam-seq-to-lerobot ~/src/diff-ik/.runs/policy-sim/export-v1 \
+  viam dataset export --dataset-id <v2 id> --destination .runs/policy-sim/export-v2
+  cd ~/src/viam-sequence-to-lerobot && uv run viam-seq-to-lerobot ~/src/diff-ik/.runs/policy-sim/export-v2 \
       --camera scene-cam --camera wrist-cam --arm arm --grippers gripper --action-space ee \
-      --image-size 224 --fps <capture rate> --repo-id local/diff-ik-pick-v1 \
-      --output-root ~/src/diff-ik/.runs/policy-sim/lerobot-v1
+      --image-size 224 --fps <capture rate> --repo-id local/diff-ik-pick-v2 \
+      --output-root ~/src/diff-ik/.runs/policy-sim/lerobot-v2
   ```
   Check the converter's `--help` for exact flag names (`--camera` repeats; the arm and output flags may be named
   differently) and adapt. Expected: 50 episodes written, and skips listed with reasons. Do the same for the eval
-  export into `lerobot-v1-eval`.
+  export into `lerobot-v2-eval`.
 - [ ] **Step 4: Sanity checks** (a scratch script, using `LeRobotDataset`). Record each in the results doc:
   - episode and frame counts, and the per-episode length range;
   - no NaNs in state or action;
@@ -1234,12 +1235,12 @@ line 201); test in `/Users/nick.hehr/src/viam-mujoco-sim/tests/test_gripper.py`.
   `lerobot-train`. Then check `<scratch>/lerobot-venv/bin/lerobot-train --help` runs. If the dataset written by the
   converter's environment won't load here, that file also pins a converter commit known to pair with this LeRobot;
   note any mismatch.
-- [ ] **Step 2: Smoke dataset.** Convert only the first 5 episodes (export `.runs/policy-sim/export-v1-5` from Task 5)
-  with the same converter command as Task 7, into `.runs/policy-sim/lerobot-smoke`.
+- [ ] **Step 2: Smoke dataset.** Use Task 7's converted `diff-ik-pick-v2` dataset (`.runs/policy-sim/lerobot-v2`). The
+  5 episodes from Task 5 were captured under the old instruction (in `diff-ik-pick-v1`) and are not used.
 - [ ] **Step 3: Train 300 steps.**
   ```bash
-  <scratch>/lerobot-venv/bin/lerobot-train --dataset.repo_id=local/diff-ik-pick-smoke \
-      --dataset.root=$HOME/src/diff-ik/.runs/policy-sim/lerobot-smoke --policy.type=act \
+  <scratch>/lerobot-venv/bin/lerobot-train --dataset.repo_id=local/diff-ik-pick-v2 \
+      --dataset.root=$HOME/src/diff-ik/.runs/policy-sim/lerobot-v2 --policy.type=act \
       --policy.chunk_size=20 --policy.n_action_steps=20 --steps=300 --batch_size=8 \
       --policy.device=mps --policy.push_to_hub=false --log_freq=25 --save_freq=300 \
       --output_dir=$HOME/src/diff-ik/.runs/policy-sim/act-smoke
@@ -1307,7 +1308,7 @@ line 201); test in `/Users/nick.hehr/src/viam-mujoco-sim/tests/test_gripper.py`.
           pose = {"x": p.x, "y": p.y, "z": p.z, "o_x": p.o_x, "o_y": p.o_y, "o_z": p.o_z, "theta": p.theta}
           state = state_vector(pose, g)
           r = await policy.do_command({"command": "infer", "images": images, "state": {"values": state},
-                                       "task": "put the red block in the bin"})
+                                       "task": "Pick up the red block and place it in the bin"})
           rows = r["actions"]["rows"]
           poses, gcol = chunk_to_poses(rows)
           sid = (await svc.do_command({"command": "servo_start", "component_name": a.arm, "frame": "arm_origin",
