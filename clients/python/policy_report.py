@@ -7,6 +7,7 @@
 import argparse
 import itertools
 import json
+import sys
 import statistics as st
 from collections import Counter
 
@@ -22,10 +23,16 @@ def load(paths):
 
 
 def group(rows):
-    """{(checkpoint, mode, cadence): [rows]}, sorted by key."""
-    g = {}
+    """{(checkpoint, mode, cadence): [rows]}, sorted by key. Re-runs: first row per seed wins."""
+    g, dup = {}, 0
     for r in rows:
-        g.setdefault((str(r.get("checkpoint")), r["mode"], r["cadence"]), []).append(r)
+        rs = g.setdefault((str(r.get("checkpoint") or "-"), r["mode"], r["cadence"]), [])
+        if any(x["seed"] == r["seed"] for x in rs):
+            dup += 1
+        else:
+            rs.append(r)
+    if dup:
+        print(f"warning: dropped {dup} duplicate-seed row(s), kept the first", file=sys.stderr)
     return dict(sorted(g.items()))
 
 
@@ -40,6 +47,7 @@ def _p95(xs):
 def summary_row(rows):
     n = len(rows)
     ok = sum(bool(r["success"]) for r in rows)
+    # seam percentiles pool all seams across episodes
     seam = [x for r in rows for x in r["seam_gap_mm"]]
     row0 = [r["row0_to_state_mm"][0] for r in rows if r["row0_to_state_mm"]]
     msgs = [r["msgs_per_s"] for r in rows if r["msgs_per_s"] is not None]
@@ -69,18 +77,28 @@ def labels(keys):
     return {k: "/".join(k if multi else k[1:]) for k in keys}
 
 
+# (name, per-episode value or None, delta format)
+METRICS = [
+    ("jerk", lambda r: r["jerk_rms"], "{:.0f}"),
+    ("seam", lambda r: st.median(r["seam_gap_mm"]) if r["seam_gap_mm"] else None, "{:.1f}"),
+    ("row0", lambda r: r["row0_to_state_mm"][0] if r["row0_to_state_mm"] else None, "{:.1f}"),
+    ("msgs/s", lambda r: r["msgs_per_s"], "{:.1f}"),
+]
+
+
 def paired(rows_by_group):
-    """(cells {seed: {label: bool}}, jerk lines). Seeds are matched across groups."""
+    """(cells {seed: {label: bool}}, metric lines). Seeds are matched across groups."""
     lab = labels(rows_by_group)
     by = {lab[k]: {r["seed"]: r for r in rs} for k, rs in rows_by_group.items()}
     cells = {s: {l: d[s]["success"] for l, d in by.items() if s in d} for s in sorted({s for d in by.values() for s in d})}
     lines = []
     for a, b in itertools.combinations(by, 2):
-        diffs = [by[a][s]["jerk_rms"] - by[b][s]["jerk_rms"] for s in by[a].keys() & by[b].keys()
-                 if by[a][s]["jerk_rms"] is not None and by[b][s]["jerk_rms"] is not None]
-        if diffs:
-            lines.append(f"{a} vs {b}: median Δjerk {st.median(diffs):.0f} "
-                         f"({a} lower on {sum(d < 0 for d in diffs)}/{len(diffs)} seeds)")
+        for name, get, fmt in METRICS:
+            pairs = [(get(by[a][s]), get(by[b][s])) for s in by[a].keys() & by[b].keys()]
+            diffs = [x - y for x, y in pairs if x is not None and y is not None]
+            if diffs:
+                lines.append(f"{a} vs {b}: median Δ{name} {fmt.format(st.median(diffs))} "
+                             f"({a} lower on {sum(d < 0 for d in diffs)}/{len(diffs)} seeds)")
     return cells, lines
 
 
@@ -103,7 +121,7 @@ def main():
         print(table(["seed"] + names, [[str(s)] + [("" if n not in c else "✓" if c[n] else "✗") for n in names]
                                        for s, c in cells.items()]))
         if lines:
-            print("\n## Paired jerk\n")
+            print("\n## Paired metrics (Δ = first − second; negative = first lower)\n")
             print("\n".join(f"- {l}" for l in lines))
 
 

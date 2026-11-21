@@ -3,13 +3,15 @@
 # dependencies = []
 # ///
 """Checks for policy_report.py. Run: uv run clients/python/test_policy_report.py"""
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from policy_report import group, labels, load, paired, summary_row  # noqa: E402
+from policy_report import group, labels, load, paired, summary_row, table  # noqa: E402
 
 
 def row(seed, mode, outcome, t, jerk, row0=(5.0,), seam=(1.0,), msgs=10.0, accel=None):
@@ -41,7 +43,7 @@ m = summary_row(g[("ck", "module", "async")])
 assert m[0] == "3" and m[1] == "2 (67%)", m
 assert m[2] == "5.00", m  # median of 4, 6
 assert m[3] == "150", m  # null jerk ignored
-assert m[4] == "2.0", m  # pooled seam 1,2,3,4,1
+assert m[4] == "2.0" and m[5] == "3.8", m  # pooled seam 1,2,3,4,1; p95 inclusive
 assert m[7] == "10.0" and m[8] == "1.50", m  # null accel ignored
 assert m[9] == "success 2, timeout 1", m
 c = summary_row(g[("ck", "client", "async")])
@@ -53,6 +55,19 @@ assert cells == {0: {"client/async": True, "module/async": True},
                  1: {"client/async": False, "module/async": True},
                  2: {"module/async": False},
                  3: {"client/async": True}}, cells
-# shared seeds with both jerks: 0 (300-100) and 1 (250-200) -> median 125, client lower on 0/2
-assert lines == ["client/async vs module/async: median Δjerk 125 (client/async lower on 0/2 seeds)"], lines
+# shared seeds 0 and 1; jerk: 300-100, 250-200 -> median 125, client lower 0/2
+assert lines[0] == "client/async vs module/async: median Δjerk 125 (client/async lower on 0/2 seeds)", lines
+# seam per-episode medians: client 1,1 vs module 2,4 -> -1,-3 -> median -2, client lower 2/2
+assert "client/async vs module/async: median Δseam -2.0 (client/async lower on 2/2 seeds)" in lines, lines
+assert len(lines) == 4, lines  # jerk, seam, row0, msgs/s
+
+assert table(["a", "b"], [["1", "2"]]).splitlines()[1] == "|---|---|"
+
+# duplicate seed: first row kept, warning on stderr, empty checkpoint -> "-"
+dup = [{**r, "checkpoint": ""} for r in rows[:3] + [row(0, "module", "timeout", None, 999.0)]]
+err = io.StringIO()
+with contextlib.redirect_stderr(err):
+    gd = group(dup)
+assert list(gd) == [("-", "module", "async")] and len(gd[("-", "module", "async")]) == 3
+assert gd[("-", "module", "async")][0]["jerk_rms"] == 100.0 and "dropped 1" in err.getvalue()
 print("ok")
