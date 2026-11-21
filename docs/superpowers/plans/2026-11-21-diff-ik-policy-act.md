@@ -60,8 +60,9 @@ func TestAutoLeadUsesMedianLag(t *testing.T) {
 	l.lagTicks = 9                           // a spike raised the jump-up estimate
 	l.lagSamples = []float64{3, 3, 4, 3, 9} // but most fits say 3
 	p0, _, _ := FK(m, home)
+	_ = p0
 	tr := newTrajectory(l.now(), 100*time.Millisecond, []spatialmath.Pose{
-		spatialmath.NewPoseFromPoint(p0.Mul(mmPerM)), spatialmath.NewPoseFromPoint(p0.Mul(mmPerM).Add(r3.Vector{X: 10}))})
+		offsetTarget(t, m, home, r3.Vector{}, 0), offsetTarget(t, m, home, r3.Vector{X: 10}, 0)})
 	tr.autoLead = true
 	l.SetTrajectory(tr)
 	runTicks(t, l, 1)
@@ -106,13 +107,13 @@ Note: `runTicks` may itself call `updateLag` and append samples. If it does in t
 
 ## Task 2: `servo_trajectory` reply from the new chunk (Go)
 
-**Files:** Modify `session.go` (`trajectory`, ~line 347), `module.go` (`servoTrajectory` reply); Test `trajectory_test.go` (or the session tests file that already builds a manual `servoManager`; find it with `grep -n "manual: true" *_test.go`).
+**Files:** Modify `session.go` (`trajectory`, ~line 347), `devrel_diff-ik_servo.md`, `README.md`; Test: `session_test.go` (use its `newTestManager`, `mustStart` and `testSessionCfg` helpers).
 
 - [ ] **Step 1: Failing test.** Start a manual pose session the way the existing session tests do, call `sess.trajectory(poses, 100ms, age=50ms, lead=&80ms, blend=0)` with 10 poses, and assert the returned status has `Traj == true`, `TrajLeadMS == 80`, `TrajRemainingMS` within 1 ms of `900 - 50 - 80 = 770`, `TrajEnded == false`. A second call with `lead == nil` must report `TrajLeadMS == loop.Status().LagMedianMS`.
 - [ ] **Step 2: Run** it — fails (reply has `Traj == false`, lead 0).
-- [ ] **Step 3: Implement** in `session.trajectory`, after `s.loop.SetTrajectory(tr)` and before returning: take `st := s.status()` (after `s.mu.Unlock()`, since `status()` locks), compute `lead := tr.lead` or, when `tr.autoLead`, `time.Duration(st.LagMedianMS * float64(time.Millisecond))`; set `st.Traj, st.TrajEnded = true, false`, `st.TrajLeadMS = ms(lead)`, `st.TrajRemainingMS = max(0, ms(tr.end().Sub(now.Add(lead))))`. The module reply already reads these fields.
+- [ ] **Step 3: Implement** in `session.trajectory`, after `s.loop.SetTrajectory(tr)` and before returning: take `st := s.status()` (after `s.mu.Unlock()`, since `status()` locks), compute `lead := tr.lead` or, when `tr.autoLead`, `time.Duration(st.LagMedianMS * float64(time.Millisecond))`; set `st.Traj, st.TrajEnded = true, false`, `st.TrajLeadMS = float64(lead) / float64(time.Millisecond)`, `st.TrajRemainingMS = max(0, float64(tr.end().Sub(now.Add(lead))) / float64(time.Millisecond))`. No module.go change: the reply already reads these fields.
 - [ ] **Step 4: Run** `go test -race ./...`.
-- [ ] **Step 5: Docs.** In `devrel_diff-ik_servo.md` `servo_trajectory` table, `lead_ms` default text becomes: "the session's measured lag (median of recent fits, `lag_median_ms` in status)". Drop "The measured lag currently reads 40–60 ms high, so send it explicitly." Add `lag_median_ms` where status fields are listed. Returns line: "`lead_ms` and `remaining_ms` are the new chunk's."
+- [ ] **Step 5: Docs.** In `devrel_diff-ik_servo.md` `servo_trajectory` table, `lead_ms` default text becomes: "the session's measured lag (median of recent fits, `lag_median_ms` in status)". Drop "The measured lag currently reads 40–60 ms high, so send it explicitly." Add `lag_median_ms` where status fields are listed. Returns line: "`lead_ms` and `remaining_ms` are the new chunk's." In `README.md`, if it mentions sending `lead_ms` explicitly or the high lag reading, update it the same way.
 - [ ] **Step 6: Commit** `git commit -am "servo_trajectory reply reports the new chunk's lead and remaining"`
 
 ## Task 3: Tilted poses in `bc_pick.py`
@@ -168,7 +169,7 @@ def tilt_vector(mag_deg: float, azimuth_deg: float) -> tuple:
 ```
 
   - `sample_scene`: build the existing dict first (same draw order), then `d["tilts"] = {k: tilt_vector(r.uniform(0, TILT_MAX_DEG), r.uniform(0, 360)) for k in TILTED}`.
-  - `minjerk_segment(a, b, ...)`: accept 4- or 6-tuples (pad a 4-tuple with `0.0, 0.0` internally, return the input length); interpolate tx, ty linearly in `m` like x, y, z; the last pose is `b` (with theta `a[3] + dth`, as now).
+  - `minjerk_segment(a, b, ...)`: accept 4- or 6-tuples at either end, padding a 4-tuple with `0.0, 0.0`. The output has 6 elements if **either** end has 6 (so a tilt is never dropped when `cur` is a 4-tuple and the goal is a 6-tuple, or the reverse), else 4. Interpolate tx, ty linearly in `m` like x, y, z; `out[-1]` is `b` padded to the output length (with theta `a[3] + dth`, as now). Add a check: `minjerk_segment((0,0,0,180), (0,0,0,180,4.0,0.0), 1.0, 10)[-1] == (0,0,0,180,4.0,0.0)` and `len(minjerk_segment((0,0,0,180,4.0,0.0), (0,0,0,180), 1.0, 10)[0]) == 6`.
   - `pose_map(p)`: for a 4-tuple or a zero tilt return the exact tool-down map (keeps the existing assert). Otherwise build `R = Rotation.from_rotvec(np.radians([tx, ty, 0])) * down(theta)` where `down(theta)` is `policy_layout._rotation({"o_x": 0, "o_y": 0, "o_z": -1, "theta": theta})` (rename it `rotation` in `policy_layout.py`, keep `_rotation = rotation` so nothing else breaks), then convert to an orientation vector exactly as `policy_layout.chunk_to_poses` does (`RotationMatrix(...).to_quaternion().to_orientation_vector()`), theta in degrees. Import numpy/scipy/policy_layout inside `pose_map` so `bc_pick` stays importable without them for callers that never tilt.
 - [ ] **Step 4: Run** `uv run clients/python/test_bc_pick.py` and `uv run clients/python/test_policy_layout.py` — both `ok`.
 - [ ] **Step 5: Commit** `git commit -am "bc_pick: seed-drawn tool tilts and 6-tuple poses"`
@@ -203,13 +204,14 @@ def start_pose(p0: dict, seed: int) -> tuple:
   - `move()` already passes tuples through `C.minjerk_segment` and `C.pose_map`; make its `dur` use only `cur[:4]`/`goal[:4]` as now. `hold()` passes the 6-tuple to `target()` unchanged.
   - The `StartPoseError` check on `p0` (the session's first pose, at home) is unchanged: home is tool-down.
   - Capture tag `expert:v1` → `expert:v2` (tilted demos).
+  - PEP 723 header: `dependencies = ["viam-sdk", "numpy", "scipy"]` (viam-sdk alone has no scipy; a tilted `pose_map` would raise, and `run()`'s `except Exception` would silently discard every episode).
 - [ ] **Step 3: Run** `uv run clients/python/test_bc_pick.py` and `python3 -c "import ast,sys; ast.parse(open('clients/python/expert_pick.py').read())"`.
 - [ ] **Step 4: Commit** `git commit -am "Expert: tilted transit waypoints; block layout and start pose shared via bc_pick"`
 
 ## Task 5: v3 check (CONTROLLER, machine)
 
 - [ ] Restart `diff-ik-policy-sim` (viam-server with its scratchpad `viam.json`; rebuild `bin/diff-ik` first with `make` so Tasks 1–2 are in), wait until ready.
-- [ ] `uv run clients/python/expert_pick.py run --seeds 9100-9109 --log .runs/v3-check.jsonl ...` (no capture flag; same flags as sub-project 1's dry runs). Expect 10/10 kept.
+- [ ] `uv run clients/python/expert_pick.py run --seeds 9100-9109 ...` (no capture flag; same flags as sub-project 1's dry runs; the log goes to `.runs/policy-sim/expert-bar.jsonl` automatically). Expect 10/10 kept.
 - [ ] Capture 10 tilted episodes into a throwaway dataset `diff-ik-pick-v3-probe`, export, convert locally with the converter branch (`--action-space ee --grippers gripper --gripper-key input --image-size 224`, other flags as in the sub-project 1 results), and read `meta/stats.json`: r02/r12 std near 0.03; gripper column only 0/1. Grab a `scene-cam` frame of a tilted pre-grasp for the user.
 - [ ] **USER CHECK-IN 1:** report 10/10, the stats, the image. Stop the machine while waiting. Delete the probe dataset after approval.
 
@@ -217,7 +219,7 @@ def start_pose(p0: dict, seed: int) -> tuple:
 
 - [ ] Training: seeds 2000–2049, then 2050–2099, each with `--capture v3` and then `add --dataset diff-ik-pick-v3`. Eval: seeds 9100–9129 with `--capture v3-eval`, `add --dataset diff-ik-pick-v3-eval`.
 - [ ] Discarded seeds are recorded, not replaced (the dataset is "kept episodes of these seeds"). If fewer than 95 training episodes survive, report before continuing.
-- [ ] Export both datasets and convert locally (same flags as Task 5) into `.runs/policy-act/v3` and `.runs/policy-act/v3-eval`; run `dev/check_policy_dataset.py` on each.
+- [ ] Export both datasets and convert locally (same flags as Task 5) into `.runs/policy-act/v3` and `.runs/policy-act/v3-eval`; run `dev/check_policy_dataset.py` on each from the converter env (`cd ~/src/viam-sequence-to-lerobot && uv run python /Users/nick.hehr/src/diff-ik/dev/check_policy_dataset.py ...`, as in the sub-project 1 results). `add` also needs `--part-id` (and the other flags it used in sub-project 1).
 - [ ] Append a "v3 dataset" section to `docs/results/2026-11-policy-act.md` (create it with a title and date): counts, discards and reasons, stats for r02/r12 and the gripper, dataset IDs. Commit.
 
 ## Task 7: Shared playback selection
@@ -338,13 +340,13 @@ Interface (all three):
 
 ```python
 class Executor:
-    async def start(self, start_pose: tuple) -> None: ...   # servo to the episode's start pose (6-tuple, arm frame), settle 0.5 s
+    async def start(self, seed: int) -> None: ...            # servo_start, then servo to bc_pick.start_pose(p0, seed) (p0 = the servo_start reply pose), settle 0.5 s
     async def play(self, chunk: dict) -> None: ...           # chunk = {"t_obs", "dt", "poses", "grip"}; returns quickly
     def done_at(self) -> float: ...                          # monotonic time the current chunk finishes playing
     async def close(self) -> dict: ...                       # stop; returns {"state", "peak_accel_ratio", "msgs"}
 ```
 
-Shared: every executor counts arm command messages (`self.msgs`), owns a `GripperScheduler` (an asyncio task that fires `gripper_events` at their times via `gripper.grab()` / `gripper.open()`, replaced wholesale on each `play`, tracking the last commanded state), and starts the episode the same way: `servo_start` (frame `arm_origin`, mode `pose`, `gain` 8, `timeout_ms` 3000, `limits {"linear_mm_s": 300, "angular_deg_s": 90}`), stream `bc_pick.minjerk_segment(cur, start_pose, dur, 30)` as `servo_target`s at 30 Hz (`dur` as in `expert_pick.Episode.move`), hold 0.5 s.
+Shared: every executor counts arm command messages (`self.msgs`), owns a `GripperScheduler` (an asyncio task that fires `gripper_events` at their times via `gripper.grab()` / `gripper.open()`, replaced wholesale on each `play`, tracking the last commanded state), and starts the episode the same way: `servo_start` (frame `arm_origin`, mode `pose`, `gain` 8, `timeout_ms` 3000, `limits {"linear_mm_s": 300, "angular_deg_s": 90}`), `p0` = its reply pose, `goal = bc_pick.start_pose(p0, seed)`, stream `bc_pick.minjerk_segment((p0["x"], p0["y"], p0["z"], p0["theta"]), goal, dur, 30)` as `servo_target`s at 30 Hz (`dur` as in `expert_pick.Episode.move`), hold 0.5 s.
 
 - [ ] **ModuleExec(svc, gripper, arm_name, lead_ms, blend_ms=200):** keeps the start session. `play`: one `servo_trajectory` with `poses`, `dt_ms = dt*1000`, `age_ms = (now - t_obs)*1000`, `blend_ms`, and `lead_ms` unless `lead_ms is None` (auto); gripper events with `lead = reply["lead_ms"]/1000`. `close`: `servo_status` (for `peak_accel_ratio`) then `servo_stop`.
 - [ ] **ClientExec(svc, gripper, arm_name, lead_ms, blend_ms=200):** keeps the start session; a 30 Hz task sends `servo_target` with `playback.blended(cur, prev, now + lead, w, sample_chunk, mix_pose)`, `w = min(1, (now - switch_t)/blend_s)`; past the chunk's end it holds the last row (`sample_chunk` clamps). `play` swaps `prev, cur` and resets `switch_t`.
@@ -360,16 +362,16 @@ CLI:
 
 ```
 uv run clients/python/policy_run.py --address <addr> --mode module|client|move --cadence sync|async \
-    --replan-every 10 --lead-ms 100|auto --seeds 9100-9129 --out .runs/eval/<name>.jsonl [--timeout-s 30]
+    --replan-every 10 --lead-ms 100|auto --seeds 9100-9129 --out .runs/eval/<name>.jsonl [--timeout-s 30] [--checkpoint-label <text>]
 ```
 
-- [ ] Episode (per seed): world `reset` + `set_prop_pose(bc_pick.block_pose(seed))`; `gripper.open()`; executor `start(bc_pick.start_pose(p0, seed))` where `p0` is the `servo_start` reply pose; then loop:
+- [ ] Episode (per seed): world `reset` + `set_prop_pose(bc_pick.block_pose(seed))`; `gripper.open()`; `await executor.start(seed)`; then loop:
   1. Observe: both cameras via `get_images`, resized to `specs["input_features"][key]` (existing code); `arm.get_end_position()`; gripper `{"command": "position"}` → **`input`** (not `position`) into `state_vector(pose, input)`; `t_obs = time.monotonic()`.
   2. Infer with a 5 s `asyncio.wait_for`; `chunk_to_poses(rows)` → poses + gripper column; record `row0_to_state_mm`.
   3. Before `play`, if a chunk is playing, record the seam gap: `math.dist` of `sample_chunk(old, now)` and `sample_chunk(new, now)` positions.
   4. `executor.play(chunk)`.
   5. Sync: sleep until `executor.done_at()`. Async: sleep until `t_obs + replan_every * dt`.
-  6. Every loop, check success: two `get_prop_pose` reads 0.3 s apart plus the gripper `input`; `succeeded(...)` ends the episode. Timeout ends it at `--timeout-s`.
+  6. Success is checked by a side task (so it doesn't delay the async cadence): every 0.3 s it reads `get_prop_pose` and the gripper `input` and calls `succeeded(previous_read, this_read, input)`; a success ends the episode. Timeout ends it at `--timeout-s`.
   - A side task samples `arm.get_end_position()` at 30 Hz into `(t, x, y, z)` for `jerk_rms`.
   - Failures per spec "Error handling" (`infer`, session state, `plan`, `gripper`) end the episode with that `outcome`; the run continues with the next seed. Abort the run only if the machine is unreachable or `specs` don't match (existing checks).
 - [ ] JSONL row per episode: `seed, mode, cadence, replan_every, lead_ms, success, outcome, t_success_s, msgs_per_s, peak_accel_ratio, jerk_rms, row0_to_state_mm (list), seam_gap_mm (list), infer_s (list), chunks, checkpoint` (`checkpoint` from `--checkpoint-label`, free text).
@@ -404,7 +406,7 @@ uv run clients/python/policy_run.py --address <addr> --mode module|client|move -
 ## Task 14: Training script PR (`~/src/viam-lerobot-training`)
 
 - [ ] On a new branch `action-space-ee`:
-  - `lerobot-training/model/args.py`: `p.add_argument("--action_space", default="joint", choices=["joint", "ee"])` (match the converter's name for the default; check its CLI), passed into the conversion config where `gripper_key` is passed.
+  - `lerobot-training/model/args.py`: `p.add_argument("--action_space", default="joints", choices=["joints", "ee"])` (the converter's names; `ConversionConfig` rejects others, convert.py ~87). Pass it into the conversion config in `lerobot-training/model/training.py` (~line 54), where `gripper_key` is passed.
   - `cloud.py` preflight (~line 146): when `action_space == "ee"`, require `(arm, "EndPosition")` instead of `(arm, "JointPositions")`.
   - `container/Dockerfile`: `ARG CONVERTER_REF=<merged commit>` — leave a `TODO-after-merge` placeholder only in the PR description, and set the SHA once the converter PR merges.
   - README section 2 table: add `action_space`.
@@ -414,7 +416,7 @@ uv run clients/python/policy_run.py --address <addr> --mode module|client|move -
 
 ## Task 15: vla:policy LeRobot bump (`~/src/viam-vla-inference-service`)
 
-- [ ] Branch `lerobot-02655292`: bump the LeRobot pin to `02655292cdadd7dd2f8fc5daa31a7437b44354ee`; fix import/API drift; run its tests; load the local Task 12 checkpoint **without** the compat strip through the module locally (point `vla-policy` at the run-from-source module) and run 3 eval seeds.
+- [ ] Branch `lerobot-02655292`: bump the LeRobot pin to `02655292cdadd7dd2f8fc5daa31a7437b44354ee`; fix import/API drift; run its tests. **CONTROLLER (machine):** load the local Task 12 checkpoint **without** the compat strip through the module run from source (point `vla-policy` at it) and run 3 eval seeds.
 - [ ] If the drift is large (more than an afternoon), stop, report, and switch to the export strip in Task 14.
 - [ ] **CONTROLLER + USER OK:** push, open the PR. A module release after merge is also publishing: ask.
 
@@ -432,7 +434,7 @@ viam train submit custom from-registry --dataset-id=<diff-ik-pick-v3 id> --org-i
 
   Check the args against the README table before submitting: a job on the default `gripper_key=position` or `action_space=joint` is a wasted billed run.
 - [ ] Watch `viam train logs`; on completion, deploy the model package to `vla-policy` (`dev/bc-pick-mujoco.json` and the machine config: the registry package instead of `model_path`), commit the config.
-- [ ] Cloud gate: `policy_run.py --mode module --cadence sync --lead-ms <Task 12 value> --seeds 9100-9129 --checkpoint-label cloud`. ≥21/30 passes. Below: the spec's fallbacks, each with the user's OK.
+- [ ] Cloud gate: `policy_run.py --mode module --cadence sync --lead-ms <Task 12 value> --seeds 9100-9129 --checkpoint-label cloud`. ≥21/30 passes. If it lands well short of the local checkpoint, compare the two training configs (`train_metadata.json` against the local `train_config.json`) before anything else. Otherwise below 21: the spec's fallbacks, each with the user's OK.
 - [ ] Results section "Cloud ACT". **USER CHECK-IN 5.**
 
 ## Task 17: v0.4.1 (CONTROLLER + USER OK)
