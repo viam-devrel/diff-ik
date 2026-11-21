@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["viam-sdk", "numpy", "scipy"]
+# dependencies = ["viam-sdk", "numpy", "scipy", "pillow"]
 # ///
 """Policy runner for the pick-to-bin cell. Sub-project 1 has only --once: one observation, one infer, one
 servo_trajectory, to prove the layout and the command end to end.
@@ -10,6 +10,7 @@ servo_trajectory, to prove the layout and the command end to end.
 import argparse
 import asyncio
 import base64
+import io
 import json
 import math
 import os
@@ -42,6 +43,8 @@ async def once(a):
             raise SystemExit(f"policy wants image keys {keys}, cell has {list(CAMERAS)}")
         if specs.get("state_dim") != 10 or specs.get("action_dim") != 10:
             raise SystemExit(f"policy state/action dims {specs.get('state_dim')}/{specs.get('action_dim')}, want 10/10")
+        from PIL import Image
+
         t_obs = time.monotonic()
         images = {}
         for key, cam in CAMERAS.items():
@@ -50,9 +53,13 @@ async def once(a):
             mime = getattr(img, "mime_type", "image/jpeg")
             if mime not in MIME_ENC:
                 raise SystemExit(f"{cam}: unsupported image mime type {mime!r}")
-            enc = MIME_ENC[mime]
-            images[key] = {"encoding": enc, "data": base64.b64encode(img.data).decode(),
-                           "height": img.height, "width": img.width, "channels": 3}
+            # the policy service does not resize; train frames were bicubic-resized to the input shape
+            _, h, w = (int(v) for v in specs["input_features"][key])  # struct numbers arrive as floats
+            buf = io.BytesIO()
+            Image.open(io.BytesIO(img.data)).convert("RGB").resize((w, h), Image.Resampling.BICUBIC).save(
+                buf, "JPEG", quality=95)
+            images[key] = {"encoding": "jpeg", "data": base64.b64encode(buf.getvalue()).decode(),
+                           "height": h, "width": w, "channels": 3}
         p = await arm.get_end_position()
         g = (await grip.do_command({"command": "position"}))["position"]
         pose = {"x": p.x, "y": p.y, "z": p.z, "o_x": p.o_x, "o_y": p.o_y, "o_z": p.o_z, "theta": p.theta}

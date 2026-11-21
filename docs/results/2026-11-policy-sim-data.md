@@ -110,6 +110,10 @@ Date 2026-11-21. Laptop viam-server v1.17.0, `viam` CLI 1.17.0, viam-sdk 0.85+.
   so the arm casts a visible shadow on the table. Fill, rim, headlight, sky, shadow size and antialias unchanged.
 - Renders: `.runs/policy-sim/renders/v2-{overview,scene-cam,wrist-cam}.jpg` (not committed).
 
+### Check-in 2
+The user reviewed the 5-episode grid (all successes) and switched the instruction to "Pick up the red block and place it in
+the bin", so capture restarted as `diff-ik-pick-v2` (v1's 5 episodes are unused).
+
 ## Task 4: scripted expert and the expert bar
 
 - `clients/python/expert_pick.py run` (no capture). First episode (seed 1000) kept with no constant changes; the plan's
@@ -185,6 +189,15 @@ Run: `cd ~/src/viam-sequence-to-lerobot && uv run python ~/src/diff-ik/dev/check
 - The gripper action is ~100 open and ~44 holding, never near 0. A runner must treat values below ~70 as "close"; a 30/70
   hysteresis with "close below 30" would never close.
 - action == next state is by construction (a layout check), not evidence of data quality.
+- **Decide before training:** r02 and r12 are near-constant (std ~0.002 / 0.001 in `meta/stats.json`; the tool is always down),
+  so mean/std normalization makes small tilts look 5-10 sigma out of distribution. Options: clamp the std in normalization, add
+  slight orientation randomization to the expert, or check servo tilt.
+- **Decide before training:** the gripper action is the next tick's measured jaw (ramps, ~44 when holding). The latched command
+  `input` (0/1) is captured in the same DoCommand output, so `--gripper-key input` would give a clean binary action.
+- The first chunk from home starts 200-345 mm from the state; plan a warm-up or blending for the first chunk.
+- 50 episodes is thin for the randomization. 20 spare captured seeds (1050-1064, 9010-9014) exist; adding them changes v2's contents.
+- A direct `infer` caller must resize images to the policy's input size (done in `policy_run.py` now).
+- `dev/bc-pick-mujoco.json`'s `vla-policy` points at a gitignored local checkpoint, so a fresh clone shows that service failing.
 
 ### Smoke test (Task 9): local ACT -> `viam-labs:vla:policy` -> `servo_trajectory`
 - **Training env:** `lerobot[training]` at 02655292 needs **Python 3.12** (the plan's 3.11 fails to resolve); venv
@@ -219,8 +232,25 @@ Run: `cd ~/src/viam-sequence-to-lerobot && uv run python ~/src/diff-ik/dev/check
 {"rows": 20, "row_width": 10, "infer_s": 0.22598170908167958, "first": {"x": 555.5869750976562, "y": -71.89149475097656, "z": 218.45579528808594, "o_x": 0.00045088854810002433, "o_y": 0.00033252964844739216, "o_z": -0.9999998430617627, "theta": 27.549262871274024}, "last": {"x": 555.3858642578125, "y": -78.68677520751953, "z": 222.17494201660156, "o_x": 4.877292441941769e-05, "o_y": 0.0005731078954688373, "o_z": -0.9999998345842573, "theta": 24.1402116088017}, "max_step_mm": 7.4168779699635925, "gripper_col": [96.9, 97.0, 96.7, 96.5, 96.6], "start_xyz": [491.99782177812176, 134.0032471009216, 488.00036731899365], "end_xyz": [536.9462407740183, -15.058042091240765, 301.05189956584456], "row0_to_state_mm": 345.09491658597386, "row_last_to_end_mm": 103.00587276671077, "trajectory_reply_state": "idle", "lead_ms": 0.0, "remaining_ms": 0.0, "status_state": "running", "trajectory_ended": true, "stop_state": "stopped", "peak_accel_ratio": 1.0000000000000009}
 ```
   The first pose is **345 mm** from the observed state; the last pose is 103 mm from where the arm stopped (the arm was still
-  travelling when the session ended). `lead_ms` and `remaining_ms` read 0.0 in the reply (the chunk was already due, since
-  the start was far from row 0); not investigated.
+  travelling when the session ended). `lead_ms` and `remaining_ms` read 0.0 in the reply, and that is stale, not "the chunk was
+  already due": `servo_trajectory`'s reply is the session status from before the loop's next tick samples the new chunk
+  (session.go `trajectory` returns `s.status()`). Poll `servo_status` after a tick for real values. **diff-ik module fix for
+  later:** the reply should report the new chunk's lead and remaining.
+
+### Image resize fix and re-run
+- The policy was trained on 224 x 224 images (the converter bicubic-resized the 448 x 448 JPEG frames), and the
+  `viam-labs:vla:policy` service does not resize (only the vla controller does). `policy_run.py` sent the raw 448 px frames.
+  It now reads `specs["input_features"][key]` (`[3, 224, 224]`; the numbers arrive as floats, so they are cast to int),
+  decodes each frame with PIL, resizes with `Image.Resampling.BICUBIC`, re-encodes as JPEG (quality 95) and sends the
+  resized height/width. `pillow` is in the script's PEP 723 dependencies.
+- Raw `--once` output after the fix (world reset first):
+```json
+{"rows": 20, "row_width": 10, "infer_s": 0.06981862522661686, "first": {"x": 526.2438354492188, "y": 127.3753890991211, "z": 289.6628112792969, "o_x": 0.00027421354335713135, "o_y": -8.497370972979329e-06, "o_z": -0.9999999623673631, "theta": -85.72103851388643}, "last": {"x": 529.8375244140625, "y": 117.0950698852539, "z": 284.0704650878906, "o_x": 0.00010193396357379542, "o_y": -1.5096805078150586e-06, "o_z": -0.999999994803594, "theta": -84.21211245948105}, "max_step_mm": 7.144071406032352, "gripper_col": [105.7, 105.6, 105.5, 106.1, 105.5], "start_xyz": [491.99782185253866, 134.0032471039886, 488.00036671669], "end_xyz": [528.2601404377351, 118.5457964178278, 293.26250736846293], "row0_to_state_mm": 201.38148833961296, "row_last_to_end_mm": 9.438558627720509, "trajectory_reply_state": "idle", "lead_ms": 0.0, "remaining_ms": 0.0, "status_state": "running", "trajectory_ended": true, "stop_state": "stopped", "peak_accel_ratio": 1.0000000000000437}
+```
+  `row0_to_state_mm` fell from **345 to 201**, matching the offline home-frame check (199 mm), and the arm ended 9.4 mm from
+  the chunk's last pose (was 103 mm). So the 448 px input was part of the earlier miss; the remaining gap is the undertrained
+  300-step policy. The gripper column reads ~105 (an undertrained policy extrapolating past 100); harmless for `--once`,
+  which does not command the gripper. `lead_ms`/`remaining_ms` 0.0 is the stale-reply issue above.
 
 ### Offline frame check (training frames through `infer`)
 Three frames of `local/diff-ik-pick-v2` (JPEG-encoded images, state, task) sent to `vla-policy` `infer`; distances in mm
@@ -251,8 +281,9 @@ scratchpad `frame_check.py` (not committed).
 - Converter (`viam-sequence-to-lerobot`): branch `diff-ik-policy-sim` from `bimanual`, commits `6eae2ce` (`--action-space ee`)
   and `03f5a1c` (review follow-ups).
 - `viam:capture-control` 0.1.1; `viam-labs:vla` 0.3.0; viam-server v1.17.0.
-- LeRobot `02655292` with Python 3.12 for training; the module's bundled LeRobot is older, so the smoke checkpoint needed the
-  compat `config.json` (the `dtype` and `optimizer_fused` fields stripped).
+- Training LeRobot `02655292cdadd7dd2f8fc5daa31a7437b44354ee` (Python >= 3.12) vs the vla 0.3.0 module's bundled LeRobot
+  (`ff7cc3de`, 0.6.2; see `~/src/viam-vla-inference-service/pyproject.toml`). Checkpoints from the former need `dtype` and
+  `optimizer_fused` stripped from `config.json` to load in the latter.
 
 ### Tests (all green)
 - `test_bc_pick.py`: ok; `test_policy_layout.py`: ok.
@@ -261,7 +292,7 @@ scratchpad `frame_check.py` (not committed).
 - diff-ik `go build ./...`: ok (no Go changes).
 
 ### Done when (spec)
-1. Cell runs on the patched mujoco-sim; tuned visuals approved (visual fix, Task 2).
+1. Cell runs on the patched mujoco-sim; tuned visuals approved by the user for v2 after one fix pass (natural wood grain, key light angled for table shadows; Task 2).
 2. Expert 20/20 over seeds 1000-1019 (>= 95%).
 3. `diff-ik-pick-v2` 50 episodes, `diff-ik-pick-v2-eval` 10; card above.
 4. `ee` mode tested; datasets load, 0 NaNs, gripper bimodal, ranges match the randomization.
