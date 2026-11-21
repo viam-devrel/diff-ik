@@ -369,7 +369,7 @@ uv run clients/python/policy_run.py --address <addr> --mode module|client|move -
   3. Before `play`, if a chunk is playing, record the seam gap: `math.dist` of `sample_chunk(old, now)` and `sample_chunk(new, now)` positions.
   4. `executor.play(chunk)`.
   5. Sync: sleep until `executor.done_at()`. Async: sleep until `t_obs + replan_every * dt`.
-  6. Success is checked by a side task (so it doesn't delay the async cadence): every 0.3 s it reads `get_prop_pose` and the gripper `input` and calls `succeeded(previous_read, this_read, input)`; a success ends the episode. Timeout ends it at `--timeout-s`.
+  6. Success is checked by a side task (so it doesn't delay the async cadence): every 0.3 s it reads `get_prop_pose` and the gripper `input` and calls `succeeded(previous_read, this_read, input)` once two reads exist; a success ends the episode. Timeout ends it at `--timeout-s`.
   - A side task samples `arm.get_end_position()` at 30 Hz into `(t, x, y, z)` for `jerk_rms`.
   - Failures per spec "Error handling" (`infer`, session state, `plan`, `gripper`) end the episode with that `outcome`; the run continues with the next seed. Abort the run only if the machine is unreachable or `specs` don't match (existing checks).
 - [ ] JSONL row per episode: `seed, mode, cadence, replan_every, lead_ms, success, outcome, t_success_s, msgs_per_s, peak_accel_ratio, jerk_rms, row0_to_state_mm (list), seam_gap_mm (list), infer_s (list), chunks, checkpoint` (`checkpoint` from `--checkpoint-label`, free text).
@@ -430,7 +430,7 @@ viam train submit custom from-registry --dataset-id=<diff-ik-pick-v3 id> --org-i
   --args=arm=arm,grippers=gripper,gripper_key=input,action_space=ee,cameras="'scene-cam wrist-cam'",image_size=224,fps=10,policy=act,steps=20000,batch_size=8,extra="'--policy.chunk_size=20 --policy.n_action_steps=20'"
 ```
 
-  Check the args against the README table before submitting: a job on the default `gripper_key=position` or `action_space=joint` is a wasted billed run.
+  Check the args against the README table before submitting: a job on the default `gripper_key=position` or `action_space=joints` is a wasted billed run.
 - [ ] Watch `viam train logs`; on completion, deploy the model package to `vla-policy` (`dev/bc-pick-mujoco.json` and the machine config: the registry package instead of `model_path`), commit the config.
 - [ ] Cloud gate: `policy_run.py --mode module --cadence sync --lead-ms <Task 12 value> --seeds 9100-9129 --checkpoint-label cloud`. ≥21/30 passes. If it lands well short of the local checkpoint, compare the two training configs (`train_metadata.json` against the local `train_config.json`) before anything else. Otherwise below 21: the spec's fallbacks, each with the user's OK.
 - [ ] Results section "Cloud ACT". **USER CHECK-IN 5.**
