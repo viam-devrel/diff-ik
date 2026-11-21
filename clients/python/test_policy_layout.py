@@ -21,6 +21,12 @@ poses, grip = chunk_to_poses([s])
 s2 = state_vector(poses[0], grip[0])
 np.testing.assert_allclose(s2, s, atol=1e-6)
 
+# exactly at the tool-down pole (every pose in the dataset sits near it)
+pole = {"x": 550.0, "y": 0.0, "z": 85.0, "o_x": 0.0, "o_y": 0.0, "o_z": -1.0, "theta": 137.0}
+sp = state_vector(pole, 44.0)
+pp, gp = chunk_to_poses([sp])
+np.testing.assert_allclose(state_vector(pp[0], gp[0]), sp, atol=1e-6)
+
 # noisy rotation rows (a policy's raw output) still give a valid pose
 noisy = list(s)
 noisy[3:9] = [v * 1.07 + 0.01 for v in noisy[3:9]]
