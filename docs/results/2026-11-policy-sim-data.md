@@ -66,3 +66,17 @@ Date 2026-11-21. Laptop viam-server v1.17.0, `viam` CLI 1.17.0, viam-sdk 0.85+.
 ### Gaps / next
 - Probe config on the machine: `sim-world` + `block`, `arm` (ur5e at z 400), `gripper` (2f85, z 155.8),
   `scene-cam`/`wrist-cam` 448 x 448, `demo-capture`, `data-manager`.
+
+## Task 1: gripper reading and export fix
+
+- mujoco-sim branch `diff-ik-policy-sim` (from 0.20.0), two commits: `{"command": "position"}` on the gripper
+  (`{"position": 0-100, 100 = open, "input": 0|1}`; no `{}` alias) and `captured_at` on camera `get_images`
+  (it returned an empty `ResponseMetadata`, so images looked like 1970 and fell outside the sequence window).
+  Tests: gripper + camera 41 passed.
+- The machine now runs the local module `/Users/nick.hehr/src/viam-mujoco-sim/run.sh` (a `local` module entry must not
+  carry `module_id`); the gripper's `docommand_input` is `{"command": "position"}`.
+- Export check (11 s capture at 10 Hz, tag `probe:export-fix`, exported ~1 min later): `binary_data.parquet` has
+  **111 rows each for `scene-cam` and `wrist-cam`**, 222 image files under `binary_data/`; `tabular_data.parquet` has
+  222 `arm` rows (JointPositions + EndPosition) and **111 `gripper` rows** with `docommand_output.position`
+  (99.67 open, `input` 0.0). The fix works. The probe dataset was deleted with the CLI.
+- Start/stop commands on `demo-capture` are `{"start_capture": true, "frequency_hz": N, "tags": [...]}` and `{"stop_capture": true}`.
