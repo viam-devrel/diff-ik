@@ -2,10 +2,11 @@
 # requires-python = ">=3.11"
 # dependencies = ["viam-sdk", "numpy", "scipy", "pillow"]
 # ///
-"""Policy runner for the pick-to-bin cell. Sub-project 1 has only --once: one observation, one infer, one
-servo_trajectory, to prove the layout and the command end to end.
+"""Closed-loop policy runner for the pick-to-bin cell: one JSONL row per episode.
 
-  uv run clients/python/policy_run.py --address <addr> --once --lead-ms 200
+  uv run clients/python/policy_run.py --address <addr> --mode module --cadence async --replan-every 10 \\
+      --lead-ms auto --seeds 9100-9129 --out .runs/eval/module-async.jsonl
+  uv run clients/python/policy_run.py --address <addr> --once     # one seed, one chunk, module/sync
 """
 import argparse
 import asyncio
@@ -18,97 +19,269 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bc_pick  # noqa: E402
+from policy_exec import ClientExec, ModuleExec, MoveExec, jerk_rms, sample_chunk, succeeded  # noqa: E402
 from policy_layout import chunk_to_poses, state_vector  # noqa: E402
 
 CAMERAS = {"observation.images.scene_cam": "scene-cam", "observation.images.wrist_cam": "wrist-cam"}
 MIME_ENC = {"image/jpeg": "jpeg", "image/png": "png"}
+TASK = "Pick up the red block and place it in the bin"
+DT = 0.1
+INFER_TIMEOUT_S = 5.0
 
 
-async def once(a):
+# --- pure parts ---
+
+
+def seed_range(s: str) -> list:
+    lo, _, hi = s.partition("-")
+    return list(range(int(lo), int(hi or lo) + 1))
+
+
+def parse_lead(s: str, mode: str):
+    """--lead-ms: 'auto' (module only) -> None, else a number of ms."""
+    if s == "auto":
+        if mode != "module":
+            raise ValueError("--lead-ms auto is only valid with --mode module")
+        return None
+    return float(s)
+
+
+def outcome_from(errors, close_state, success: bool, infer_failed: bool) -> str:
+    """infer > session (the state close() reports) > plan > gripper > success > timeout."""
+    kinds = [k for k, _ in errors]
+    if infer_failed:
+        return "infer"
+    if "session" in kinds:
+        return str(close_state)
+    for k in ("plan", "gripper"):
+        if k in kinds:
+            return k
+    return "success" if success else "timeout"
+
+
+def episode_row(*, seed, mode, cadence, replan_every, lead_ms, outcome, t_success_s, duration_s, close,
+                jerk, row0_to_state_mm, seam_gap_mm, infer_s, chunks, checkpoint, errors) -> dict:
+    return {
+        "seed": seed, "mode": mode, "cadence": cadence, "replan_every": replan_every, "lead_ms": lead_ms,
+        "success": outcome == "success", "outcome": outcome, "t_success_s": t_success_s,
+        "msgs_per_s": close["msgs"] / duration_s if duration_s > 0 else None,
+        "peak_accel_ratio": close.get("peak_accel_ratio"),
+        "jerk_rms": None if jerk != jerk else jerk,  # NaN -> null: strict JSON
+        "row0_to_state_mm": list(row0_to_state_mm), "seam_gap_mm": list(seam_gap_mm), "infer_s": list(infer_s),
+        "chunks": chunks, "checkpoint": checkpoint, "errors": [list(e) for e in errors],
+    }
+
+
+# --- I/O ---
+
+
+async def race(ev, timeout, coro=None):
+    """Wait for ev, coro (re-raising its error) or the timeout, whichever is first."""
+    tasks = {asyncio.ensure_future(ev.wait())}
+    if coro is not None:
+        tasks.add(asyncio.ensure_future(coro))
+    done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED)
+    for p in pending:
+        p.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for d in done:
+        d.result()
+
+
+async def observe(a, cams, arm, grip, specs):
+    """(t_obs, images, pose, gripper input). The model was trained on the latched 0/1 command: `input`."""
+    from PIL import Image
+
+    t_obs = time.monotonic()
+    images = {}
+    for key, cam in cams.items():
+        imgs, _ = await cam.get_images()
+        img = imgs[0]
+        mime = getattr(img, "mime_type", "image/jpeg")
+        if mime not in MIME_ENC:
+            raise RuntimeError(f"{cam.name}: unsupported image mime type {mime!r}")
+        # the policy service does not resize; train frames were bicubic-resized to the input shape
+        _, h, w = (int(v) for v in specs["input_features"][key])  # struct numbers arrive as floats
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(img.data)).convert("RGB").resize((w, h), Image.Resampling.BICUBIC).save(
+            buf, "JPEG", quality=95)
+        images[key] = {"encoding": "jpeg", "data": base64.b64encode(buf.getvalue()).decode(),
+                       "height": h, "width": w, "channels": 3}
+    p = await arm.get_end_position()
+    g = (await grip.do_command({"command": "position"}))["input"]
+    pose = {"x": p.x, "y": p.y, "z": p.z, "o_x": p.o_x, "o_y": p.o_y, "o_z": p.o_z, "theta": p.theta}
+    return t_obs, images, pose, g
+
+
+async def success_task(world, grip, t0, ev, out):
+    prev = None
+    while True:
+        try:
+            r = await world.do_command({"command": "get_prop_pose", "prop": "block"})
+            xyz = tuple(v * 1000 for v in r["pose"]["position"])
+            g = (await grip.do_command({"command": "position"}))["input"]
+            if prev is not None and succeeded(prev, xyz, g):
+                out["t_success_s"] = time.monotonic() - t0
+                ev.set()
+                return
+            prev = xyz
+        except Exception:  # noqa: BLE001 - a missed read is just a missed sample
+            pass
+        await asyncio.sleep(0.3)
+
+
+async def jerk_task(arm, samples):
+    while True:
+        t = time.monotonic()
+        try:
+            p = await arm.get_end_position()
+            samples.append((t, p.x, p.y, p.z))
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(max(0.0, 1 / 30 - (time.monotonic() - t)))
+
+
+async def run_episode(a, c, seed) -> dict:
+    ex = c["make_exec"]()
+    errors_extra, infer_s, row0, seam, samples, st = [], [], [], [], [], {"t_success_s": None}
+    ev, chunks, old, t0, duration = asyncio.Event(), 0, None, time.monotonic(), 0.0
+    tasks, close = [], {"state": None, "peak_accel_ratio": None, "msgs": 0}
+    try:
+        try:
+            await c["world"].do_command({"command": "reset"})
+            pos, q = bc_pick.block_pose(seed)
+            await c["world"].do_command({"command": "set_prop_pose", "prop": "block", "position": pos,
+                                         "orientation_wxyz": q})
+            await c["gripper"].open()
+            await ex.start(seed)
+            t0 = time.monotonic()
+            tasks = [asyncio.create_task(success_task(c["world"], c["side_grip"], t0, ev, st)),
+                     asyncio.create_task(jerk_task(c["side_arm"], samples))]
+            while not ev.is_set() and time.monotonic() - t0 < a.timeout_s and not ex.errors:
+                if a.once and chunks >= 1:
+                    break
+                try:
+                    t_obs, images, pose, g = await observe(a, c["cams"], c["arm"], c["grip"], c["specs"])
+                    t_inf = time.monotonic()
+                    r = await asyncio.wait_for(c["policy"].do_command(
+                        {"command": "infer", "images": images, "state": {"values": state_vector(pose, g)},
+                         "task": TASK}), INFER_TIMEOUT_S)
+                    infer_s.append(time.monotonic() - t_inf)
+                    poses, gcol = chunk_to_poses(r["actions"]["rows"])
+                except Exception as e:  # noqa: BLE001 - timeouts included
+                    errors_extra.append(("infer", repr(e)))
+                    break
+                chunk = {"t_obs": t_obs, "dt": DT, "poses": poses, "grip": gcol}
+                row0.append(math.dist([poses[0][k] for k in "xyz"], [pose[k] for k in "xyz"]))
+                if old is not None:
+                    now = time.monotonic()
+                    seam.append(math.dist([sample_chunk(old, now)[k] for k in "xyz"],
+                                          [sample_chunk(chunk, now)[k] for k in "xyz"]))
+                await ex.play(chunk)
+                old, chunks = chunk, chunks + 1
+                left = a.timeout_s - (time.monotonic() - t0)
+                if a.cadence == "sync":
+                    await race(ev, left, ex.wait_done())
+                else:
+                    await race(ev, min(left, t_obs + a.replan_every * DT - time.monotonic()))
+            duration = time.monotonic() - t0
+        except Exception as e:  # noqa: BLE001 - an executor (or setup) failure ends this episode only
+            duration = time.monotonic() - t0
+            if not any(k == "session" for k, _ in ex.errors):
+                ex.errors.append(("session", repr(e)))
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            close = await ex.close()
+        except Exception as e:  # noqa: BLE001
+            close = {"state": f"close_failed: {e!r}", "peak_accel_ratio": None, "msgs": ex.msgs}
+    errors = list(ex.errors) + errors_extra
+    outcome = outcome_from(errors, close["state"], ev.is_set(), bool(errors_extra))
+    if a.once and outcome == "timeout":
+        outcome = "once"
+    return episode_row(
+        seed=seed, mode=a.mode, cadence=a.cadence, replan_every=a.replan_every, lead_ms=a.lead_ms, outcome=outcome,
+        t_success_s=st["t_success_s"], duration_s=duration, close=close, jerk=jerk_rms(samples),
+        row0_to_state_mm=row0, seam_gap_mm=seam, infer_s=infer_s, chunks=chunks, checkpoint=a.checkpoint_label,
+        errors=errors)
+
+
+async def main_async(a):
     from viam.components.arm import Arm
     from viam.components.camera import Camera
     from viam.components.gripper import Gripper
     from viam.services.generic import Generic
     from viam.services.motion import MotionClient
 
-    from bc_pick import connect
-
-    (robot,) = await connect(a.address, a.insecure, 1)
+    servo_r, obs_r, side_r = await bc_pick.connect(a.address, a.insecure, 3)
     try:
-        arm, grip = Arm.from_robot(robot, a.arm), Gripper.from_robot(robot, a.gripper)
-        policy, svc = Generic.from_robot(robot, a.policy), MotionClient.from_robot(robot, a.service)
+        policy, world = Generic.from_robot(obs_r, a.policy), Generic.from_robot(obs_r, a.world)
         specs = await policy.do_command({"command": "specs"})
         keys = specs["image_feature_keys"]
         if set(keys) != set(CAMERAS):
             raise SystemExit(f"policy wants image keys {keys}, cell has {list(CAMERAS)}")
         if specs.get("state_dim") != 10 or specs.get("action_dim") != 10:
             raise SystemExit(f"policy state/action dims {specs.get('state_dim')}/{specs.get('action_dim')}, want 10/10")
-        from PIL import Image
-
-        t_obs = time.monotonic()
-        images = {}
-        for key, cam in CAMERAS.items():
-            imgs, _ = await Camera.from_robot(robot, cam).get_images()
-            img = imgs[0]
-            mime = getattr(img, "mime_type", "image/jpeg")
-            if mime not in MIME_ENC:
-                raise SystemExit(f"{cam}: unsupported image mime type {mime!r}")
-            # the policy service does not resize; train frames were bicubic-resized to the input shape
-            _, h, w = (int(v) for v in specs["input_features"][key])  # struct numbers arrive as floats
-            buf = io.BytesIO()
-            Image.open(io.BytesIO(img.data)).convert("RGB").resize((w, h), Image.Resampling.BICUBIC).save(
-                buf, "JPEG", quality=95)
-            images[key] = {"encoding": "jpeg", "data": base64.b64encode(buf.getvalue()).decode(),
-                           "height": h, "width": w, "channels": 3}
-        p = await arm.get_end_position()
-        g = (await grip.do_command({"command": "position"}))["position"]
-        pose = {"x": p.x, "y": p.y, "z": p.z, "o_x": p.o_x, "o_y": p.o_y, "o_z": p.o_z, "theta": p.theta}
-        state = state_vector(pose, g)
-        r = await policy.do_command({"command": "infer", "images": images, "state": {"values": state},
-                                     "task": "Pick up the red block and place it in the bin"})
-        rows = r["actions"]["rows"]
-        poses, gcol = chunk_to_poses(rows)
-        sid = (await svc.do_command({"command": "servo_start", "component_name": a.arm, "frame": "arm_origin",
-                                     "mode": "pose", "timeout_ms": 2000}))["session_id"]
-        stop = {}
-        try:
-            res = await svc.do_command({"command": "servo_trajectory", "session_id": sid, "poses": poses,
-                                        "dt_ms": 1000 / a.rate_hz, "age_ms": (time.monotonic() - t_obs) * 1000,
-                                        "lead_ms": a.lead_ms})
-            await asyncio.sleep(len(poses) / a.rate_hz + 0.5)
-            st = await svc.do_command({"command": "servo_status", "session_id": sid})
-        finally:
-            stop = await svc.do_command({"command": "servo_stop", "session_id": sid})
-        q = await arm.get_end_position()
-        steps = [math.dist([a_["x"], a_["y"], a_["z"]], [b["x"], b["y"], b["z"]]) for a_, b in zip(poses, poses[1:])]
-        xyz = lambda d: [d["x"], d["y"], d["z"]]  # noqa: E731
-        print(json.dumps({
-            "rows": len(rows), "row_width": len(rows[0]), "infer_s": r.get("server_s"),
-            "first": poses[0], "last": poses[-1], "max_step_mm": max(steps) if steps else 0.0,
-            "gripper_col": [round(v, 1) for v in gcol[:5]], "start_xyz": [p.x, p.y, p.z], "end_xyz": [q.x, q.y, q.z],
-            "row0_to_state_mm": math.dist(xyz(poses[0]), [p.x, p.y, p.z]),
-            "row_last_to_end_mm": math.dist(xyz(poses[-1]), [q.x, q.y, q.z]),
-            "trajectory_reply_state": res.get("state"), "lead_ms": res.get("lead_ms"),
-            "remaining_ms": res.get("remaining_ms"), "status_state": st.get("state"),
-            "trajectory_ended": st.get("trajectory_ended"), "stop_state": stop.get("state"),
-            "peak_accel_ratio": st.get("peak_accel_ratio")}))
+        svc, gripper = MotionClient.from_robot(servo_r, a.service), Gripper.from_robot(servo_r, a.gripper)
+        motion = MotionClient.from_robot(servo_r, "builtin")
+        makers = {"module": lambda: ModuleExec(svc, gripper, a.arm, a.lead_ms),
+                  "client": lambda: ClientExec(svc, gripper, a.arm, a.lead_ms),
+                  "move": lambda: MoveExec(motion, gripper, a.arm, svc)}
+        c = {"make_exec": makers[a.mode], "world": world, "gripper": gripper, "policy": policy, "specs": specs,
+             "cams": {k: Camera.from_robot(obs_r, cam) for k, cam in CAMERAS.items()},
+             "arm": Arm.from_robot(obs_r, a.arm), "grip": Gripper.from_robot(obs_r, a.gripper),
+             "side_arm": Arm.from_robot(side_r, a.arm), "side_grip": Gripper.from_robot(side_r, a.gripper)}
+        seeds, wins = seed_range(a.seeds), 0
+        if a.out:
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        for seed in seeds:
+            row = await run_episode(a, c, seed)
+            wins += row["success"]
+            if a.out:
+                with open(a.out, "a") as f:
+                    f.write(json.dumps(row) + "\n")
+            print(f"seed {seed} {row['outcome']} t_success={row['t_success_s']} chunks={row['chunks']} "
+                  f"msgs/s={row['msgs_per_s']} jerk={row['jerk_rms']} errors={len(row['errors'])}", flush=True)
+            if a.once:
+                print(json.dumps(row))
+        print(f"{wins}/{len(seeds)} succeeded")
     finally:
-        await robot.close()
+        for r in (servo_r, obs_r, side_r):
+            await r.close()
 
 
-def main():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--address", required=True)
     ap.add_argument("--insecure", action="store_true")
-    ap.add_argument("--once", action="store_true", required=True)
-    ap.add_argument("--rate-hz", type=float, default=10.0, help="the capture rate: dt_ms = 1000 / rate")
-    ap.add_argument("--lead-ms", type=float, default=200.0)
+    ap.add_argument("--once", action="store_true", help="one seed, module/sync, a single chunk")
+    ap.add_argument("--mode", choices=["module", "client", "move"], default="module")
+    ap.add_argument("--cadence", choices=["sync", "async"], default="sync")
+    ap.add_argument("--replan-every", type=int, default=10, help="async: rows played before the next observation")
+    ap.add_argument("--lead-ms", default="100", help="a number, or auto (module mode only)")
+    ap.add_argument("--seeds", default="9100", help="N or LO-HI")
+    ap.add_argument("--out", help="JSONL file, appended (required unless --once)")
+    ap.add_argument("--timeout-s", type=float, default=30.0)
+    ap.add_argument("--checkpoint-label", default="")
     ap.add_argument("--arm", default="arm")
     ap.add_argument("--gripper", default="gripper")
     ap.add_argument("--policy", default="vla-policy")
     ap.add_argument("--service", default="servo")
-    asyncio.run(once(ap.parse_args()))
+    ap.add_argument("--world", default="sim-world")
+    a = ap.parse_args(argv)
+    if a.once:
+        a.mode, a.cadence = "module", "sync"
+    elif not a.out:
+        ap.error("--out is required unless --once")
+    try:
+        a.lead_ms = parse_lead(a.lead_ms, a.mode)
+    except ValueError as e:
+        ap.error(str(e))
+    return a
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async(parse_args()))
