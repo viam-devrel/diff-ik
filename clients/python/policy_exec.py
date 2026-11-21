@@ -158,6 +158,7 @@ class Executor:
             try:
                 await asyncio.wait_for(self._gcmd, 2.0)
             except Exception as e:  # noqa: BLE001
+                self._gcmd.cancel()  # still pending after the wait: don't leave it running
                 self.errors.append(("gripper", repr(e)))
         elif self._gcmd and not self._gcmd.cancelled() and self._gcmd.exception():
             err = ("gripper", repr(self._gcmd.exception()))

@@ -28,6 +28,10 @@ MIME_ENC = {"image/jpeg": "jpeg", "image/png": "png"}
 TASK = "Pick up the red block and place it in the bin"
 DT = 0.1
 INFER_TIMEOUT_S = 5.0
+OBSERVE_TIMEOUT_S = 5.0
+PLAY_TIMEOUT_S = 5.0
+CLOSE_TIMEOUT_S = 10.0
+ABORT_AFTER = 3
 
 
 # --- pure parts ---
@@ -47,17 +51,23 @@ def parse_lead(s: str, mode: str):
     return float(s)
 
 
-def outcome_from(errors, close_state, success: bool, infer_failed: bool) -> str:
-    """infer > session (the state close() reports) > plan > gripper > success > timeout."""
+def outcome_from(errors, close_state, success: bool) -> str:
+    """setup > observe > infer > session (the state close() reports) > plan > gripper > success > timeout."""
     kinds = [k for k, _ in errors]
-    if infer_failed:
-        return "infer"
+    for k in ("setup", "observe", "infer"):
+        if k in kinds:
+            return k
     if "session" in kinds:
         return str(close_state)
     for k in ("plan", "gripper"):
         if k in kinds:
             return k
     return "success" if success else "timeout"
+
+
+def should_abort(outcomes, n: int = ABORT_AFTER) -> bool:
+    """The last n episodes all failed systemically (setup, or close() itself failed): the cell is broken."""
+    return len(outcomes) >= n and all(o == "setup" or o.startswith("close_failed") for o in outcomes[-n:])
 
 
 def episode_row(*, seed, mode, cadence, replan_every, lead_ms, outcome, t_success_s, duration_s, close,
@@ -89,7 +99,7 @@ async def race(ev, timeout, coro=None):
         d.result()
 
 
-async def observe(a, cams, arm, grip, specs):
+async def observe(cams, arm, grip, specs):
     """(t_obs, images, pose, gripper input). The model was trained on the latched 0/1 command: `input`."""
     from PIL import Image
 
@@ -136,70 +146,84 @@ async def jerk_task(arm, samples):
         t = time.monotonic()
         try:
             p = await arm.get_end_position()
-            samples.append((t, p.x, p.y, p.z))
+            samples.append(((t + time.monotonic()) / 2, p.x, p.y, p.z))  # midpoint of the call
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(max(0.0, 1 / 30 - (time.monotonic() - t)))
 
 
 async def run_episode(a, c, seed) -> dict:
+    """t_success_s is the time of the confirming read (it lags the block settling by 0.3-0.6 s)."""
     ex = c["make_exec"]()
-    errors_extra, infer_s, row0, seam, samples, st = [], [], [], [], [], {"t_success_s": None}
-    ev, chunks, old, t0, duration = asyncio.Event(), 0, None, time.monotonic(), 0.0
-    tasks, close = [], {"state": None, "peak_accel_ratio": None, "msgs": 0}
+    errors_extra, infer_s, row0, seam, samples = [], [], [], [], []
+    st = {"t_success_s": None}
+    ev, chunks, old = asyncio.Event(), 0, None
+    t0, duration, started, tasks = time.monotonic(), 0.0, False, []
+    close = {"state": None, "peak_accel_ratio": None, "msgs": 0}
     try:
         try:
-            await c["world"].do_command({"command": "reset"})
-            pos, q = bc_pick.block_pose(seed)
-            await c["world"].do_command({"command": "set_prop_pose", "prop": "block", "position": pos,
-                                         "orientation_wxyz": q})
-            await c["gripper"].open()
-            await ex.start(seed)
-            t0 = time.monotonic()
-            tasks = [asyncio.create_task(success_task(c["world"], c["side_grip"], t0, ev, st)),
-                     asyncio.create_task(jerk_task(c["side_arm"], samples))]
-            while not ev.is_set() and time.monotonic() - t0 < a.timeout_s and not ex.errors:
-                if a.once and chunks >= 1:
-                    break
-                try:
-                    t_obs, images, pose, g = await observe(a, c["cams"], c["arm"], c["grip"], c["specs"])
-                    t_inf = time.monotonic()
-                    r = await asyncio.wait_for(c["policy"].do_command(
-                        {"command": "infer", "images": images, "state": {"values": state_vector(pose, g)},
-                         "task": TASK}), INFER_TIMEOUT_S)
-                    infer_s.append(time.monotonic() - t_inf)
-                    poses, gcol = chunk_to_poses(r["actions"]["rows"])
-                except Exception as e:  # noqa: BLE001 - timeouts included
-                    errors_extra.append(("infer", repr(e)))
-                    break
-                chunk = {"t_obs": t_obs, "dt": DT, "poses": poses, "grip": gcol}
-                row0.append(math.dist([poses[0][k] for k in "xyz"], [pose[k] for k in "xyz"]))
-                if old is not None:
-                    now = time.monotonic()
-                    seam.append(math.dist([sample_chunk(old, now)[k] for k in "xyz"],
-                                          [sample_chunk(chunk, now)[k] for k in "xyz"]))
-                await ex.play(chunk)
-                old, chunks = chunk, chunks + 1
-                left = a.timeout_s - (time.monotonic() - t0)
-                if a.cadence == "sync":
-                    await race(ev, left, ex.wait_done())
-                else:
-                    await race(ev, min(left, t_obs + a.replan_every * DT - time.monotonic()))
+            async with asyncio.timeout(a.timeout_s + 30):  # bounds setup plus loop: nothing can hang the run
+                await c["world"].do_command({"command": "reset"})
+                pos, q = bc_pick.block_pose(seed)
+                await c["world"].do_command({"command": "set_prop_pose", "prop": "block", "position": pos,
+                                             "orientation_wxyz": q})
+                await c["gripper"].open()
+                await ex.start(seed)
+                t0, started = time.monotonic(), True
+                tasks = [asyncio.create_task(success_task(c["world"], c["side_grip"], t0, ev, st)),
+                         asyncio.create_task(jerk_task(c["side_arm"], samples))]
+                while not ev.is_set() and time.monotonic() - t0 < a.timeout_s and not ex.errors:
+                    if a.once and chunks >= 1:
+                        break
+                    try:
+                        t_obs, images, pose, g = await asyncio.wait_for(
+                            observe(c["cams"], c["arm"], c["grip"], c["specs"]), OBSERVE_TIMEOUT_S)
+                    except Exception as e:  # noqa: BLE001 - timeouts included
+                        errors_extra.append(("observe", repr(e)))
+                        break
+                    try:
+                        t_inf = time.monotonic()
+                        r = await asyncio.wait_for(c["policy"].do_command(
+                            {"command": "infer", "images": images, "state": {"values": state_vector(pose, g)},
+                             "task": TASK}), INFER_TIMEOUT_S)
+                        infer_s.append(time.monotonic() - t_inf)
+                        poses, gcol = chunk_to_poses(r["actions"]["rows"])
+                    except Exception as e:  # noqa: BLE001
+                        errors_extra.append(("infer", repr(e)))
+                        break
+                    chunk = {"t_obs": t_obs, "dt": DT, "poses": poses, "grip": gcol}
+                    row0.append(math.dist([poses[0][k] for k in "xyz"], [pose[k] for k in "xyz"]))
+                    if old is not None:
+                        now = time.monotonic()
+                        seam.append(math.dist([sample_chunk(old, now)[k] for k in "xyz"],
+                                              [sample_chunk(chunk, now)[k] for k in "xyz"]))
+                    if ev.is_set():
+                        break
+                    await asyncio.wait_for(ex.play(chunk), PLAY_TIMEOUT_S)
+                    old = chunk
+                    chunks += 1
+                    left = a.timeout_s - (time.monotonic() - t0)
+                    if a.cadence == "sync":
+                        await race(ev, left, ex.wait_done())
+                    else:
+                        await race(ev, min(left, t_obs + a.replan_every * DT - time.monotonic()))
+                duration = time.monotonic() - t0
+        except Exception as e:  # noqa: BLE001 - this episode only; TimeoutError included
             duration = time.monotonic() - t0
-        except Exception as e:  # noqa: BLE001 - an executor (or setup) failure ends this episode only
-            duration = time.monotonic() - t0
-            if not any(k == "session" for k, _ in ex.errors):
+            if not started:
+                errors_extra.append(("setup", repr(e)))
+            elif not any(k == "session" for k, _ in ex.errors):
                 ex.errors.append(("session", repr(e)))
     finally:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         try:
-            close = await ex.close()
+            close = await asyncio.wait_for(ex.close(), CLOSE_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001
             close = {"state": f"close_failed: {e!r}", "peak_accel_ratio": None, "msgs": ex.msgs}
     errors = list(ex.errors) + errors_extra
-    outcome = outcome_from(errors, close["state"], ev.is_set(), bool(errors_extra))
+    outcome = outcome_from(errors, close["state"], ev.is_set())
     if a.once and outcome == "timeout":
         outcome = "once"
     return episode_row(
@@ -218,7 +242,7 @@ async def main_async(a):
 
     servo_r, obs_r, side_r = await bc_pick.connect(a.address, a.insecure, 3)
     try:
-        policy, world = Generic.from_robot(obs_r, a.policy), Generic.from_robot(obs_r, a.world)
+        policy, world = Generic.from_robot(obs_r, a.policy), Generic.from_robot(side_r, a.world)
         specs = await policy.do_command({"command": "specs"})
         keys = specs["image_feature_keys"]
         if set(keys) != set(CAMERAS):
@@ -234,12 +258,13 @@ async def main_async(a):
              "cams": {k: Camera.from_robot(obs_r, cam) for k, cam in CAMERAS.items()},
              "arm": Arm.from_robot(obs_r, a.arm), "grip": Gripper.from_robot(obs_r, a.gripper),
              "side_arm": Arm.from_robot(side_r, a.arm), "side_grip": Gripper.from_robot(side_r, a.gripper)}
-        seeds, wins = seed_range(a.seeds), 0
+        seeds, wins, outcomes = seed_range(a.seeds), 0, []
         if a.out:
             os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         for seed in seeds:
             row = await run_episode(a, c, seed)
             wins += row["success"]
+            outcomes.append(row["outcome"])
             if a.out:
                 with open(a.out, "a") as f:
                     f.write(json.dumps(row) + "\n")
@@ -247,7 +272,11 @@ async def main_async(a):
                   f"msgs/s={row['msgs_per_s']} jerk={row['jerk_rms']} errors={len(row['errors'])}", flush=True)
             if a.once:
                 print(json.dumps(row))
-        print(f"{wins}/{len(seeds)} succeeded")
+            if should_abort(outcomes):
+                print(f"aborting: {ABORT_AFTER} consecutive setup/close failures ({row['errors'][-1:]}); "
+                      "the machine or world is not usable", flush=True)
+                break
+        print(f"{wins}/{len(outcomes)} succeeded")
     finally:
         for r in (servo_r, obs_r, side_r):
             await r.close()
@@ -274,6 +303,7 @@ def parse_args(argv=None):
     a = ap.parse_args(argv)
     if a.once:
         a.mode, a.cadence = "module", "sync"
+        a.seeds = str(seed_range(a.seeds)[0])
     elif not a.out:
         ap.error("--out is required unless --once")
     try:

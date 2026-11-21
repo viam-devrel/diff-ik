@@ -8,17 +8,24 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from policy_run import episode_row, outcome_from, parse_args, parse_lead, seed_range  # noqa: E402
+from policy_run import episode_row, outcome_from, parse_args, parse_lead, seed_range, should_abort  # noqa: E402
 
 assert seed_range("9100-9102") == [9100, 9101, 9102] and seed_range("7") == [7]
 
-assert outcome_from([], "x", True, False) == "success"
-assert outcome_from([], "x", False, False) == "timeout"
-assert outcome_from([("infer", "e")], None, False, True) == "infer"
-assert outcome_from([("session", "e")], "stopped_timeout", True, False) == "stopped_timeout"
-assert outcome_from([("plan", "e")], "ok", False, False) == "plan"
-assert outcome_from([("gripper", "e")], "ok", True, False) == "gripper"
-assert outcome_from([("gripper", "e"), ("plan", "e")], "ok", False, False) == "plan"
+assert outcome_from([], "x", True) == "success"
+assert outcome_from([], "x", False) == "timeout"
+assert outcome_from([("infer", "e")], None, False) == "infer"
+assert outcome_from([("observe", "e")], None, False) == "observe"
+assert outcome_from([("setup", "e")], "stopped", False) == "setup"
+assert outcome_from([("session", "e")], "stopped_timeout", True) == "stopped_timeout"
+assert outcome_from([("plan", "e")], "ok", False) == "plan"
+assert outcome_from([("gripper", "e")], "ok", True) == "gripper"
+assert outcome_from([("gripper", "e"), ("plan", "e")], "ok", False) == "plan"
+
+assert not should_abort(["setup", "setup"])
+assert should_abort(["success", "setup", "setup", "close_failed: x"])
+assert not should_abort(["setup", "setup", "timeout"])
+assert not should_abort(["setup", "stopped_timeout", "setup"])
 
 row = episode_row(seed=9100, mode="module", cadence="async", replan_every=10, lead_ms=None, outcome="success",
                   t_success_s=12.5, duration_s=10.0, close={"state": "stopped", "peak_accel_ratio": 0.4, "msgs": 250},
@@ -41,5 +48,6 @@ except ValueError:
 a = parse_args(["--address", "x", "--mode", "client", "--lead-ms", "80", "--out", "o.jsonl"])
 assert a.lead_ms == 80.0 and a.mode == "client"
 o = parse_args(["--address", "x", "--once", "--mode", "move"])
+assert parse_args(["--address", "x", "--once", "--seeds", "5-9"]).seeds == "5"
 assert o.mode == "module" and o.cadence == "sync" and o.out is None
 print("ok")
