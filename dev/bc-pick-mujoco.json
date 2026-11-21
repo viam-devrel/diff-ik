@@ -11,7 +11,7 @@
     "floor_texture": "textures/concrete.png", "floor_texture_size": 2,
     "lighting": {
      "lights": [
-      {"type": "directional", "direction": [-0.4, 0.3, -1], "color": [0.95, 0.88, 0.78], "shadows": true},
+      {"type": "directional", "direction": [0.6, 0.15, -0.8], "color": [0.82, 0.76, 0.68], "shadows": true},
       {"type": "directional", "direction": [0.5, -0.4, -0.6], "color": [0.25, 0.28, 0.32], "shadows": false},
       {"type": "spot", "position": [-0.3, 0.9, 1.4], "direction": [0.6, -0.6, -0.8], "color": [0.5, 0.5, 0.55],
        "cutoff_deg": 35, "shadows": false}
@@ -27,7 +27,7 @@
    "attributes": {"world": "sim-world", "color": [0.35, 0.35, 0.38]}},
   {"name": "table", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:obstacle",
    "frame": {"parent": "world", "translation": {"x": 550, "y": 0, "z": 150}, "geometry": {"type": "box", "x": 400, "y": 600, "z": 300}},
-   "attributes": {"world": "sim-world", "color": [0.72, 0.58, 0.40], "texture": "/Users/nick.hehr/src/diff-ik/dev/assets/wood.png"}},
+   "attributes": {"world": "sim-world", "color": [0.72, 0.58, 0.40], "texture": "/Users/nick.hehr/src/diff-ik/dev/assets/wood-v2.png"}},
   {"name": "bin", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:obstacle",
    "frame": {"parent": "world", "translation": {"x": 550, "y": -200, "z": 300}},
    "attributes": {"world": "sim-world", "mesh": "meshes/bin.stl", "color": [0.62, 0.48, 0.32], "texture": "textures/cardboard.png"}},

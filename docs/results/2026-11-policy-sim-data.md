@@ -98,3 +98,12 @@ Date 2026-11-21. Laptop viam-server v1.17.0, `viam` CLI 1.17.0, viam-sdk 0.85+.
 - Renders (not committed), in `.runs/policy-sim/renders/`: `before-{scene-cam,wrist-cam,overview}.jpg` (no lighting
   block, no floor/table/bin textures) and `after-{scene-cam,wrist-cam,overview}.jpg` (tuned). The tuned config is
   restored on the machine.
+
+### Visual fix (Task 2 follow-up)
+
+- Wood: `dev/make_wood_texture.py` now writes `dev/assets/wood-v2.png` (multi-octave value noise, stretched along the grain,
+  irregular ring spacing, five knots, light (170,135,95) / dark (105,75,48)). Renamed from `wood.png` so the sim does not
+  serve a cached texture.
+- Light: key light direction `[0.6, 0.15, -0.8]`, color `[0.82, 0.76, 0.68]` (was `[-0.4, 0.3, -1]`, `[0.95, 0.88, 0.78]`),
+  so the arm casts a visible shadow on the table. Fill, rim, headlight, sky, shadow size and antialias unchanged.
+- Renders: `.runs/policy-sim/renders/v2-{overview,scene-cam,wrist-cam}.jpg` (not committed).
