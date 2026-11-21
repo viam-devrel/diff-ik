@@ -101,6 +101,9 @@ type SessionConfig struct {
 
 	Guard       *GuardConfig // nil: no force guard
 	GuardSource ForceSource
+
+	Force       *ForceConfig // nil: no force control (twist mode only)
+	ForceSource ForceSource
 }
 
 // armJoints adapts an arm's JointPositions to a JointReader.
@@ -586,6 +589,23 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 		}
 		s.guard = g
 		go g.run(runCtx) // finish cancels runCtx, so the guard ends with the loop
+	}
+	if cfg.Force != nil {
+		if cfg.Mode != ModeTwist {
+			s.cancel()
+			return nil, nil, errors.New(`force needs "mode": "twist"`)
+		}
+		fc := cfg.Force.withDefaults()
+		// a monitor-only guard (force_n 0): the force controller's poller and software tare
+		mon, err := newGuard(ctx, GuardConfig{Sensor: fc.Sensor, RateHz: fc.RateHz}, cfg.ForceSource, s.trip)
+		if err == nil {
+			err = l.SetForce(fc, mon.force)
+		}
+		if err != nil {
+			s.cancel()
+			return nil, nil, err
+		}
+		go mon.run(runCtx)
 	}
 	l.OnTick = s.onTick
 	m.byArm[armName] = s

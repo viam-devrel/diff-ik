@@ -1,0 +1,205 @@
+{
+ "modules": [
+  {
+   "type": "local",
+   "name": "mujoco-sim",
+   "executable_path": "/Users/nick.hehr/src/viam-mujoco-sim/run.sh"
+  },
+  {
+   "type": "local",
+   "name": "diff-ik",
+   "executable_path": "/Users/nick.hehr/src/diff-ik/bin/diff-ik"
+  }
+ ],
+ "components": [
+  {
+   "name": "sim-world",
+   "api": "rdk:component:generic",
+   "model": "viam-labs:mujoco-sim:world",
+   "attributes": {}
+  },
+  {
+   "name": "pedestal",
+   "api": "rdk:component:generic",
+   "model": "viam-labs:mujoco-sim:obstacle",
+   "frame": {
+    "parent": "world",
+    "translation": {
+     "x": 0,
+     "y": 0,
+     "z": 200
+    },
+    "geometry": {
+     "type": "box",
+     "x": 200,
+     "y": 200,
+     "z": 400
+    }
+   },
+   "attributes": {
+    "world": "sim-world",
+    "color": [
+     0.35,
+     0.35,
+     0.38
+    ]
+   }
+  },
+  {
+   "name": "table",
+   "api": "rdk:component:generic",
+   "model": "viam-labs:mujoco-sim:obstacle",
+   "frame": {
+    "parent": "world",
+    "translation": {
+     "x": 550,
+     "y": 0,
+     "z": 150
+    },
+    "geometry": {
+     "type": "box",
+     "x": 400,
+     "y": 600,
+     "z": 300
+    }
+   },
+   "attributes": {
+    "world": "sim-world",
+    "color": [
+     0.55,
+     0.45,
+     0.35
+    ]
+   }
+  },
+  {
+   "name": "workpiece",
+   "api": "rdk:component:generic",
+   "model": "viam-labs:mujoco-sim:obstacle",
+   "frame": {
+    "parent": "world",
+    "translation": {
+     "x": 550,
+     "y": 0,
+     "z": 330
+    },
+    "orientation": {
+     "type": "ov_degrees",
+     "value": {
+      "x": 0.0349,
+      "y": 0,
+      "z": 0.9994,
+      "th": 0
+     }
+    },
+    "geometry": {
+     "type": "box",
+     "x": 240,
+     "y": 160,
+     "z": 60
+    }
+   },
+   "attributes": {
+    "world": "sim-world",
+    "color": [
+     0.85,
+     0.72,
+     0.5
+    ],
+    "static_friction": 0.6
+   }
+  },
+  {
+   "name": "arm",
+   "api": "rdk:component:arm",
+   "model": "viam-labs:mujoco-sim:arm",
+   "frame": {
+    "parent": "world",
+    "translation": {
+     "x": 0,
+     "y": 0,
+     "z": 400
+    }
+   },
+   "attributes": {
+    "world": "sim-world",
+    "asset": "ur5e",
+    "max_joint_deg_s": 180,
+    "max_joint_deg_s2": 360
+   }
+  },
+  {
+   "name": "gripper",
+   "api": "rdk:component:gripper",
+   "model": "viam-labs:mujoco-sim:gripper",
+   "frame": {
+    "parent": "arm",
+    "translation": {
+     "x": 0,
+     "y": 0,
+     "z": 130
+    }
+   },
+   "attributes": {
+    "world": "sim-world",
+    "arm": "arm",
+    "asset": "robotiq_epick"
+   }
+  },
+  {
+   "name": "wrist-ft",
+   "api": "rdk:component:sensor",
+   "model": "viam-labs:mujoco-sim:force_torque",
+   "frame": {
+    "parent": "arm"
+   },
+   "attributes": {
+    "world": "sim-world",
+    "force_noise_n": 0.1,
+    "torque_noise_nm": 0.005,
+    "seed": 1
+   }
+  },
+  {
+   "name": "overview",
+   "api": "rdk:component:camera",
+   "model": "viam-labs:mujoco-sim:camera",
+   "frame": {
+    "parent": "world",
+    "translation": {
+     "x": 1500,
+     "y": -1000,
+     "z": 1100
+    }
+   },
+   "attributes": {
+    "world": "sim-world",
+    "target": [
+     0.5,
+     0,
+     0.4
+    ],
+    "width": 1280,
+    "height": 720
+   }
+  }
+ ],
+ "services": [
+  {
+   "name": "servo",
+   "api": "rdk:service:motion",
+   "model": "devrel:diff-ik:servo",
+   "attributes": {
+    "arms": [
+     "arm"
+    ],
+    "sensors": [
+     "wrist-ft"
+    ]
+   }
+  }
+ ],
+ "network": {
+  "bind_address": "localhost:8087"
+ }
+}

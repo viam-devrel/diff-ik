@@ -225,6 +225,10 @@ type Status struct {
 	CollisionIgnored, CollisionSkipped []string
 	CollisionLate                      string // last "approach faster than v_max" warning
 
+	Force        bool    // force control is on
+	ForcePressN  float64 // force control: pressing force along the tool axis this tick
+	ForceContact bool    // force control: contact made (regulating, not approaching)
+	ForceSideN   float64 // force control: sideways contact force on the tool (tool x/y) this tick
 }
 
 const tickWindow = 500 // ticks kept for p50/p99
@@ -261,6 +265,7 @@ type Loop struct {
 	qpFails   int             // consecutive QP fallbacks; loop goroutine only
 	live      *liveState      // live-obstacle mode; nil: off
 	coll      *collisionModel // nil: collision avoidance off; rows() is called from the loop goroutine only
+	force     *forceCtl       // nil: no force control; loop goroutine only
 	peakAccel float64         // see Status.PeakAccelRatio; loop goroutine only
 
 	sent     [][]float64 // last sent commands, oldest first, at most MaxLagMS of ticks; loop goroutine only
@@ -454,6 +459,16 @@ func (l *Loop) Trip(final State) {
 	}
 }
 
+// SetForce turns force control on; read returns the latest tared force F − F₀ in the sensor frame, N. Call before Run.
+func (l *Loop) SetForce(cfg ForceConfig, read func() r3.Vector) error {
+	cfg = cfg.withDefaults()
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+	l.force = &forceCtl{cfg: cfg, read: read}
+	return nil
+}
+
 // holder is a JointIO that can send a point the arm should come to rest at (zero point velocity).
 type holder interface {
 	Hold(ctx context.Context, q []referenceframe.Input) error
@@ -527,10 +542,16 @@ func (l *Loop) rampScale() (bool, float64) {
 //     leashS × the speed limit and the advance would grow it (vel · e > 0).
 func (l *Loop) advance(dt float64, cp r3.Vector, cq quat.Number, ramping, hold bool) (spatialmath.Pose, [6]float64) {
 	var zero [6]float64
-	if l.extrap && l.now().Sub(l.lastSet) > l.holdAfter {
-		return l.target, zero
-	}
 	vel := l.vel
+	if l.extrap && l.now().Sub(l.lastSet) > l.holdAfter {
+		if l.force == nil {
+			return l.target, zero
+		}
+		vel = zero
+	}
+	if l.force != nil {
+		vel = l.force.overlay(vel, cq)
+	}
 	if ramping || hold || vel == zero {
 		return l.target, vel
 	}
@@ -711,6 +732,23 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 		resynced = true
 	}
 
+	// 2b. force control: read the pressing force; at first contact snap the command back to the measured
+	// joints (like the guard's trip) so the approach's lag-ahead doesn't become a force spike.
+	if f := l.force; f != nil {
+		f.update(f.read(), dt)
+		if !f.contact && f.press >= f.cfg.ContactN {
+			f.contact = true
+			copy(l.qCmd, qm)
+			mp, _, err := FK(l.model, qm)
+			if err != nil {
+				return err
+			}
+			l.mu.Lock()
+			l.target = spatialmath.NewPose(mp.Mul(mmPerM), l.target.Orientation())
+			l.mu.Unlock()
+		}
+	}
+
 	// 3. FK(q_cmd), then advance the target under mu, then the error from the copy (spec "Tick order")
 	cp, cq, err := FK(l.model, l.qCmd)
 	if err != nil {
@@ -852,6 +890,10 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	st.Task, st.PointingResidualDeg, st.ToolAxis = l.cfg.Task, ms.residualDeg, toolAxis(cq)
 	st.QCmd, st.QMeas = slices.Clone(l.qCmd), slices.Clone(qm)
 	st.QPActive, st.QPIters, st.PeakAccelRatio = qpActive, qpIters, l.peakAccel
+	if f := l.force; f != nil {
+		st.Force, st.ForcePressN, st.ForceContact = true, f.press, f.contact
+		st.ForceSideN = math.Hypot(f.push.X, f.push.Y)
+	}
 	if fellBack {
 		st.QPFallbacks++
 	}

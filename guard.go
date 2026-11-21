@@ -112,7 +112,15 @@ type guard struct {
 	reads, errs         atomic.Int64
 	mu                  sync.Mutex
 	lastN, peakN, tripN float64
+	lastF               r3.Vector // latest F − F₀, sensor frame, N
 	reason              string
+}
+
+// force is the latest tared force, F − F₀, in the sensor frame.
+func (g *guard) force() r3.Vector {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lastF
 }
 
 // newGuard reads the baseline; a sensor that can't be read fails servo_start.
@@ -158,7 +166,7 @@ func (g *guard) run(ctx context.Context) {
 		g.reads.Add(1)
 		fn, tn := f.Sub(g.f0).Norm(), tq.Sub(g.t0).Norm()
 		g.mu.Lock()
-		g.lastN, g.peakN = fn, max(g.peakN, fn)
+		g.lastN, g.peakN, g.lastF = fn, max(g.peakN, fn), f.Sub(g.f0)
 		g.mu.Unlock()
 		switch {
 		case g.cfg.ForceN > 0 && fn >= g.cfg.ForceN:

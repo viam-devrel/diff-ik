@@ -24,6 +24,12 @@ func toolAxis(q quat.Number) r3.Vector {
 	return r3.Vector{X: 2 * (x*z + w*y), Y: 2 * (y*z - w*x), Z: 1 - 2*(x*x+y*y)}
 }
 
+// rotate turns v by unit quaternion q: q·v·q*.
+func rotate(q quat.Number, v r3.Vector) r3.Vector {
+	r := quat.Mul(quat.Mul(q, quat.Number{Imag: v.X, Jmag: v.Y, Kmag: v.Z}), quat.Conj(q))
+	return r3.Vector{X: r.Imag, Y: r.Jmag, Z: r.Kmag}
+}
+
 // pointingError returns the rotation vector r (base frame, ⟂ ac) that turns the current tool axis
 // ac onto the target axis at, and an orthonormal pair u, v ⟂ ac.
 func pointingError(ac, at r3.Vector) (r, u, v r3.Vector) {

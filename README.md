@@ -38,8 +38,18 @@ Results: [`docs/results/2026-11-live-obstacles.md`](docs/results/2026-11-live-ob
 A session can also stop itself on contact (`guard`), watching a wrist force-torque sensor named in the module's
 `sensors`. When it trips, the session commands the measured joints, so the arm stops pressing, and ends as
 `stopped_contact`. In a MuJoCo touch-off onto a rigid table at 10–80 mm/s, it cuts the peak force of a client-side
-stop by 3.5–4.5× and drops what is left after the stop from 46–359 N to 0.3–1.5 N. Results:
+stop by 3.5–4.5× and drops what is left after the stop from 46–359 N to 0.3–1.5 N. A comparison with the builtin motion
+service is in [`docs/results/2026-11-builtin-comparison.md`](docs/results/2026-11-builtin-comparison.md). Results:
 [`docs/results/2026-11-contact-guard.md`](docs/results/2026-11-contact-guard.md).
+
+A twist session can also hold a pressing force along the tool axis (`force`) while the client's twist sweeps it
+sideways, as in sanding or polishing. In MuJoCo it holds 5–20 N on a rigid table to within 0.35 N (0.1 N spread), settling in 0.2–0.5 s.
+In a block-sanding cell (`dev/sanding-mujoco.json`) it averages 9.9–10.3 N over raster passes on a tilted block.
+Results: [`docs/results/2026-11-force-control.md`](docs/results/2026-11-force-control.md). With sideways compliance (`comply_xy`), a
+spiral search plus force-controlled insertion put a 20 mm peg into a hole with 1 mm clearance from up to 5 mm off, in
+25 of 25 trials (`dev/peg-mujoco.json`;
+[`docs/results/2026-11-peg-in-hole.md`](docs/results/2026-11-peg-in-hole.md)). The force controller reads mujoco-sim's
+`force_torque` and the xArm module's `ft_sensor` readings.
 
 ## Local SO-101 simulation (Phase 3a)
 

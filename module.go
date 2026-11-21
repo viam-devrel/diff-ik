@@ -435,6 +435,10 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 	if err != nil {
 		return nil, nil, err
 	}
+	force, fsrc, err := s.parseForce(cmd)
+	if err != nil {
+		return nil, nil, err
+	}
 	frames, err := optBool(cmd, "frames", false)
 	if err != nil {
 		return nil, nil, err
@@ -448,7 +452,7 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 		return nil, nil, err
 	}
 	return s.m.start(ctx, armName, SessionConfig{
-		Frame: frame, Mode: Mode(mode), Loop: lc, Collision: coll, Live: live, LiveSource: src, Guard: guard, GuardSource: gsrc, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
+		Frame: frame, Mode: Mode(mode), Loop: lc, Collision: coll, Live: live, LiveSource: src, Guard: guard, GuardSource: gsrc, Force: force, ForceSource: fsrc, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
 		Timeout: time.Duration(timeout * float64(time.Millisecond)),
 		Ramp:    time.Duration(ramp * float64(time.Millisecond)),
 	})
@@ -499,6 +503,69 @@ func (s *diffIkServo) parseGuard(cmd map[string]interface{}) (*GuardConfig, Forc
 	src, ok := s.m.sensors[c.Sensor]
 	if !ok {
 		return nil, nil, fmt.Errorf("guard.sensor %q is not in this service's sensors", c.Sensor)
+	}
+	return c, src, nil
+}
+
+// parseForce reads force; nil means off. It returns the sensor named by its "sensor".
+func (s *diffIkServo) parseForce(cmd map[string]interface{}) (*ForceConfig, ForceSource, error) {
+	raw, ok := cmd["force"]
+	if !ok {
+		return nil, nil, nil
+	}
+	fm, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, nil, errors.New("force must be an object")
+	}
+	c := &ForceConfig{}
+	for k, v := range fm {
+		var dst *float64
+		switch k {
+		case "sensor":
+			name, ok := v.(string)
+			if !ok {
+				return nil, nil, errors.New("force.sensor must be a string")
+			}
+			c.Sensor = name
+			continue
+		case "press_axis":
+			ax, ok := v.(string)
+			if !ok {
+				return nil, nil, errors.New("force.press_axis must be a string")
+			}
+			c.PressAxis = ax
+			continue
+		case "target_n":
+			dst = &c.TargetN
+		case "gain":
+			dst = &c.Gain
+		case "ki":
+			dst = &c.Ki
+		case "max_mm_s":
+			dst = &c.MaxMMPerS
+		case "approach_mm_s":
+			dst = &c.ApproachMMPerS
+		case "contact_n":
+			dst = &c.ContactN
+		case "rate_hz":
+			dst = &c.RateHz
+		case "comply_xy":
+			dst = &c.ComplyXY
+		default:
+			return nil, nil, fmt.Errorf("unknown force key %q", k)
+		}
+		n, err := num(v, "force."+k)
+		if err != nil {
+			return nil, nil, err
+		}
+		*dst = n
+	}
+	if err := c.withDefaults().validate(); err != nil {
+		return nil, nil, err
+	}
+	src, ok := s.m.sensors[c.Sensor]
+	if !ok {
+		return nil, nil, fmt.Errorf("force.sensor %q is not in this service's sensors", c.Sensor)
 	}
 	return c, src, nil
 }
@@ -912,6 +979,9 @@ func statusMap(st SessionStatus) map[string]interface{} {
 		if st.LiveLastError != "" {
 			out["live_last_error"] = st.LiveLastError
 		}
+	}
+	if st.Force {
+		out["force_press_n"], out["force_contact"], out["force_side_n"] = st.ForcePressN, st.ForceContact, st.ForceSideN
 	}
 	if g := st.Guard; g != nil {
 		out["guard_reads"], out["guard_errors"] = float64(g.Reads), float64(g.Errors)

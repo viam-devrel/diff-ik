@@ -1,0 +1,20 @@
+<mujoco model="peg_tool">
+  <!-- A peg on a holder, for peg-in-hole: holder 50 mm across, 40 mm long; peg 20 mm across, 60 mm long. The tip
+       (TCP) is 100 mm from the flange. mujoco-sim needs exactly one actuator on a gripper: a jawless tool gets an
+       adhesion actuator, as a suction cup does, which the peg task never turns on. -->
+  <compiler angle="radian" autolimits="true"/>
+
+  <worldbody>
+    <body name="peg_tool">
+      <geom name="holder" type="cylinder" size="0.025 0.02" pos="0 0 0.02" mass="0.3" rgba="0.3 0.3 0.33 1"/>
+      <body name="peg" pos="0 0 0.07">
+        <geom name="peg" type="cylinder" size="0.01 0.03" mass="0.1" rgba="0.8 0.8 0.82 1"/>
+        <site name="tip" pos="0 0 0.03"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <adhesion name="hold" body="peg" ctrlrange="0 1" gain="1"/>
+  </actuator>
+</mujoco>

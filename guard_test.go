@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/golang/geo/r3"
+	"gonum.org/v1/gonum/num/quat"
 )
 
 // A trip snaps the command back to the measured joints (an arm blocked behind its command) and ends the loop.
@@ -89,6 +90,36 @@ func TestGuardTripsOnContactAndFaultsBlind(t *testing.T) {
 
 // Force control: the tool approaches along its axis, then at first contact the command snaps back to the measured
 // joints and the axis speed follows the force law.
+func TestForceApproachThenSnap(t *testing.T) {
+	l, sim, m := newTestLoop(t, home, LoopConfig{})
+	press := 0.0
+	// mujoco-sim's convention: a surface pushing back reads −z
+	if err := l.SetForce(ForceConfig{Sensor: "ft", TargetN: 10}, func() r3.Vector { return r3.Vector{Z: -press} }); err != nil {
+		t.Fatal(err)
+	}
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+	l.SetVelocity([6]float64{})
+	p0, o, _ := FK(m, home)
+	runTicks(t, l, 25)
+	p1, _, _ := FK(m, sim.q)
+	if d := p1.Sub(p0).Dot(toolAxis(o)) * mmPerM; d < 1 {
+		t.Fatalf("moved %.2f mm along the tool axis before contact, want ≈ 2.5", d)
+	}
+	sim.delay = 3 // a blocked arm trails its command
+	runTicks(t, l, 5)
+	measured := slices.Clone(sim.q)
+	press = 12 // contact, over the target: the law backs off
+	runTicks(t, l, 1)
+	if st := l.Status(); !st.ForceContact || st.ForcePressN != 12 {
+		t.Fatalf("status %+v", st)
+	}
+	if d := maxAbsDiff(sim.sends[len(sim.sends)-1], measured); d > deg2rad(0.5) {
+		t.Fatalf("first contact tick sent %.3f° from the measured joints", rad2deg(d))
+	}
+	if v := l.force.axisMMPerS(); v != -1 { // 0.5 mm/s/N × (10 − 12)
+		t.Fatalf("axis speed %v, want -1", v)
+	}
+}
 
 type flatFT struct{ fz float64 }
 
@@ -96,13 +127,35 @@ func (f flatFT) Readings(context.Context, map[string]interface{}) (map[string]in
 	return map[string]interface{}{"Fx_N": 0.0, "Fy_N": 0.0, "Fz_N": f.fz, "TRx_Nm": 0.0, "TRy_Nm": 0.0, "TRz_Nm": 0.0}, nil
 }
 
-// The xArm sensor's flat keys read like mujoco-sim's maps.
-func TestFlatReadings(t *testing.T) {
+// The xArm sensor's flat keys read like mujoco-sim's maps, and press_axis "+z" flips the pressing sign.
+func TestFlatReadingsAndPressSign(t *testing.T) {
 	f, tq, err := readFT(context.Background(), flatFT{fz: -18.4})
 	if err != nil || f.Z != -18.4 || tq.Norm() != 0 {
 		t.Fatalf("flat reading: f %v t %v err %v", f, tq, err)
 	}
 	if _, _, err := readFT(context.Background(), &fakeFT{}); err != nil {
 		t.Fatalf("map reading: %v", err)
+	}
+	// press_axis: "-z" reads a push back as −z (mujoco-sim), "+z" as +z
+	for _, c := range []struct {
+		axis string
+		fz   float64
+	}{{"-z", -5}, {"+z", 5}} {
+		fc := &forceCtl{cfg: ForceConfig{TargetN: 10, PressAxis: c.axis}.withDefaults()}
+		fc.update(r3.Vector{Z: c.fz}, 0.02)
+		if fc.press != 5 {
+			t.Fatalf("press_axis %s: press %v from Fz %v, want 5", c.axis, fc.press, c.fz)
+		}
+	}
+	// comply_xy: a wall pushing the tool toward +x (sensor reads +x with "-z") yields toward +x; the tool points down
+	// (180° about x), so tool +x is base +x
+	fc := &forceCtl{cfg: ForceConfig{TargetN: 10, ComplyXY: 0.5}.withDefaults(), contact: true}
+	fc.update(r3.Vector{X: 4, Z: -10}, 0.02)
+	down := quat.Number{Imag: 1} // 180° about x
+	if v := fc.overlay([6]float64{}, down); !(v[0] > 0.0019 && v[0] < 0.0021) || v[1] != 0 {
+		t.Fatalf("comply velocity %v m/s, want +x 0.002 (0.5 mm/s/N × 4 N)", v[:3])
+	}
+	if err := (ForceConfig{Sensor: "ft", TargetN: 10, PressAxis: "z"}).withDefaults().validate(); err == nil {
+		t.Fatal(`press_axis "z" accepted`)
 	}
 }

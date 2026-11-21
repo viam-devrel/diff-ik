@@ -32,7 +32,7 @@ fewer than 6 DOF use the pointing task, which tracks position and tool-axis dire
 |---|---|---|---|
 | `arms` | []string | Required | Arms this service may servo. They become dependencies. |
 | `vision_services` | []string | Optional | Vision services a `live_obstacles` session may poll. They become dependencies. Use the short names; the module declares the full names `rdk:service:vision/<name>` as dependencies. |
-| `sensors` | []string | Optional | Force-torque sensors a `guard` may poll. They become dependencies. |
+| `sensors` | []string | Optional | Force-torque sensors a `guard` or `force` may poll. They become dependencies. |
 | `teleop` | object | Optional | `servo_start` defaults for `teleop_*` sessions (`limits`, `rate_hz`, `timeout_ms`, `ramp_ms`, `target_filter`, `task_weights`, ...), plus `teleop_idle_ms` (default 60000). |
 
 Set the joint limit below the arm driver's own speed limit. Drivers such as the xArm reject streamed points above it,
@@ -91,6 +91,7 @@ second session on a busy arm fails.
 | `collision` | off | `qp` only. `true`, or `{"d_min_mm", "d_act_mm"}` (defaults 10 and 100; `d_act_mm` must exceed `d_min_mm`; unknown keys are rejected). Collision is also on when `world_state` or `collision_specification` is given. `"collision": false` turns it off even then. Frame-system meshes on the arm or around it (a gripper model, a fixture) are checked as their bounding box in the mesh's own frame, with a warning; cylinders are still skipped. |
 | `live_obstacles` | off | `qp` only. Obstacles from a vision service, polled while the session runs. Turns collision on; `"collision": false` with it is rejected. See below and "Live obstacles". |
 | `guard` | off | Stop on contact: `{"sensor", "force_n", "torque_nm", "rate_hz"}`. See "Contact guard". |
+| `force` | off | Twist mode only. Regulate the pressing force along the tool axis. See "Force control". |
 | `point_velocities` | true | Send per-point target joint velocities to the driver. |
 
 #### `live_obstacles`
@@ -201,6 +202,44 @@ solver and mode.
   `guard_trip_n` and `guard_reason`.
 
 Results: `docs/results/2026-11-contact-guard.md`.
+
+## Force control
+
+With `force` (twist mode only), the session presses the tool along its z axis at a set force while the client's twist
+drives the other directions. It suits press-and-hold, sanding, polishing and wiping.
+
+```json
+"force": { "sensor": "wrist-ft", "target_n": 10, "gain": 0.5, "ki": 4, "max_mm_s": 5, "approach_mm_s": 5 }
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `sensor` | required | One of `sensors`, with readings like the guard's. The sensor frame is taken as the tool frame. |
+| `press_axis` | `"-z"` | The sensor z sign that a surface pushing back on the tool reads: `"-z"` for mujoco-sim's `force_torque`, `"+z"` for a sensor with the opposite convention. The xArm sensor's sign is unverified: press on the tool and check `Fz_N`. |
+| `target_n` | required | Pressing force to hold, N. Must be > 0. |
+| `gain` | 0.5 | Axis speed per N of force error, mm/s per N. Must be > 0. |
+| `ki` | 0 | Integral gain, mm/s per N·s. Use it to follow a surface that moves along the axis under a sweep (a tilted face). Reset at contact and clamped to `max_mm_s`. |
+| `max_mm_s` | 5 | Cap on the axis speed once in contact. |
+| `approach_mm_s` | 5 | Axis speed before contact. The impact at contact grows with it (about 10 N at 5 mm/s on a rigid surface in sim). |
+| `contact_n` | min(2, `target_n`/2) | Pressing force that counts as contact. Must be below `target_n`. |
+| `rate_hz` | 500 | Sensor poll rate, in (0, 2000]. |
+| `comply_xy` | 0 (off) | Sideways compliance, mm/s per N: once in contact, the tool also moves in tool x/y at `comply_xy` × the sideways contact force, clamped to `max_mm_s`. It lets walls centre a peg in a hole. In the peg-in-hole cell, 1.0 worked and 2.0 was worse. |
+
+- **Approach.** Until contact, the tool moves along its axis at `approach_mm_s`. Its axis component of the client's
+  twist is replaced. Stream zero twists to hold x/y.
+- **Contact.** At first contact the command snaps back to the measured joints, as the guard's trip does, so the
+  approach's lag-ahead doesn't become a force spike.
+- **Regulation.** Then the axis speed is `gain`·e + `ki`·∫e dt, with e = `target_n` − pressing force, clamped to
+  ±`max_mm_s`.
+- **Taring.** The tare is taken at start, from the sensor's own poller. Three failed reads in a row end the session as
+  `faulted`.
+- **Guard.** Add a `guard` (with a `force_n` above the target) as a hard limit.
+- **Status:** `force_press_n` (this tick's pressing force), `force_side_n` (the sideways contact force) and
+  `force_contact`.
+- **Tuning (sim, rigid surface):** `gain` 0.4–1.6 settles in under 0.5 s. It oscillates from about 3. Gains depend on
+  how stiff the arm and contact are, so retune on hardware.
+
+Results: `docs/results/2026-11-force-control.md` and `docs/results/2026-11-peg-in-hole.md`.
 
 ## QP solver
 
