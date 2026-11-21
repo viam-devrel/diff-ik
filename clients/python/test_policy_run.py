@@ -23,6 +23,8 @@ assert outcome_from([("gripper", "e")], "ok", True) == "gripper"
 assert outcome_from([("gripper", "e"), ("plan", "e")], "ok", False) == "plan"
 
 assert not should_abort(["setup", "setup"])
+assert should_abort(["observe", "setup", "observe"])
+assert not should_abort(["infer", "infer", "infer"])
 assert should_abort(["success", "setup", "setup", "close_failed: x"])
 assert not should_abort(["setup", "setup", "timeout"])
 assert not should_abort(["setup", "stopped_timeout", "setup"])

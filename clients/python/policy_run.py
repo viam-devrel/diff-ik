@@ -66,8 +66,8 @@ def outcome_from(errors, close_state, success: bool) -> str:
 
 
 def should_abort(outcomes, n: int = ABORT_AFTER) -> bool:
-    """The last n episodes all failed systemically (setup, or close() itself failed): the cell is broken."""
-    return len(outcomes) >= n and all(o == "setup" or o.startswith("close_failed") for o in outcomes[-n:])
+    """The last n episodes all failed systemically (setup, observe, or close() itself failed): the cell is broken."""
+    return len(outcomes) >= n and all(o in ("setup", "observe") or o.startswith("close_failed") for o in outcomes[-n:])
 
 
 def episode_row(*, seed, mode, cadence, replan_every, lead_ms, outcome, t_success_s, duration_s, close,
@@ -91,12 +91,15 @@ async def race(ev, timeout, coro=None):
     tasks = {asyncio.ensure_future(ev.wait())}
     if coro is not None:
         tasks.add(asyncio.ensure_future(coro))
-    done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED)
-    for p in pending:
-        p.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    try:
+        done, _ = await asyncio.wait(tasks, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED)
+    finally:  # also on an outer cancel: never leak a polling wait_done
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     for d in done:
-        d.result()
+        if not d.cancelled():
+            d.result()
 
 
 async def observe(cams, arm, grip, specs):
