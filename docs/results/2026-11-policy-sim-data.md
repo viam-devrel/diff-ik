@@ -80,3 +80,21 @@ Date 2026-11-21. Laptop viam-server v1.17.0, `viam` CLI 1.17.0, viam-sdk 0.85+.
   222 `arm` rows (JointPositions + EndPosition) and **111 `gripper` rows** with `docommand_output.position`
   (99.67 open, `input` 0.0). The fix works. The probe dataset was deleted with the CLI.
 - Start/stop commands on `demo-capture` are `{"start_capture": true, "frequency_hz": N, "tags": [...]}` and `{"stop_capture": true}`.
+
+## Task 2: cell, wood texture, renders
+
+- `dev/make_wood_texture.py` writes `dev/assets/wood.png` (procedural oak). The grain reads as wavy stripes at close range;
+  on the table at render distance it passes as wood, but it is regular. Say if you want it more irregular.
+- `dev/bc-pick-mujoco.json` is the cell: ur5e + 2F-85 on a pedestal, wood-textured table, cardboard bin, red 40 mm block
+  at world (550, 50, 320), `scene-cam`/`wrist-cam` 448 x 448, `overview` 1280 x 720, capture-control 0.1.1,
+  `viam-labs:vla` pinned 0.3.0, local mujoco-sim (patched build).
+- **Network difference:** the repo file keeps `localhost:8089` (local-only run). The machine's cloud config keeps
+  `localhost:8087` because the other laptop viam-server holds 8080; same config otherwise.
+- **home_joints adjusted:** the plan's `[0, -1.5708, ...]` put the flange at (-492, -134, 488) in the arm frame (behind the
+  arm, over the pedestal side). Joint 1 = 3.1416 rotates it to the table side. Readout after the change (arm frame):
+  x 492.0, y 134.0, z 488.0, tool down (o = (0, 0, -1)). Gripper `position` after `Open`: 99.35.
+- **Cameras:** no change needed. `scene-cam` frames the whole table top, the block and the bin. The block is visible in
+  `wrist-cam` from home, so no servo move was needed.
+- Renders (not committed), in `.runs/policy-sim/renders/`: `before-{scene-cam,wrist-cam,overview}.jpg` (no lighting
+  block, no floor/table/bin textures) and `after-{scene-cam,wrist-cam,overview}.jpg` (tuned). The tuned config is
+  restored on the machine.
