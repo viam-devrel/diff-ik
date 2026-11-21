@@ -24,13 +24,17 @@ def _rows_rotation(r) -> Rotation:
     return Rotation.from_matrix(np.stack([b1, b2, np.cross(b1, b2)]))
 
 
+def pose_map_from(xyz, R: Rotation) -> dict:
+    """A position (mm) and a scipy Rotation as a pose map (orientation vector, theta in degrees)."""
+    v = RotationMatrix(R.as_matrix().reshape(9).tolist()).to_quaternion().to_orientation_vector()
+    return {"x": float(xyz[0]), "y": float(xyz[1]), "z": float(xyz[2]), "o_x": float(v.o_x),
+            "o_y": float(v.o_y), "o_z": float(v.o_z), "theta": float(np.degrees(v.theta))}
+
+
 def chunk_to_poses(rows) -> tuple:
     """Policy action rows (10 numbers each) as servo pose maps, plus the gripper column."""
     poses, grip = [], []
     for r in rows:
-        m = RotationMatrix(_rows_rotation(r[3:9]).as_matrix().reshape(9).tolist())
-        v = m.to_quaternion().to_orientation_vector()
-        poses.append({"x": float(r[0]), "y": float(r[1]), "z": float(r[2]), "o_x": float(v.o_x),
-                      "o_y": float(v.o_y), "o_z": float(v.o_z), "theta": float(np.degrees(v.theta))})
+        poses.append(pose_map_from(r[0:3], _rows_rotation(r[3:9])))
         grip.append(float(r[9]) if len(r) > 9 else float("nan"))
     return poses, grip
