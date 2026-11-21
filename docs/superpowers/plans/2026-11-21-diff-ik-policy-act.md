@@ -323,7 +323,7 @@ print("ok")
 - [ ] **Step 3: Implement** in `policy_exec.py` (pure section at the top; SDK imports only inside the executor functions/classes of Task 9):
   - `first_live_row(t_obs, dt, now)`: `max(0, math.ceil((now - t_obs) / dt - 1e-9))`.
   - `gripper_events(gcol, t_obs, dt, closed, lead)`: walk rows; `want = v > 0.5`; on `want != closed` append `(t_obs + k*dt - lead, "grab" if want else "open")` and flip `closed`.
-  - `jerk_rms(samples)`: samples `(t, x, y, z)` mm; NaN if fewer than 4; third difference of each axis divided by the mean dt cubed; RMS of the 3-D norm.
+  - `jerk_rms(samples)`: samples `(t, x, y, z)` mm; NaN if fewer than 4; resample each axis onto evenly spaced times (a cubic spline; linear interpolation leaves kinks the third difference amplifies), then the third difference divided by that dt cubed; RMS of the 3-D norm. (Mean dt on jittered samples inflates it about 8x at 1 ms jitter.)
   - `succeeded(b1, b2, gripper_input)`: `in_bin(b2) and math.dist(b1, b2) < 1.0 and gripper_input < 0.5` (import `in_bin` from `bc_pick`).
   - `sample_chunk(chunk, t)`: `s = (t - t_obs)/dt` clamped to `[0, n-1]`; `k = floor`, `f = s - k`; position linear between rows k and k+1; orientation `Slerp` (scipy) between `policy_layout.rotation(pose_k)` and `pose_{k+1}`, converted back to an orientation-vector pose map as `chunk_to_poses` does.
   - Also add `mix_pose(a, b, w)`: linear position, slerp orientation (same conversion) — used with `playback.blended` in Task 9.
