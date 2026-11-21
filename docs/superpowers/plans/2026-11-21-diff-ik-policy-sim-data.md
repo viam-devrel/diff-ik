@@ -835,25 +835,34 @@ line 201); test in `/Users/nick.hehr/src/viam-mujoco-sim/tests/test_gripper.py`.
       from viam.proto.app.dataset import DatasetType
       from viam.rpc.dial import DialOptions
 
-      kept = {}
+      # The log can hold several rows per seed after re-runs: the latest row decides.
+      latest = {}
       for line in open(a.log):
           row = json.loads(line)
-          if row.get("kept") and row.get("tags"):
-              kept[next(t for t in row["tags"] if t.startswith("episode:"))] = row["seed"]
+          if row.get("tags"):
+              latest[next(t for t in row["tags"] if t.startswith("episode:"))] = row
+      kept = {tag: row for tag, row in latest.items() if row.get("kept")}
       client = await ViamClient.create_from_dial_options(
           DialOptions.with_api_key(os.environ["VIAM_API_KEY"], os.environ["VIAM_API_KEY_ID"]))
       try:
           data = client.data_client
+          # One sequence per episode tag: a crashed or re-run capture can leave several sequences under one tag,
+          # so keep the one whose start is closest to the kept row's t_start.
           found, token = {}, None
           while True:
               seqs, token = await data.list_sequences(organization_id=a.org_id, page_token=token)
               for s in seqs:
-                  if s.part_id == a.part_id:
-                      for t in s.sequence_tags:
-                          if t in kept:
-                              found[t] = s.id
+                  if s.part_id != a.part_id:
+                      continue
+                  for t in s.sequence_tags:
+                      if t in kept:
+                          t0 = datetime.fromisoformat(kept[t]["t_start"])
+                          gap = abs((s.start_time.ToDatetime(tzinfo=timezone.utc) - t0).total_seconds())
+                          if t not in found or gap < found[t][1]:
+                              found[t] = (s.id, gap)
               if not token:
                   break
+          found = {t: sid for t, (sid, gap) in found.items()}
           missing = sorted(set(kept) - set(found))
           ds = [d for d in await data.list_datasets_by_organization_id(a.org_id) if d.name == a.dataset]
           dataset_id = ds[0].id if ds else await data.create_dataset(
@@ -864,7 +873,12 @@ line 201); test in `/Users/nick.hehr/src/viam-mujoco-sim/tests/test_gripper.py`.
       finally:
           client.close()
   ```
-  and its parser: `add = sub.add_parser("add")` with `--log`, `--dataset`, `--org-id` (default
+  It needs `from datetime import datetime, timezone` (already imported at the top of `expert_pick.py`). If
+  `Timestamp.ToDatetime` doesn't take `tzinfo` in the installed protobuf, convert with
+  `.ToDatetime().replace(tzinfo=timezone.utc)`. Write a small pure helper test for the choose-closest rule only if it's
+  extracted into a function; otherwise verify it in Step 2.
+
+  Add its parser: `add = sub.add_parser("add")` with `--log`, `--dataset`, `--org-id` (default
   `16518049-9dd3-479f-9644-c5d112aa42d8`) and `--part-id` (required), plus `elif a.cmd == "add":
   asyncio.run(cmd_add(a))`. If `ViamClient.close()` is a coroutine in the installed SDK, await it. If adding a
   sequence that's already in the dataset errors, filter those out first with `sequences_by_dataset_id`.
