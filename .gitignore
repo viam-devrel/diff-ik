@@ -38,3 +38,6 @@ docs/plans
 docs/specs
 clients/ts/node_modules/
 __pycache__/
+
+# large untracked run artifacts (datasets, checkpoints, renders)
+.runs/

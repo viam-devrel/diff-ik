@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from policy_layout import chunk_to_poses, state_vector  # noqa: E402
 
 CAMERAS = {"observation.images.scene_cam": "scene-cam", "observation.images.wrist_cam": "wrist-cam"}
+MIME_ENC = {"image/jpeg": "jpeg", "image/png": "png"}
 
 
 async def once(a):
@@ -37,13 +38,19 @@ async def once(a):
         policy, svc = Generic.from_robot(robot, a.policy), MotionClient.from_robot(robot, a.service)
         specs = await policy.do_command({"command": "specs"})
         keys = specs["image_feature_keys"]
-        assert set(keys) == set(CAMERAS), f"policy wants {keys}, cell has {list(CAMERAS)}"
+        if set(keys) != set(CAMERAS):
+            raise SystemExit(f"policy wants image keys {keys}, cell has {list(CAMERAS)}")
+        if specs.get("state_dim") != 10 or specs.get("action_dim") != 10:
+            raise SystemExit(f"policy state/action dims {specs.get('state_dim')}/{specs.get('action_dim')}, want 10/10")
         t_obs = time.monotonic()
         images = {}
         for key, cam in CAMERAS.items():
             imgs, _ = await Camera.from_robot(robot, cam).get_images()
             img = imgs[0]
-            enc = {"image/jpeg": "jpeg", "image/png": "png"}.get(getattr(img, "mime_type", "image/jpeg"), "jpeg")
+            mime = getattr(img, "mime_type", "image/jpeg")
+            if mime not in MIME_ENC:
+                raise SystemExit(f"{cam}: unsupported image mime type {mime!r}")
+            enc = MIME_ENC[mime]
             images[key] = {"encoding": enc, "data": base64.b64encode(img.data).decode(),
                            "height": img.height, "width": img.width, "channels": 3}
         p = await arm.get_end_position()
@@ -56,6 +63,7 @@ async def once(a):
         poses, gcol = chunk_to_poses(rows)
         sid = (await svc.do_command({"command": "servo_start", "component_name": a.arm, "frame": "arm_origin",
                                      "mode": "pose", "timeout_ms": 2000}))["session_id"]
+        stop = {}
         try:
             res = await svc.do_command({"command": "servo_trajectory", "session_id": sid, "poses": poses,
                                         "dt_ms": 1000 / a.rate_hz, "age_ms": (time.monotonic() - t_obs) * 1000,
@@ -63,14 +71,20 @@ async def once(a):
             await asyncio.sleep(len(poses) / a.rate_hz + 0.5)
             st = await svc.do_command({"command": "servo_status", "session_id": sid})
         finally:
-            await svc.do_command({"command": "servo_stop", "session_id": sid})
+            stop = await svc.do_command({"command": "servo_stop", "session_id": sid})
         q = await arm.get_end_position()
         steps = [math.dist([a_["x"], a_["y"], a_["z"]], [b["x"], b["y"], b["z"]]) for a_, b in zip(poses, poses[1:])]
+        xyz = lambda d: [d["x"], d["y"], d["z"]]  # noqa: E731
         print(json.dumps({
             "rows": len(rows), "row_width": len(rows[0]), "infer_s": r.get("server_s"),
             "first": poses[0], "last": poses[-1], "max_step_mm": max(steps) if steps else 0.0,
             "gripper_col": [round(v, 1) for v in gcol[:5]], "start_xyz": [p.x, p.y, p.z], "end_xyz": [q.x, q.y, q.z],
-            "accepted": res.get("state"), "status_state": st.get("state"), "peak_accel_ratio": st.get("peak_accel_ratio")}))
+            "row0_to_state_mm": math.dist(xyz(poses[0]), [p.x, p.y, p.z]),
+            "row_last_to_end_mm": math.dist(xyz(poses[-1]), [q.x, q.y, q.z]),
+            "trajectory_reply_state": res.get("state"), "lead_ms": res.get("lead_ms"),
+            "remaining_ms": res.get("remaining_ms"), "status_state": st.get("state"),
+            "trajectory_ended": st.get("trajectory_ended"), "stop_state": stop.get("state"),
+            "peak_accel_ratio": st.get("peak_accel_ratio")}))
     finally:
         await robot.close()
 
