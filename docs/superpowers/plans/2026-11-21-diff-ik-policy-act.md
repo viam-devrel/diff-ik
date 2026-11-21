@@ -59,8 +59,6 @@ func TestAutoLeadUsesMedianLag(t *testing.T) {
 	runTicks(t, l, 2)
 	l.lagTicks = 9                           // a spike raised the jump-up estimate
 	l.lagSamples = []float64{3, 3, 4, 3, 9} // but most fits say 3
-	p0, _, _ := FK(m, home)
-	_ = p0
 	tr := newTrajectory(l.now(), 100*time.Millisecond, []spatialmath.Pose{
 		offsetTarget(t, m, home, r3.Vector{}, 0), offsetTarget(t, m, home, r3.Vector{X: 10}, 0)})
 	tr.autoLead = true
