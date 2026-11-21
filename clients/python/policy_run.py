@@ -240,12 +240,13 @@ async def main_async(a):
     from viam.components.arm import Arm
     from viam.components.camera import Camera
     from viam.components.gripper import Gripper
+    from viam.components.generic import Generic as GenericComponent
     from viam.services.generic import Generic
     from viam.services.motion import MotionClient
 
     servo_r, obs_r, side_r = await bc_pick.connect(a.address, a.insecure, 3)
     try:
-        policy, world = Generic.from_robot(obs_r, a.policy), Generic.from_robot(side_r, a.world)
+        policy, world = Generic.from_robot(obs_r, a.policy), GenericComponent.from_robot(side_r, a.world)  # the sim world is a component
         specs = await policy.do_command({"command": "specs"})
         keys = specs["image_feature_keys"]
         if set(keys) != set(CAMERAS):
