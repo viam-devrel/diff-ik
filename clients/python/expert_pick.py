@@ -157,7 +157,11 @@ class Episode:
                     await self.capture.do_command({"stop_capture": True})
                     info["t_stop"] = datetime.now(timezone.utc).isoformat()
                 except Exception as e:
+                    # capture may still run under this episode's tag: don't trust this episode or the next
                     print(f"warning: stop_capture failed: {e!r}", file=sys.stderr)
+                    info["kept"] = False
+                    info["reason"] = (info["reason"] + "; " if info["reason"] else "") + f"stop_capture failed: {e!r}"
+                    info["abort"] = True
         return info
 
 
@@ -186,11 +190,59 @@ async def cmd_run(a):
                 log.write(json.dumps(info) + "\n")
                 log.flush()
                 print(json.dumps({"seed": seed, "kept": info["kept"], "reason": info["reason"]}))
+                if info.get("abort"):
+                    print("aborting batch: stop_capture failed", file=sys.stderr)
+                    break
     finally:
         for c in conns:
             await c.close()
     n = len(seeds)
     print(json.dumps({"episodes": n, "kept": kept, "success": kept / n, "log": log_path}))
+
+
+async def cmd_add(a):
+    """Add the log's kept episodes to a sequence dataset, creating it if needed; matched by episode tag."""
+    from viam.app.viam_client import ViamClient
+    from viam.proto.app.dataset import DatasetType
+    from viam.rpc.dial import DialOptions
+
+    # The log can hold several rows per seed after re-runs: the latest row decides.
+    latest = {}
+    for line in open(a.log):
+        row = json.loads(line)
+        if row.get("tags"):
+            latest[next(t for t in row["tags"] if t.startswith("episode:"))] = row
+    kept = {tag: row for tag, row in latest.items() if row.get("kept")}
+    client = await ViamClient.create_from_dial_options(
+        DialOptions.with_api_key(os.environ["VIAM_API_KEY"], os.environ["VIAM_API_KEY_ID"]))
+    try:
+        data = client.data_client
+        # One sequence per episode tag: a crashed or re-run capture can leave several sequences under one tag,
+        # so keep the one whose start is closest to the kept row's t_start.
+        found, token = {}, None
+        while True:
+            seqs, token = await data.list_sequences(organization_id=a.org_id, page_token=token)
+            for s in seqs:
+                if s.part_id != a.part_id:
+                    continue
+                for t in s.sequence_tags:
+                    if t in kept:
+                        t0 = datetime.fromisoformat(kept[t]["t_start"])
+                        gap = abs((s.start_time.ToDatetime(tzinfo=timezone.utc) - t0).total_seconds())
+                        if t not in found or gap < found[t][1]:
+                            found[t] = (s.id, gap)
+            if not token:
+                break
+        found = {t: sid for t, (sid, gap) in found.items()}
+        missing = sorted(set(kept) - set(found))
+        ds = [d for d in await data.list_datasets_by_organization_id(a.org_id) if d.name == a.dataset]
+        dataset_id = ds[0].id if ds else await data.create_dataset(
+            name=a.dataset, organization_id=a.org_id, type=DatasetType.DATASET_TYPE_SEQUENCE_DATA)
+        if found:
+            await data.add_sequences_to_dataset(dataset_id=dataset_id, sequence_ids=list(found.values()))
+        print(json.dumps({"dataset_id": dataset_id, "added": len(found), "missing": missing}))
+    finally:
+        client.close()
 
 
 def main():
@@ -207,9 +259,16 @@ def main():
     run.add_argument("--gripper", default="gripper")
     run.add_argument("--world", default="sim-world")
     run.add_argument("--capture-sensor", default="demo-capture")
+    add = sub.add_parser("add")
+    add.add_argument("--log", required=True)
+    add.add_argument("--dataset", required=True)
+    add.add_argument("--org-id", default="16518049-9dd3-479f-9644-c5d112aa42d8")
+    add.add_argument("--part-id", required=True)
     a = ap.parse_args()
     if a.cmd == "run":
         asyncio.run(cmd_run(a))
+    elif a.cmd == "add":
+        asyncio.run(cmd_add(a))
 
 
 if __name__ == "__main__":
