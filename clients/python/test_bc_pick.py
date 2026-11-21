@@ -1,15 +1,17 @@
 # /// script
 # requires-python = ">=3.11"
+# dependencies = ["viam-sdk", "numpy", "scipy"]
 # ///
 """Pure-path checks for bc_pick.py. Run: uv run clients/python/test_bc_pick.py"""
 import math
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bc_pick import (  # noqa: E402
-    BIN_XY, BLOCK_AREA, TCP_MM, angle_diff, flange_from_tcp, grasp_theta, in_bin, minjerk_segment, pose_map,
-    sample_scene, world_to_arm, yaw_from_wxyz,
+    BIN_XY, BLOCK_AREA, TCP_MM, TILT_MAX_DEG, angle_diff, flange_from_tcp, grasp_theta, in_bin, minjerk_segment, pose_map,
+    sample_scene, tilt_vector, world_to_arm, yaw_from_wxyz,
 )
 
 # scenes: deterministic, in range
@@ -51,4 +53,36 @@ assert in_bin((bx, by, 320), BIN_XY) and in_bin((bx + 60, by - 60, 330), BIN_XY)
 assert not in_bin((bx + 80, by, 320), BIN_XY) and not in_bin((bx, by, 400), BIN_XY)
 
 assert pose_map((1, 2, 3, 45)) == {"x": 1, "y": 2, "z": 3, "o_x": 0, "o_y": 0, "o_z": -1, "theta": 45}
+
+# tilts: drawn after the v1 draws, so old seeds keep their scene
+r = random.Random(1003)
+(x0, x1), (y0, y1) = BLOCK_AREA
+v1 = {"block_xy": (r.uniform(x0, x1), r.uniform(y0, y1)), "block_yaw_deg": r.uniform(-45, 45),
+      "nudge_xyz": tuple(r.uniform(-30, 30) for _ in range(3)), "nudge_yaw_deg": r.uniform(-10, 10),
+      "speed": r.uniform(0.8, 1.2)}
+sc = sample_scene(1003)
+assert {k: sc[k] for k in v1} == v1
+assert set(sc["tilts"]) == {"start", "pregrasp", "lift"}
+for s in range(200):
+    for tx, ty in sample_scene(s)["tilts"].values():
+        assert math.hypot(tx, ty) <= TILT_MAX_DEG + 1e-9
+assert sample_scene(7)["tilts"] == sample_scene(7)["tilts"]
+
+# 6-tuple poses: (x, y, z, theta, tx, ty); untilted matches the old tool-down map exactly
+assert pose_map((1, 2, 3, 45)) == {"x": 1, "y": 2, "z": 3, "o_x": 0, "o_y": 0, "o_z": -1, "theta": 45}
+p = pose_map((1, 2, 3, 45, 0.0, 0.0))
+assert abs(p["o_z"] + 1) < 1e-9 and abs(p["theta"] - 45) < 1e-6
+p = pose_map((0, 0, 0, 180, 4.0, 0.0))  # 4 degrees about world x
+assert abs(math.degrees(math.acos(-p["o_z"])) - 4.0) < 1e-6
+assert max(abs(a - b) for a, b in zip(tilt_vector(3.0, 90.0), (0.0, 3.0))) < 1e-9
+
+# segments carry tilt: exact ends, min-jerk between
+seg = minjerk_segment((0, 0, 0, 180, 0.0, 0.0), (100, 0, 0, 180, 4.0, -2.0), 1.0, 30)
+assert seg[0] == (0, 0, 0, 180, 0.0, 0.0) and seg[-1] == (100, 0, 0, 180, 4.0, -2.0) and len(seg) == 31
+assert abs(seg[15][4] - 2.0) < 0.2  # halfway through min-jerk is halfway
+assert minjerk_segment((0, 0, 0, 180), (1, 0, 0, 180), 1.0, 10)[-1] == (1, 0, 0, 180)  # 4-tuples still work
+# mixed lengths never drop a tilt
+assert minjerk_segment((0, 0, 0, 180), (0, 0, 0, 180, 4.0, 0.0), 1.0, 10)[-1] == (0, 0, 0, 180, 4.0, 0.0)
+assert len(minjerk_segment((0, 0, 0, 180, 4.0, 0.0), (0, 0, 0, 180), 1.0, 10)[0]) == 6
+
 print("ok")

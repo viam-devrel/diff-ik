@@ -5,14 +5,17 @@ from scipy.spatial.transform import Rotation
 from viam.spatialmath import OrientationVector, RotationMatrix
 
 
-def _rotation(pose: dict) -> Rotation:
+def rotation(pose: dict) -> Rotation:
     q = OrientationVector(pose["o_x"], pose["o_y"], pose["o_z"], np.deg2rad(pose["theta"])).to_quaternion()
     return Rotation.from_matrix(np.asarray(q.to_rotation_matrix().elements, dtype=np.float64).reshape(3, 3))
 
 
+_rotation = rotation  # old name, still imported elsewhere
+
+
 def state_vector(pose: dict, gripper: float) -> list:
     """A pose map (x, y, z mm; o_x, o_y, o_z, theta degrees) and the gripper opening as the 10-number state."""
-    rows = _rotation(pose).as_matrix()[:2, :].reshape(6)
+    rows = rotation(pose).as_matrix()[:2, :].reshape(6)
     return [float(pose["x"]), float(pose["y"]), float(pose["z"]), *map(float, rows), float(gripper)]
 
 
