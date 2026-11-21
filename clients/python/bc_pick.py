@@ -37,6 +37,20 @@ def sample_scene(seed: int) -> dict:
     return d
 
 
+def block_pose(seed: int) -> tuple:
+    """World position (m) and orientation (wxyz) to set_prop_pose the block for this seed."""
+    sc = sample_scene(seed)
+    (bx, by), yaw = sc["block_xy"], math.radians(sc["block_yaw_deg"])
+    return [bx / 1000, by / 1000, (TABLE_TOP + BLOCK_MM / 2) / 1000], [math.cos(yaw / 2), 0, 0, math.sin(yaw / 2)]
+
+
+def start_pose(p0: dict, seed: int) -> tuple:
+    """The episode's start (flange, arm frame, 6-tuple): the session's first pose plus the seed's nudge and start tilt."""
+    sc = sample_scene(seed)
+    n, (tx, ty) = sc["nudge_xyz"], sc["tilts"]["start"]
+    return (p0["x"] + n[0], p0["y"] + n[1], p0["z"] + n[2], p0["theta"] + sc["nudge_yaw_deg"], tx, ty)
+
+
 def angle_diff(a: float, b: float) -> float:
     """a − b wrapped to [−180, 180)."""
     return (a - b + 180.0) % 360.0 - 180.0

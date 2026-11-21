@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bc_pick import (  # noqa: E402
+    block_pose, start_pose,
     BIN_XY, BLOCK_AREA, TCP_MM, TILT_MAX_DEG, TILT_MIN_DEG, angle_diff, flange_from_tcp, grasp_theta, in_bin, minjerk_segment, pose_map,
     sample_scene, tilt_vector, world_to_arm, yaw_from_wxyz,
 )
@@ -88,5 +89,14 @@ assert minjerk_segment((0, 0, 0, 180), (1, 0, 0, 180), 1.0, 10)[-1] == (1, 0, 0,
 # mixed lengths never drop a tilt
 assert minjerk_segment((0, 0, 0, 180), (0, 0, 0, 180, 4.0, 0.0), 1.0, 10)[-1] == (0, 0, 0, 180, 4.0, 0.0)
 assert len(minjerk_segment((0, 0, 0, 180, 4.0, 0.0), (0, 0, 0, 180), 1.0, 10)[0]) == 6
+
+# shared block layout and start pose
+pos, q = block_pose(1003)
+bx, by = sc["block_xy"]
+yaw = math.radians(sc["block_yaw_deg"])
+assert pos == [bx / 1000, by / 1000, 0.32] and q == [math.cos(yaw / 2), 0, 0, math.sin(yaw / 2)]
+sp = start_pose({"x": 0, "y": 0, "z": 0, "theta": 180}, 1003)
+assert sp[4:] == tuple(sc["tilts"]["start"])
+assert sp[:4] == (*sc["nudge_xyz"], 180 + sc["nudge_yaw_deg"])
 
 print("ok")

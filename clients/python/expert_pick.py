@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["viam-sdk"]
+# dependencies = ["viam-sdk", "numpy", "scipy"]
 # ///
 """Scripted pick-to-bin expert for dev/bc-pick-mujoco.json (spec docs/superpowers/specs/2026-11-21-...-data-design.md).
 
@@ -51,7 +51,7 @@ class Episode:
         await self.svc.do_command({"command": "servo_target", "session_id": self.sid, "pose": C.pose_map(p)})
 
     async def move(self, cur, goal, speed, check_grasp=False):
-        """Stream a min-jerk segment from cur to goal (flange, arm frame, (x, y, z, theta)); returns goal."""
+        """Stream a min-jerk segment from cur to goal (flange, arm frame, (x, y, z, theta, tx, ty)); returns goal."""
         dist = math.dist(cur[:3], goal[:3])
         dur = max(0.6, dist / (BASE_MM_S * speed), abs(C.angle_diff(goal[3], cur[3])) / 60.0)
         for i, p in enumerate(C.minjerk_segment(cur, goal, dur, TICK_HZ)):
@@ -85,29 +85,29 @@ class Episode:
         pos, q = r["pose"]["position"], r["pose"]["orientation_wxyz"]
         return tuple(v * 1000 for v in pos), q
 
+    async def place(self, seed):
+        await self.world.do_command({"command": "reset"})
+        pos, q = C.block_pose(seed)
+        await self.world.do_command({"command": "set_prop_pose", "prop": "block", "position": pos,
+                                     "orientation_wxyz": q})
+
     async def run(self, seed, tags=None) -> dict:
         sc = C.sample_scene(seed)
-        bx, by = sc["block_xy"]
-        yaw = math.radians(sc["block_yaw_deg"])
-        await self.world.do_command({"command": "reset"})
-        await self.world.do_command({"command": "set_prop_pose", "prop": "block",
-                                     "position": [bx / 1000, by / 1000, (C.TABLE_TOP + C.BLOCK_MM / 2) / 1000],
-                                     "orientation_wxyz": [math.cos(yaw / 2), 0, 0, math.sin(yaw / 2)]})
+        await self.place(seed)
         await self.gripper.open()
         r = await self.svc.do_command({"command": "servo_start", "component_name": self.a.arm, "frame": "arm_origin",
                                        "mode": "pose", "gain": 8, "timeout_ms": 3000,
                                        "limits": {"linear_mm_s": 300, "angular_deg_s": 90}})
         self.sid = r["session_id"]
         p0 = r["pose"]
-        cur = (p0["x"], p0["y"], p0["z"], p0["theta"])
+        cur = (p0["x"], p0["y"], p0["z"], p0["theta"], 0.0, 0.0)
         info = {"seed": seed, "scene": sc, "kept": False, "reason": ""}
         capturing = False
         try:
             if abs(p0["o_x"]) > 0.02 or abs(p0["o_y"]) > 0.02 or p0["o_z"] > -0.99:
                 # theta is only comparable across poses when the orientation vector is (0, 0, -1)
                 raise StartPoseError(f"start pose isn't tool-down: {p0}; fix home_joints (Task 2 Step 3)")
-            n = sc["nudge_xyz"]
-            start = (cur[0] + n[0], cur[1] + n[1], cur[2] + n[2], cur[3] + sc["nudge_yaw_deg"])
+            start = C.start_pose(p0, seed)
             cur = await self.move(cur, start, sc["speed"])
             await self.hold(cur, 0.5)
             if tags is not None:
@@ -116,8 +116,8 @@ class Episode:
             (wx, wy, wz), q = await self.block_world_mm()
             theta = C.grasp_theta(C.yaw_from_wxyz(q), cur[3])
             grasp_tcp = C.world_to_arm((wx, wy, wz + C.GRASP_ABOVE_CENTER))
-            pre = C.flange_from_tcp((grasp_tcp[0], grasp_tcp[1], grasp_tcp[2] + C.PREGRASP_ABOVE)) + (theta,)
-            grasp = C.flange_from_tcp(grasp_tcp) + (theta,)
+            pre = C.flange_from_tcp((grasp_tcp[0], grasp_tcp[1], grasp_tcp[2] + C.PREGRASP_ABOVE)) + (theta, *sc["tilts"]["pregrasp"])
+            grasp = C.flange_from_tcp(grasp_tcp) + (theta, 0.0, 0.0)
             cur = await self.move(cur, pre, sc["speed"])
             cur = await self.move(cur, grasp, sc["speed"] * 0.6)
             await self.hold(cur, 0.2)
@@ -127,13 +127,13 @@ class Episode:
                 if time.monotonic() > deadline:
                     raise Discard("grasp timeout")
                 await self.hold(cur, 0.1)
-            lift = (cur[0], cur[1], cur[2] + C.LIFT, cur[3])
+            lift = (cur[0], cur[1], cur[2] + C.LIFT, cur[3], *sc["tilts"]["lift"])
             cur = await self.move(cur, lift, sc["speed"] * 0.8, check_grasp=True)
             bin_tcp = C.world_to_arm((C.BIN_XY[0], C.BIN_XY[1], C.BIN_RIM_Z + C.PLACE_ABOVE_RIM))
-            over_bin = C.flange_from_tcp(bin_tcp) + (cur[3],)
+            over_bin = C.flange_from_tcp(bin_tcp) + (cur[3], 0.0, 0.0)
             cur = await self.move(cur, over_bin, sc["speed"], check_grasp=True)
             await self.hold_during(cur, 0.6, self.gripper.open())
-            cur = await self.move(cur, (cur[0], cur[1], cur[2] + C.RETREAT, cur[3]), sc["speed"])
+            cur = await self.move(cur, (cur[0], cur[1], cur[2] + C.RETREAT, cur[3], 0.0, 0.0), sc["speed"])
             await self.hold(cur, 0.4)
             b1, _ = await self.block_world_mm()
             await self.hold(cur, 0.3)
@@ -182,7 +182,7 @@ async def cmd_run(a):
             for seed in seeds:
                 tags = None
                 if a.capture:
-                    tags = [f"cmd:{INSTRUCTION}", f"episode:{a.capture}-{seed}", "expert:v1"]
+                    tags = [f"cmd:{INSTRUCTION}", f"episode:{a.capture}-{seed}", "expert:v2"]
                 info = await ep.run(seed, tags)
                 n += 1
                 if a.capture:
