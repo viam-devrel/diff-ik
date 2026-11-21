@@ -162,6 +162,13 @@ async def main():
     svc.seq = ["running", "running", "stopped_timeout"]
     assert (await ex.close())["state"] == "stopped_timeout" and not svc.of("servo_stop")
 
+    # a session error that left the session running: the poll times out, then servo_stop is sent
+    svc = FakeSvc(); ex = ModuleExec(svc, FakeGripper(), "arm", 80)
+    await ex.start(3, time_scale=TS)
+    ex.errors.append(("session", "RuntimeError('transient')"))
+    r = await ex.close()
+    assert len(svc.of("servo_stop")) == 1 and r["state"] == "stopped"
+
     # 2. client: start goal fed before the first chunk; a dead session surfaces in play
     svc = FakeSvc(); ex = ClientExec(svc, FakeGripper(), "arm", 0)
     await ex.start(3, time_scale=TS)

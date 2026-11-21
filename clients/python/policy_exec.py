@@ -159,6 +159,10 @@ class Executor:
                 await asyncio.wait_for(self._gcmd, 2.0)
             except Exception as e:  # noqa: BLE001
                 self.errors.append(("gripper", repr(e)))
+        elif self._gcmd and not self._gcmd.cancelled() and self._gcmd.exception():
+            err = ("gripper", repr(self._gcmd.exception()))
+            if err not in self.errors:  # _fire may have recorded it already
+                self.errors.append(err)
         st = await self.svc.do_command({"command": "servo_status", "session_id": self.sid})
         state, peak = st.get("state"), st.get("peak_accel_ratio")
         if not self._terminal(state):
@@ -175,8 +179,12 @@ class Executor:
                     if self._terminal(state):
                         break
                     await asyncio.sleep(0.1)
-                else:
-                    state = f"{state} (not terminal)"
+                else:  # the error didn't end the session (transient/validation): stop it, or the next start is "busy"
+                    try:
+                        state = (await self.svc.do_command(
+                            {"command": "servo_stop", "session_id": self.sid})).get("state")
+                    except Exception:  # noqa: BLE001
+                        state = f"{state} (not terminal)"
         return {"state": state, "peak_accel_ratio": peak, "msgs": self.msgs}
 
 
