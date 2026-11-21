@@ -204,5 +204,75 @@ Run: `cd ~/src/viam-sequence-to-lerobot && uv run python ~/src/diff-ik/dev/check
   `infer_s` 0.64, max step 7.4 mm, first pose (555.6, -71.9, 218.5), last (555.4, -78.7, 222.2), all inside the
   workspace; gripper column ~97 (open). Arm moved from (492.0, 134.0, 488.0) to (537.0, -15.6, 300.7), i.e. toward
   the chunk (still travelling when the session was stopped: the chunk is 2 s, the start is ~400 mm from it).
-  `accepted` "idle", status "running", `peak_accel_ratio` 1.0, no fault. A second run, watched in `overview`, showed
+  `accepted` (since renamed `trajectory_reply_state`) "idle", status "running", `peak_accel_ratio` 1.0, no fault. A second run, watched in `overview`, showed
   the arm descending smoothly from home toward the block. Task success not expected.
+
+### Review fixes and re-run (commit c99c1d6)
+- `policy_run.py`: `accepted` renamed `trajectory_reply_state` (it is the session state when the call landed; a rejected
+  chunk raises); the summary now also prints `lead_ms`, `remaining_ms`, `trajectory_ended`, the `servo_stop` reply state
+  (`stop_state`), `row0_to_state_mm` and `row_last_to_end_mm`. The image-key assert is an explicit `SystemExit` that also
+  checks `specs` `state_dim` and `action_dim` are 10; an unknown image mime type raises. `.runs/` is now in `.gitignore`.
+- Why the cloud address: the insecure local dial (`--insecure` to `localhost:8087`) failed, so every run used
+  `diff-ik-policy-sim-main.sr89pn2pma.viam.cloud` with the machine API key from the environment.
+- Raw `--once` output (world reset first):
+```json
+{"rows": 20, "row_width": 10, "infer_s": 0.22598170908167958, "first": {"x": 555.5869750976562, "y": -71.89149475097656, "z": 218.45579528808594, "o_x": 0.00045088854810002433, "o_y": 0.00033252964844739216, "o_z": -0.9999998430617627, "theta": 27.549262871274024}, "last": {"x": 555.3858642578125, "y": -78.68677520751953, "z": 222.17494201660156, "o_x": 4.877292441941769e-05, "o_y": 0.0005731078954688373, "o_z": -0.9999998345842573, "theta": 24.1402116088017}, "max_step_mm": 7.4168779699635925, "gripper_col": [96.9, 97.0, 96.7, 96.5, 96.6], "start_xyz": [491.99782177812176, 134.0032471009216, 488.00036731899365], "end_xyz": [536.9462407740183, -15.058042091240765, 301.05189956584456], "row0_to_state_mm": 345.09491658597386, "row_last_to_end_mm": 103.00587276671077, "trajectory_reply_state": "idle", "lead_ms": 0.0, "remaining_ms": 0.0, "status_state": "running", "trajectory_ended": true, "stop_state": "stopped", "peak_accel_ratio": 1.0000000000000009}
+```
+  The first pose is **345 mm** from the observed state; the last pose is 103 mm from where the arm stopped (the arm was still
+  travelling when the session ended). `lead_ms` and `remaining_ms` read 0.0 in the reply (the chunk was already due, since
+  the start was far from row 0); not investigated.
+
+### Offline frame check (training frames through `infer`)
+Three frames of `local/diff-ik-pick-v2` (JPEG-encoded images, state, task) sent to `vla-policy` `infer`; distances in mm
+between the chunk's first row and the frame's state / dataset action (xyz):
+
+| frame | row0 | state | \|row0 - state\| | \|row0 - action\| |
+|---|---|---|---|---|
+| 0 (start, home) | (553.3, 108.8, 305.4) | (483.2, 132.1, 490.1) | 198.9 | 198.6 |
+| 40 (near grasp) | (620.0, 53.4, 86.8) | (619.7, 74.6, 86.9) | 21.2 | 21.3 |
+| 1500 (mid-episode) | (529.5, -136.8, 216.8) | (517.1, 16.3, 184.3) | 157.0 | 152.0 |
+
+Conclusion: the layout and frame are right. Predictions point to the right workspace region and the frame near the grasp
+lands within 21 mm; the large misses are at home and mid-carry, where a 300-step, loss ~3 ACT policy is undertrained and
+predicts a chunk that leads the state (a 20-row chunk at 10 Hz covers 2 s, so some lead is expected). No sign of a
+layout or normalization mismatch (that would miss by hundreds of mm on training frames too). Three frames only. Script:
+scratchpad `frame_check.py` (not committed).
+
+## Task 10: cell summary, versions, tests, limits
+
+### The cell
+- `dev/bc-pick-mujoco.json`: ur5e + 2F-85, wood table, bin, red 40 mm block, `scene-cam` / `wrist-cam` 448 x 448; the
+  before/after renders are in `.runs/policy-sim/renders/` (`before-*`, `after-*`, `v2-*`); `home_joints` changed (joint 1 =
+  3.1416) as described in Task 2; cameras unchanged.
+
+### Versions
+- mujoco-sim: branch `diff-ik-policy-sim` from 0.20.0, commits `d395004` (gripper `position`) and `0b31747` (camera
+  `captured_at`).
+- Converter (`viam-sequence-to-lerobot`): branch `diff-ik-policy-sim` from `bimanual`, commits `6eae2ce` (`--action-space ee`)
+  and `03f5a1c` (review follow-ups).
+- `viam:capture-control` 0.1.1; `viam-labs:vla` 0.3.0; viam-server v1.17.0.
+- LeRobot `02655292` with Python 3.12 for training; the module's bundled LeRobot is older, so the smoke checkpoint needed the
+  compat `config.json` (the `dtype` and `optimizer_fused` fields stripped).
+
+### Tests (all green)
+- `test_bc_pick.py`: ok; `test_policy_layout.py`: ok.
+- Converter suite: 111 passed, 1 xfailed.
+- mujoco-sim `tests/test_gripper.py` + `tests/test_camera.py` (`--tb=line`): 41 passed.
+- diff-ik `go build ./...`: ok (no Go changes).
+
+### Done when (spec)
+1. Cell runs on the patched mujoco-sim; tuned visuals approved (visual fix, Task 2).
+2. Expert 20/20 over seeds 1000-1019 (>= 95%).
+3. `diff-ik-pick-v2` 50 episodes, `diff-ik-pick-v2-eval` 10; card above.
+4. `ee` mode tested; datasets load, 0 NaNs, gripper bimodal, ranges match the randomization.
+5. Smoke test passes: trained, served, `--once` drove `servo_trajectory`; no fault.
+6. This doc.
+
+### Limits
+- One scene (fixed bin, one block, one lighting), 50 expert episodes, sim only.
+- The smoke policy (300 steps) is not expected to succeed; the offline check shows it is undertrained, not mis-laid-out.
+- Gripper "closed" is ~44 (the block holds the jaws open), never near 0.
+- Real-episode skew re-check not done; captured-at stamps are the data manager's `time_requested`.
+- Cell config has machine-local absolute paths; the local insecure dial failed, so tooling goes through the cloud.
+- The module's LeRobot and the training LeRobot must be pinned together (or the fields stripped).
+- Sub-project 2 (closed-loop runner, training at scale) not started; the machine is left running.
