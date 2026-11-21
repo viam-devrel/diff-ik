@@ -340,7 +340,7 @@ Interface (all three):
 class Executor:
     async def start(self, seed: int) -> None: ...            # servo_start, then servo to bc_pick.start_pose(p0, seed) (p0 = the servo_start reply pose), settle 0.5 s
     async def play(self, chunk: dict) -> None: ...           # chunk = {"t_obs", "dt", "poses", "grip"}; returns quickly
-    def done_at(self) -> float: ...                          # monotonic time the current chunk finishes playing
+    async def wait_done(self) -> None: ...                   # returns when the current chunk has played (sync cadence)
     async def close(self) -> dict: ...                       # stop; returns {"state", "peak_accel_ratio", "msgs"}
 ```
 
@@ -348,7 +348,7 @@ Shared: every executor counts arm command messages (`self.msgs`), owns a `Grippe
 
 - [ ] **ModuleExec(svc, gripper, arm_name, lead_ms, blend_ms=200):** keeps the start session. `play`: one `servo_trajectory` with `poses`, `dt_ms = dt*1000`, `age_ms = (now - t_obs)*1000`, `blend_ms`, and `lead_ms` unless `lead_ms is None` (auto); gripper events with `lead = reply["lead_ms"]/1000`. `close`: `servo_status` (for `peak_accel_ratio`) then `servo_stop`.
 - [ ] **ClientExec(svc, gripper, arm_name, lead_ms, blend_ms=200):** keeps the start session; a 30 Hz task sends `servo_target` with `playback.blended(cur, prev, now + lead, w, sample_chunk, mix_pose)`, `w = min(1, (now - switch_t)/blend_s)`; past the chunk's end it holds the last row (`sample_chunk` clamps). `play` swaps `prev, cur` and resets `switch_t`.
-- [ ] **MoveExec(motion, gripper, arm_name, servo_svc):** `start` uses a servo session (as above) then `servo_stop`s it. A worker task runs a queue of rows: for each, `MotionClient.move(component_name=arm_name, destination=PoseInFrame(reference_frame="arm_origin", pose=...))` (the builtin service, `MotionClient.from_robot(robot, "builtin")`), and fires that row's gripper command when the row's `Move` starts. `play` replaces the queue with rows from `first_live_row(t_obs, dt, now)`. `done_at` is "queue empty" (sync waits for it). No `peak_accel_ratio`.
+- [ ] **MoveExec(motion, gripper, arm_name, servo_svc):** `start` uses a servo session (as above) then `servo_stop`s it. A worker task runs a queue of rows: for each, `MotionClient.move(component_name=arm_name, destination=PoseInFrame(reference_frame="arm_origin", pose=...))` (the builtin service, `MotionClient.from_robot(robot, "builtin")`), and fires that row's gripper command when the row's `Move` starts. `play` replaces the queue with rows from `first_live_row(t_obs, dt, now)`. `wait_done` returns when the queue is empty and no Move is in flight. No `peak_accel_ratio`.
 - [ ] **Fake-service check** in `test_policy_exec.py`: a fake `svc.do_command` that records commands, a fake gripper; drive `ModuleExec.play` and `ClientExec` for 0.3 s with `asyncio.run`, assert one `servo_trajectory` with the expected `age_ms` ≥ 0 and `dt_ms` 100, and that `ClientExec` sent about 9 `servo_target`s whose poses move from row 0 toward row 1. Keep it small.
 - [ ] Run `uv run clients/python/test_policy_exec.py`; commit `git commit -am "policy_exec: module, client and move executors"`.
 
@@ -368,7 +368,7 @@ uv run clients/python/policy_run.py --address <addr> --mode module|client|move -
   2. Infer with a 5 s `asyncio.wait_for`; `chunk_to_poses(rows)` → poses + gripper column; record `row0_to_state_mm`.
   3. Before `play`, if a chunk is playing, record the seam gap: `math.dist` of `sample_chunk(old, now)` and `sample_chunk(new, now)` positions.
   4. `executor.play(chunk)`.
-  5. Sync: sleep until `executor.done_at()`. Async: sleep until `t_obs + replan_every * dt`.
+  5. Sync: `await executor.wait_done()`. Async: sleep until `t_obs + replan_every * dt`.
   6. Success is checked by a side task (so it doesn't delay the async cadence): every 0.3 s it reads `get_prop_pose` and the gripper `input` and calls `succeeded(previous_read, this_read, input)` once two reads exist; a success ends the episode. Timeout ends it at `--timeout-s`.
   - A side task samples `arm.get_end_position()` at 30 Hz into `(t, x, y, z)` for `jerk_rms`.
   - Failures per spec "Error handling" (`infer`, session state, `plan`, `gripper`) end the episode with that `outcome`; the run continues with the next seed. Abort the run only if the machine is unreachable or `specs` don't match (existing checks).
