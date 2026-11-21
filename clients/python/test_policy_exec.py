@@ -24,6 +24,8 @@ assert jerk_rms(line) < 1e-6
 cubic = [(i / 30, (i / 30) ** 3, 0, 0) for i in range(60)]
 assert abs(jerk_rms(cubic) - 6.0) < 1e-6
 assert math.isnan(jerk_rms(line[:3]))
+assert abs(jerk_rms(line[:30] + line[29:31] + line[31:]) - 0) < 1e-6  # a duplicated timestamp does not raise
+assert math.isnan(jerk_rms([line[0]] * 5))
 
 # jitter (1/30 s plus up to 8 ms) must not blow it up
 rng = random.Random(0)

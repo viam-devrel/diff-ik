@@ -28,7 +28,8 @@ def _rows_rotation(r) -> Rotation:
 
 
 def pose_map_from(xyz, R: Rotation) -> dict:
-    """A position (mm) and a scipy Rotation as a pose map (orientation vector, theta in degrees); tilts under TILT_MIN_DEG snap to tool-down."""
+    """A position (mm) and a scipy Rotation as a pose map (orientation vector, theta in degrees);
+    tilts under TILT_MIN_DEG snap to tool-down."""
     z = R.apply([0, 0, 1])
     if np.degrees(np.arccos(np.clip(-z[2], -1, 1))) < TILT_MIN_DEG:  # the server would read a tilt toward +x
         R = Rotation.align_vectors([[0, 0, -1]], [z])[0] * R  # tool down, same yaw

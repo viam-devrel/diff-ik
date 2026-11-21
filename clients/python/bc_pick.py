@@ -3,6 +3,11 @@ World frame in mm; the arm stands at world (0, 0, 400) with no rotation (dev/bc-
 import math
 import random
 
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+from policy_layout import TILT_MIN_DEG, pose_map_from, rotation
+
 ARM_BASE = (0.0, 0.0, 400.0)  # arm_origin in world, mm
 TABLE_TOP = 300.0
 BLOCK_MM = 40.0
@@ -17,7 +22,6 @@ LIFT = 100.0
 PLACE_ABOVE_RIM = 120.0
 RETREAT = 50.0
 TILT_MAX_DEG = 4.0
-from policy_layout import TILT_MIN_DEG, pose_map_from, rotation  # noqa: E402
 TILTED = ("start", "pregrasp", "lift")  # grasp, above-bin (release) and retreat stay vertical
 
 
@@ -108,10 +112,8 @@ def pose_map(p) -> dict:
     (tx, ty) degrees."""
     if len(p) < 6 or math.hypot(p[4], p[5]) < TILT_MIN_DEG:
         return {"x": p[0], "y": p[1], "z": p[2], "o_x": 0, "o_y": 0, "o_z": -1, "theta": p[3]}
-    import numpy as np
-    from scipy.spatial.transform import Rotation
-
-    R = Rotation.from_rotvec(np.radians([p[4], p[5], 0.0])) * rotation({"o_x": 0, "o_y": 0, "o_z": -1, "theta": p[3]})
+    down = rotation({"o_x": 0, "o_y": 0, "o_z": -1, "theta": p[3]})
+    R = Rotation.from_rotvec(np.radians([p[4], p[5], 0.0])) * down
     return pose_map_from(p[0:3], R)
 
 

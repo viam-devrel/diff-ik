@@ -17,7 +17,8 @@ def first_live_row(t_obs: float, dt: float, now: float) -> int:
 
 
 def gripper_events(gcol, t_obs: float, dt: float, closed: bool, lead: float) -> list:
-    """(time, "grab"|"open") at each 0.5 crossing from the last commanded state, fired `lead` s early for actuation latency."""
+    """(time, "grab"|"open") at each 0.5 crossing from the last commanded state, fired `lead` s early
+    for actuation latency."""
     out = []
     for k, v in enumerate(gcol):
         want = v > 0.5
@@ -28,10 +29,15 @@ def gripper_events(gcol, t_obs: float, dt: float, closed: bool, lead: float) -> 
 
 
 def jerk_rms(samples) -> float:
-    """RMS 3-D jerk (mm/s^3) of (t, x, y, z) samples, resampled evenly (cubic spline; linear interpolation's kinks swamp the third difference) so timing jitter doesn't blow up the difference; NaN under 4 samples. Only comparable between runs at the same sample rate (position noise dominates at 30 Hz)."""
-    if len(samples) < 4:
+    """RMS 3-D jerk (mm/s^3) of (t, x, y, z) samples; NaN under 4 distinct timestamps.
+
+    Resampled evenly so timing jitter doesn't blow up the difference (cubic spline: linear interpolation's
+    kinks swamp the third difference). Only comparable between runs at the same sample rate, because
+    position noise dominates at 30 Hz."""
+    a = np.asarray(samples, dtype=float).reshape(-1, 4)
+    a = a[np.unique(a[:, 0], return_index=True)[1]]  # sorted, first sample of each timestamp
+    if len(a) < 4:
         return float("nan")
-    a = np.asarray(samples, dtype=float)
     t = np.linspace(a[0, 0], a[-1, 0], len(a))
     dt = t[1] - t[0]
     j = np.diff(CubicSpline(a[:, 0], a[:, 1:])(t), n=3, axis=0) / dt**3
