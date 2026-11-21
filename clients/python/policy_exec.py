@@ -1,11 +1,13 @@
 """Policy chunk execution: pure helpers (top), executors below."""
 import asyncio
+import contextlib
 import math
 import time
 
 import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Slerp, Rotation
+from viam.proto.common import Pose, PoseInFrame
 
 import bc_pick
 import playback
@@ -84,7 +86,9 @@ class Executor:
         self.sid = None
         self._gtask = None
         self._chunk = None
+        self.goal = None
 
+    # _cmd counts arm commands in self.msgs; raw svc.do_command (status, stop) does not.
     async def _cmd(self, command, **kw):
         self.msgs += 1
         return await self.svc.do_command({"command": command, **kw})
@@ -95,7 +99,7 @@ class Executor:
         r = await self._cmd("servo_start", component_name=self.arm_name, frame="arm_origin", mode="pose", gain=8,
                             timeout_ms=3000, limits=START_LIMITS)
         self.sid, p0 = r["session_id"], r["pose"]
-        goal = bc_pick.start_pose(p0, seed)
+        goal = self.goal = bc_pick.start_pose(p0, seed)
         cur = (p0["x"], p0["y"], p0["z"], p0["theta"])
         dur = max(0.6, math.dist(cur[:3], goal[:3]) / 150.0, abs(bc_pick.angle_diff(goal[3], cur[3])) / 60.0)
         for p in bc_pick.minjerk_segment(cur, goal, dur * time_scale, TICK_HZ):
@@ -119,21 +123,34 @@ class Executor:
         for t, what in events:
             await asyncio.sleep(max(0.0, t - time.monotonic()))
             try:
-                await (self.gripper.grab() if what == "grab" else self.gripper.open())
-                self.closed = what == "grab"
+                self.closed = what == "grab"  # last commanded state, set before the await
+                # shield: cancelling the scheduler never aborts an in-flight grab/open
+                await asyncio.shield(self.gripper.grab() if what == "grab" else self.gripper.open())
             except Exception as e:  # noqa: BLE001 - recorded, not raised
                 self.errors.append(("gripper", repr(e)))
 
     async def wait_done(self) -> None:
         c = self._chunk
+        if c is None:
+            return
         await asyncio.sleep(max(0.0, c["t_obs"] + (len(c["poses"]) - 1) * c["dt"] - time.monotonic()))
 
+    async def _cancel(self, task) -> None:
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     async def _stop(self) -> dict:
-        if self._gtask:
-            self._gtask.cancel()
+        await self._cancel(self._gtask)
         st = await self.svc.do_command({"command": "servo_status", "session_id": self.sid})
-        stop = await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})
-        return {"state": stop.get("state"), "peak_accel_ratio": st.get("peak_accel_ratio"), "msgs": self.msgs}
+        state = st.get("state")
+        if not (str(state).startswith("stopped") or state == "faulted"):  # else already ended: report it
+            try:
+                state = (await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})).get("state")
+            except Exception:  # noqa: BLE001 - "session ended: ..." races; keep the status state
+                pass
+        return {"state": state, "peak_accel_ratio": st.get("peak_accel_ratio"), "msgs": self.msgs}
 
 
 class ModuleExec(Executor):
@@ -172,19 +189,33 @@ class ClientExec(Executor):
     async def _stream(self):
         while True:
             t = time.monotonic()
-            if self.cur is not None:
+            if self.cur is None:
+                pose = bc_pick.pose_map(self.goal)  # feed the dead-man until the first chunk
+            else:
                 w = 1.0 if self.blend_s <= 0 else min(1.0, (t - self.switch_t) / self.blend_s)
                 pose = playback.blended(self.cur, self.prev, t + self.lead, w, sample_chunk, mix_pose)
+            try:
                 await self._cmd("servo_target", session_id=self.sid, pose=pose)
+            except Exception as e:  # noqa: BLE001
+                self.errors.append(("session", repr(e)))
+                return
             await asyncio.sleep(max(0.0, 1 / TICK_HZ - (time.monotonic() - t)))
 
+    def _check(self):
+        if self._task.done():
+            raise RuntimeError(f"servo stream ended: {self.errors[-1:]}")
+
+    async def wait_done(self) -> None:
+        self._check()
+        await super().wait_done()
+
     async def play(self, chunk: dict) -> None:
+        self._check()
         self.prev, self.cur, self.switch_t, self._chunk = self.cur, chunk, time.monotonic(), chunk
         self._schedule_gripper(chunk, self.lead)
 
     async def close(self) -> dict:
-        if self._task:
-            self._task.cancel()
+        await self._cancel(self._task)
         return await self._stop()
 
 
@@ -204,7 +235,6 @@ class MoveExec(Executor):
         self._worker = asyncio.create_task(self._run())
 
     async def _run(self):
-        from viam.proto.common import Pose, PoseInFrame
         while True:
             if not self.queue:
                 self._wake.clear()
@@ -238,6 +268,5 @@ class MoveExec(Executor):
             await asyncio.sleep(0.01)
 
     async def close(self) -> dict:
-        if self._worker:
-            self._worker.cancel()
+        await self._cancel(self._worker)
         return {"state": "done", "peak_accel_ratio": None, "msgs": self.msgs}

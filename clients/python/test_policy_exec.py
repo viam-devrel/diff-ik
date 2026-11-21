@@ -61,7 +61,7 @@ TS = 0.05  # start() time_scale: test-only, shortens the start motion
 
 class FakeSvc:
     def __init__(self):
-        self.cmds = []
+        self.cmds, self.status, self.stop_err = [], "running", False
 
     async def do_command(self, c):
         self.cmds.append(c)
@@ -70,18 +70,24 @@ class FakeSvc:
             return {"session_id": "s", "pose": {"x": 500, "y": 0, "z": 300, "o_x": 0, "o_y": 0, "o_z": -1, "theta": 180}}
         if k == "servo_trajectory":
             return {"lead_ms": 80, "remaining_ms": 1000, "state": "running"}
-        return {"state": "running" if k == "servo_status" else "stopped", "peak_accel_ratio": 0.5}
+        if k == "servo_status":
+            return {"state": self.status, "peak_accel_ratio": 0.5}
+        if self.stop_err:
+            raise RuntimeError("session ended: timeout")
+        return {"state": "stopped", "peak_accel_ratio": 0.5}
 
     def of(self, k):
         return [c for c in self.cmds if c["command"] == k]
 
 
 class FakeGripper:
-    def __init__(self):
-        self.calls = []
+    def __init__(self, slow=0.0):
+        self.calls, self.slow, self.done = [], slow, []
 
     async def grab(self):
         self.calls.append("grab")
+        await asyncio.sleep(self.slow)
+        self.done.append("grab")
 
     async def open(self):
         self.calls.append("open")
@@ -138,6 +144,47 @@ async def main():
     await ex.wait_done()
     assert moved == [500 + 10 * k for k in range(20)] and g.calls == ["grab"] and ex.msgs == 20
     assert (await ex.close())["state"] == "done"
+
+    # 1. ended sessions are reported, not stopped; a stop error falls back to the status state
+    svc = FakeSvc(); ex = ModuleExec(svc, FakeGripper(), "arm", 80)
+    await ex.start(3, time_scale=TS)
+    svc.status = "stopped_timeout"
+    assert (await ex.close())["state"] == "stopped_timeout" and not svc.of("servo_stop")
+    svc = FakeSvc(); ex = ModuleExec(svc, FakeGripper(), "arm", 80)
+    await ex.start(3, time_scale=TS)
+    svc.stop_err = True
+    assert (await ex.close())["state"] == "running"
+
+    # 2. client: start goal fed before the first chunk; a dead session surfaces in play
+    svc = FakeSvc(); ex = ClientExec(svc, FakeGripper(), "arm", 0)
+    await ex.start(3, time_scale=TS)
+    n0 = len(svc.of("servo_target")); await asyncio.sleep(0.2)
+    assert len(svc.of("servo_target")) > n0 + 3
+    orig = svc.do_command
+    async def dead(c):
+        if c["command"] == "servo_target":
+            raise RuntimeError("session ended")
+        return await orig(c)
+    svc.do_command = dead
+    await asyncio.sleep(0.1)
+    assert ex.errors and ex.errors[0][0] == "session"
+    try:
+        await ex.play(mk_chunk()); raise AssertionError("play should raise")
+    except RuntimeError:
+        pass
+    await ex.close()
+
+    # 3. a replaced scheduler never aborts an in-flight grab; closed is set at command time
+    svc, g = FakeSvc(), FakeGripper(slow=0.2)
+    ex = ModuleExec(svc, g, "arm", 80)
+    await ex.start(3, time_scale=TS)
+    await ex.play(mk_chunk([1.0] * 20, ahead=-0.1))
+    await asyncio.sleep(0.05)
+    assert ex.closed and g.calls == ["grab"]
+    await ex.play(mk_chunk([1.0] * 20, ahead=-0.1))  # replaces the task mid-grab
+    await asyncio.sleep(0.3)
+    assert g.done == ["grab"] and g.calls == ["grab"]
+    await ex.close()
 
 asyncio.run(main())
 print("ok")
