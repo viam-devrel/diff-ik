@@ -54,7 +54,28 @@ fires at the row's own time (`--grip-early` keeps the old timing). A/B on the 30
 
 Paired metrics are within noise. The misses come from policy accuracy, not timing.
 
-## Next
+## Cloud ACT (Track 1)
 
-Cloud training, longer and larger-batch, on the same v3 dataset (Track 1 PRs merged: viam-labs/viam-sequence-to-lerobot#10,
-viam-labs/viam-lerobot-training#1).
+- **Pipeline:** viam-labs/viam-sequence-to-lerobot#10 and viam-labs/viam-lerobot-training#1 squash-merged (converter
+  `3215dc0`). Training script `lerobot-training` v1, then v2 (below), uploaded to DevRelDemos.
+- **Containers:** `docker.io/hipsterbrown/viam-lerobot-training:0.1.0-1` (17.3 GB; all curated policies) took about 50 min
+  from submit to the program starting, most of it the image pull. `0.1.0-slim-1` (5.0 GB; `lerobot[training,peft]`
+  only, ACT/diffusion) started within minutes.
+- **Job 1 (`6b01f137…`) failed:** `viam train submit --args` rejects `=` inside a value, so the README's
+  `extra="'--policy.chunk_size=50 …'"` can't be submitted; the space form `--policy.chunk_size 50` passed the CLI but the
+  script parsed `50` as a flag (`argument --policy.n_action_steps: expected one argument`). Fixed in the script (`extra`
+  accepts `--flag value` pairs; branch `extra-space-values`, uploaded as v2; the PR is pending a working `gh`).
+- **Job 2 (`6b02006f…`):** slim container, 2 × A100 40GB (`accelerate`, one process per GPU), batch 32 per GPU (64 in
+  all), 30k steps (233 epochs of 9171 frames, 10% of episodes held out), lr 3e-5 policy and backbone (√8 × ACT's 1e-5 for
+  8× the batch), chunk 20. 0.08 s/step once warm (data 0.004 s: compute-bound, 4 workers per process), 2.45 GB per GPU,
+  **43 min of training**. Final train loss 0.028, eval loss 0.155 (best 0.152). Model `diff-ik-pick-act` v1.
+- **Open loop (same 200 frames as local):** first-row error median 11.8 mm, but p90 124 mm: on some frames the
+  prediction collapses to about the dataset-mean pose, which reads as overfitting (train 0.028 vs eval 0.155).
+- **Gate (module, sync, `lead_ms` 100, 30 eval seeds; served from a compat copy on vla 0.3.0):**
+
+  | model | successes | jerk median | seam median / p95 (mm) | row0 median (mm) |
+  |---|---|---|---|---|
+  | cloud 30k | **20/30 (67%)** | 8632 | 12.0 / 30.7 | 14.7 |
+  | local 10k | 13/30 (43%) | 10752 | 36.6 / 80.9 | 21.6 |
+
+  One short of the 21/30 bar.
