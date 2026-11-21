@@ -38,10 +38,12 @@ assert flange_from_tcp((550, 0, 328)) == (550, 0, 328 + TCP_MM)
 
 # min-jerk: exact ends, monotonic progress, count
 seg = minjerk_segment((0, 0, 0, 180), (100, 0, 0, 200), 1.0, 30)
-assert seg[0] == (0, 0, 0, 180) and seg[-1] == (100, 0, 0, 200) and len(seg) == 31
+assert seg[0] == (0, 0, 0, 180) and seg[-1][:3] == (100, 0, 0) and angle_diff(seg[-1][3], 200) == 0 and len(seg) == 31
 assert all(p[0] <= q[0] for p, q in zip(seg, seg[1:]))
 wrap = minjerk_segment((0, 0, 0, 170), (0, 0, 0, -170), 1.0, 10)  # crosses 180: short way, +20 degrees
 assert abs(angle_diff(wrap[5][3], 180)) < 1e-6
+assert abs(wrap[-1][3] - wrap[-2][3]) < 5 and angle_diff(wrap[-1][3], -170) == 0  # no 360 jump at the end
+assert -180 <= yaw_from_wxyz([0, 0, 0, 1]) < 180 and yaw_from_wxyz([0, 0, 0, 1]) == -180
 
 # in the bin: inside the inner footprint and below the rim
 bx, by = BIN_XY

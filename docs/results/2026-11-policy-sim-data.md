@@ -109,3 +109,16 @@ Date 2026-11-21. Laptop viam-server v1.17.0, `viam` CLI 1.17.0, viam-sdk 0.85+.
 - Light: key light direction `[0.6, 0.15, -0.8]`, color `[0.82, 0.76, 0.68]` (was `[-0.4, 0.3, -1]`, `[0.95, 0.88, 0.78]`),
   so the arm casts a visible shadow on the table. Fill, rim, headlight, sky, shadow size and antialias unchanged.
 - Renders: `.runs/policy-sim/renders/v2-{overview,scene-cam,wrist-cam}.jpg` (not committed).
+
+## Task 4: scripted expert and the expert bar
+
+- `clients/python/expert_pick.py run` (no capture). First episode (seed 1000) kept with no constant changes; the plan's
+  grasp height, speeds and timings worked as written. One code fix: the viam SDK's motion/gripper/etc. client modules must
+  be imported before `RobotClient.at_address`, or `MotionClient.from_robot` raises `ResourceNotFoundError` (imports now at
+  module top).
+- `bc_pick.py` fixes (tests first): `minjerk_segment`'s last sample keeps theta continuous (`a[3] + dth`, no 360 deg jump
+  across +-180); `yaw_from_wxyz` wraps to [-180, 180). `uv run clients/python/test_bc_pick.py` prints `ok`.
+- **Expert bar: 20/20 kept (success 1.0) over seeds 1000-1019**; no failures, so no failure reasons by phase.
+  Log: `.runs/policy-sim/expert-bar.jsonl` (untracked). `overview` after the run shows the block in the bin.
+- Episode duration: about 12 s per episode wall-clock (seed 1000 alone: 14.5 s including connect and start; 20 episodes
+  in about 4 min). Not logged per episode.

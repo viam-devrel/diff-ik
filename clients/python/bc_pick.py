@@ -34,7 +34,7 @@ def angle_diff(a: float, b: float) -> float:
 
 def yaw_from_wxyz(q) -> float:
     """Yaw (degrees about world z) of a quaternion [w, x, y, z] that rotates about z only."""
-    return math.degrees(2 * math.atan2(q[3], q[0]))
+    return angle_diff(math.degrees(2 * math.atan2(q[3], q[0])), 0)
 
 
 def grasp_theta(block_yaw_deg: float, current_theta_deg: float) -> float:
@@ -64,7 +64,7 @@ def minjerk_segment(a, b, duration_s: float, hz: float) -> list:
         s = i / n
         m = s * s * s * (10 - 15 * s + 6 * s * s)
         out.append((a[0] + (b[0] - a[0]) * m, a[1] + (b[1] - a[1]) * m, a[2] + (b[2] - a[2]) * m, a[3] + dth * m))
-    out[-1] = tuple(b)
+    out[-1] = (b[0], b[1], b[2], a[3] + dth)  # same orientation as b, no 360 jump
     return out
 
 
