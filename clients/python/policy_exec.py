@@ -1,10 +1,14 @@
 """Policy chunk execution: pure helpers (top), executors below."""
+import asyncio
 import math
+import time
 
 import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Slerp, Rotation
 
+import bc_pick
+import playback
 from bc_pick import in_bin
 from policy_layout import pose_map_from, rotation
 
@@ -64,3 +68,176 @@ def mix_pose(a: dict, b: dict, w: float) -> dict:
 
 
 # --- executors ---
+
+
+TICK_HZ = 30
+START_LIMITS = {"linear_mm_s": 300, "angular_deg_s": 90}
+
+
+class Executor:
+    """Shared: servo start, gripper scheduling, message count. Subclasses implement play / wait_done / close."""
+
+    def __init__(self, svc, gripper, arm_name):
+        self.svc, self.gripper, self.arm_name = svc, gripper, arm_name
+        self.msgs, self.errors = 0, []
+        self.closed = False  # last commanded gripper state
+        self.sid = None
+        self._gtask = None
+        self._chunk = None
+
+    async def _cmd(self, command, **kw):
+        self.msgs += 1
+        return await self.svc.do_command({"command": command, **kw})
+
+    async def start(self, seed: int, time_scale: float = 1.0) -> None:
+        """servo_start, min-jerk to the seed's start pose at 30 Hz, hold 0.5 s. time_scale < 1 shortens the
+        motion and hold (test-only hook; leave at 1.0 for real runs)."""
+        r = await self._cmd("servo_start", component_name=self.arm_name, frame="arm_origin", mode="pose", gain=8,
+                            timeout_ms=3000, limits=START_LIMITS)
+        self.sid, p0 = r["session_id"], r["pose"]
+        goal = bc_pick.start_pose(p0, seed)
+        cur = (p0["x"], p0["y"], p0["z"], p0["theta"])
+        dur = max(0.6, math.dist(cur[:3], goal[:3]) / 150.0, abs(bc_pick.angle_diff(goal[3], cur[3])) / 60.0)
+        for p in bc_pick.minjerk_segment(cur, goal, dur * time_scale, TICK_HZ):
+            t = time.monotonic()
+            await self._cmd("servo_target", session_id=self.sid, pose=bc_pick.pose_map(p))
+            await asyncio.sleep(max(0.0, 1 / TICK_HZ - (time.monotonic() - t)))
+        end = time.monotonic() + 0.5 * time_scale
+        while time.monotonic() < end:
+            await self._cmd("servo_target", session_id=self.sid, pose=bc_pick.pose_map(goal))
+            await asyncio.sleep(0.1 * time_scale)
+        self.msgs = 0
+
+    def _schedule_gripper(self, chunk: dict, lead: float) -> None:
+        """Replace the gripper task with one firing this chunk's events from the last commanded state."""
+        if self._gtask:
+            self._gtask.cancel()
+        events = gripper_events(chunk["grip"], chunk["t_obs"], chunk["dt"], self.closed, lead)
+        self._gtask = asyncio.create_task(self._fire(events))
+
+    async def _fire(self, events):
+        for t, what in events:
+            await asyncio.sleep(max(0.0, t - time.monotonic()))
+            try:
+                await (self.gripper.grab() if what == "grab" else self.gripper.open())
+                self.closed = what == "grab"
+            except Exception as e:  # noqa: BLE001 - recorded, not raised
+                self.errors.append(("gripper", repr(e)))
+
+    async def wait_done(self) -> None:
+        c = self._chunk
+        await asyncio.sleep(max(0.0, c["t_obs"] + (len(c["poses"]) - 1) * c["dt"] - time.monotonic()))
+
+    async def _stop(self) -> dict:
+        if self._gtask:
+            self._gtask.cancel()
+        st = await self.svc.do_command({"command": "servo_status", "session_id": self.sid})
+        stop = await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})
+        return {"state": stop.get("state"), "peak_accel_ratio": st.get("peak_accel_ratio"), "msgs": self.msgs}
+
+
+class ModuleExec(Executor):
+    """One servo_trajectory per chunk; the module blends, ages and leads."""
+
+    def __init__(self, svc, gripper, arm_name, lead_ms, blend_ms=200):
+        super().__init__(svc, gripper, arm_name)
+        self.lead_ms, self.blend_ms = lead_ms, blend_ms
+
+    async def play(self, chunk: dict) -> None:
+        self._chunk = chunk
+        kw = {} if self.lead_ms is None else {"lead_ms": self.lead_ms}  # None: module uses its measured lag
+        r = await self._cmd("servo_trajectory", session_id=self.sid, poses=chunk["poses"],
+                            dt_ms=chunk["dt"] * 1000, age_ms=(time.monotonic() - chunk["t_obs"]) * 1000,
+                            blend_ms=self.blend_ms, **kw)
+        self._schedule_gripper(chunk, r["lead_ms"] / 1000)
+
+    async def close(self) -> dict:
+        return await self._stop()
+
+
+class ClientExec(Executor):
+    """30 Hz servo_target streaming, crossfading from the previous chunk."""
+
+    def __init__(self, svc, gripper, arm_name, lead_ms, blend_ms=200):
+        super().__init__(svc, gripper, arm_name)
+        self.lead, self.blend_s = lead_ms / 1000, blend_ms / 1000
+        self.cur = self.prev = None
+        self.switch_t = 0.0
+        self._task = None
+
+    async def start(self, seed: int, time_scale: float = 1.0) -> None:
+        await super().start(seed, time_scale)
+        self._task = asyncio.create_task(self._stream())
+
+    async def _stream(self):
+        while True:
+            t = time.monotonic()
+            if self.cur is not None:
+                w = 1.0 if self.blend_s <= 0 else min(1.0, (t - self.switch_t) / self.blend_s)
+                pose = playback.blended(self.cur, self.prev, t + self.lead, w, sample_chunk, mix_pose)
+                await self._cmd("servo_target", session_id=self.sid, pose=pose)
+            await asyncio.sleep(max(0.0, 1 / TICK_HZ - (time.monotonic() - t)))
+
+    async def play(self, chunk: dict) -> None:
+        self.prev, self.cur, self.switch_t, self._chunk = self.cur, chunk, time.monotonic(), chunk
+        self._schedule_gripper(chunk, self.lead)
+
+    async def close(self) -> dict:
+        if self._task:
+            self._task.cancel()
+        return await self._stop()
+
+
+class MoveExec(Executor):
+    """One blocking builtin-motion Move per row; the gripper fires as each row's Move starts."""
+
+    def __init__(self, motion, gripper, arm_name, servo_svc):
+        super().__init__(servo_svc, gripper, arm_name)
+        self.motion = motion
+        self.queue, self.busy = [], False
+        self._wake = asyncio.Event()
+        self._worker = None
+
+    async def start(self, seed: int, time_scale: float = 1.0) -> None:
+        await super().start(seed, time_scale)
+        await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})
+        self._worker = asyncio.create_task(self._run())
+
+    async def _run(self):
+        from viam.proto.common import Pose, PoseInFrame
+        while True:
+            if not self.queue:
+                self._wake.clear()
+                await self._wake.wait()
+                continue
+            pose, g = self.queue.pop(0)
+            self.busy = True
+            try:
+                if (g > 0.5) != self.closed:
+                    try:
+                        await (self.gripper.grab() if g > 0.5 else self.gripper.open())
+                        self.closed = g > 0.5
+                    except Exception as e:  # noqa: BLE001
+                        self.errors.append(("gripper", repr(e)))
+                self.msgs += 1
+                await self.motion.move(component_name=self.arm_name, destination=PoseInFrame(
+                    reference_frame="arm_origin", pose=Pose(**{k: pose[k] for k in
+                                                               ("x", "y", "z", "o_x", "o_y", "o_z", "theta")})))
+            except Exception as e:  # noqa: BLE001
+                self.errors.append(("plan", repr(e)))
+            finally:
+                self.busy = False
+
+    async def play(self, chunk: dict) -> None:
+        k = first_live_row(chunk["t_obs"], chunk["dt"], time.monotonic())
+        self.queue = list(zip(chunk["poses"], chunk["grip"]))[k:]
+        self._wake.set()
+
+    async def wait_done(self) -> None:
+        while self.queue or self.busy:
+            await asyncio.sleep(0.01)
+
+    async def close(self) -> dict:
+        if self._worker:
+            self._worker.cancel()
+        return {"state": "done", "peak_accel_ratio": None, "msgs": self.msgs}

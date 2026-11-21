@@ -3,9 +3,10 @@
 # dependencies = ["viam-sdk", "numpy", "scipy"]
 # ///
 """Pure-path checks for policy_exec.py. Run: uv run clients/python/test_policy_exec.py"""
-import math, os, random, sys
+import asyncio, math, os, random, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from policy_exec import first_live_row, gripper_events, jerk_rms, mix_pose, sample_chunk, succeeded  # noqa: E402
+import bc_pick  # noqa: E402
+from policy_exec import ClientExec, ModuleExec, MoveExec, first_live_row, gripper_events, jerk_rms, mix_pose, sample_chunk, succeeded  # noqa: E402
 
 # rows still ahead of now: row k is due at t_obs + k*dt
 assert first_live_row(t_obs=10.0, dt=0.1, now=10.0) == 0
@@ -53,4 +54,90 @@ assert sample_chunk(ch, -1)["x"] == 0 and sample_chunk(ch, 5)["x"] == 10
 m = mix_pose(A, B, 0.5)
 assert abs(m["x"] - 5) < 1e-9 and abs(abs(m["theta"]) - 45) < 1e-4
 assert mix_pose(A, B, 0)["x"] == 0 and mix_pose(A, B, 1)["x"] == 10
+
+# --- executors, against fakes (no network) ---
+TS = 0.05  # start() time_scale: test-only, shortens the start motion
+
+
+class FakeSvc:
+    def __init__(self):
+        self.cmds = []
+
+    async def do_command(self, c):
+        self.cmds.append(c)
+        k = c["command"]
+        if k == "servo_start":
+            return {"session_id": "s", "pose": {"x": 500, "y": 0, "z": 300, "o_x": 0, "o_y": 0, "o_z": -1, "theta": 180}}
+        if k == "servo_trajectory":
+            return {"lead_ms": 80, "remaining_ms": 1000, "state": "running"}
+        return {"state": "running" if k == "servo_status" else "stopped", "peak_accel_ratio": 0.5}
+
+    def of(self, k):
+        return [c for c in self.cmds if c["command"] == k]
+
+
+class FakeGripper:
+    def __init__(self):
+        self.calls = []
+
+    async def grab(self):
+        self.calls.append("grab")
+
+    async def open(self):
+        self.calls.append("open")
+
+
+def mk_chunk(grip=None, ahead=0.0):
+    pose = lambda x: {"x": x, "y": 0, "z": 300, "o_x": 0, "o_y": 0, "o_z": -1, "theta": 180}
+    return {"t_obs": time.monotonic() + ahead, "dt": 0.1, "poses": [pose(500 + 10 * k) for k in range(20)],
+            "grip": grip or [0.0] * 20}
+
+
+async def check_start(ex, svc, seed=3):
+    await ex.start(seed, time_scale=TS)
+    assert len(svc.of("servo_start")) == 1 and ex.msgs == 0
+    goal = bc_pick.start_pose({"x": 500, "y": 0, "z": 300, "theta": 180}, seed)
+    assert svc.of("servo_target")[-1]["pose"] == bc_pick.pose_map(goal)
+
+
+async def main():
+    svc, g = FakeSvc(), FakeGripper()
+    ex = ModuleExec(svc, g, "arm", lead_ms=None)
+    await check_start(ex, svc)
+    await ex.play(mk_chunk([0.0] * 5 + [1.0] * 15))
+    tr = svc.of("servo_trajectory")
+    assert len(tr) == 1 and tr[0]["dt_ms"] == 100 and tr[0]["age_ms"] >= 0 and "lead_ms" not in tr[0]
+    await asyncio.sleep(0.6)  # event at 0.5 - 0.08 s
+    assert g.calls == ["grab"] and ex.msgs == 1
+    r = await ex.close()
+    assert r["state"] == "stopped" and r["peak_accel_ratio"] == 0.5
+
+    svc, g = FakeSvc(), FakeGripper()
+    ex = ClientExec(svc, g, "arm", lead_ms=0)
+    await check_start(ex, svc)
+    n0 = len(svc.of("servo_target"))
+    await ex.play(mk_chunk())
+    await asyncio.sleep(0.3)
+    await ex.close()
+    xs = [c["pose"]["x"] for c in svc.of("servo_target")[n0:]]
+    assert 6 <= len(xs) <= 12, len(xs)
+    assert xs == sorted(xs) and 500 <= xs[0] < xs[-1] < 540, xs
+
+    svc, g, moved = FakeSvc(), FakeGripper(), []
+
+    class FakeMotion:
+        async def move(self, component_name, destination):
+            moved.append(destination.pose.x)
+            await asyncio.sleep(0.01)
+
+    ex = MoveExec(FakeMotion(), g, "arm", svc)
+    await check_start(ex, svc)
+    assert svc.of("servo_stop")
+    ch = mk_chunk([0.0, 0.0] + [1.0] * 18, ahead=0.05)  # all rows live
+    await ex.play(ch)
+    await ex.wait_done()
+    assert moved == [500 + 10 * k for k in range(20)] and g.calls == ["grab"] and ex.msgs == 20
+    assert (await ex.close())["state"] == "done"
+
+asyncio.run(main())
 print("ok")
