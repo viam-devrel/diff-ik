@@ -1,0 +1,45 @@
+{
+ "modules": [
+  { "type": "local", "name": "mujoco-sim", "executable_path": "/Users/nick.hehr/src/viam-mujoco-sim/run.sh" },
+  { "type": "local", "name": "diff-ik", "executable_path": "/Users/nick.hehr/src/diff-ik/bin/diff-ik" }
+ ],
+ "components": [
+  { "name": "sim-world", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:world", "attributes": {} },
+  {
+   "name": "pedestal", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:obstacle",
+   "frame": { "parent": "world", "translation": { "x": 0, "y": 0, "z": 200 },
+              "geometry": { "type": "box", "x": 200, "y": 200, "z": 400 } },
+   "attributes": { "world": "sim-world", "color": [0.35, 0.35, 0.38] }
+  },
+  {
+   "name": "table", "api": "rdk:component:generic", "model": "viam-labs:mujoco-sim:obstacle",
+   "frame": { "parent": "world", "translation": { "x": 550, "y": 0, "z": 150 },
+              "geometry": { "type": "box", "x": 400, "y": 600, "z": 300 } },
+   "attributes": { "world": "sim-world", "color": [0.55, 0.45, 0.35] }
+  },
+  {
+   "name": "arm", "api": "rdk:component:arm", "model": "viam-labs:mujoco-sim:arm",
+   "frame": { "parent": "world", "translation": { "x": 0, "y": 0, "z": 400 } },
+   "attributes": { "world": "sim-world", "asset": "ur5e", "max_joint_deg_s": 180, "max_joint_deg_s2": 360 }
+  },
+  {
+   "name": "gripper", "api": "rdk:component:gripper", "model": "viam-labs:mujoco-sim:gripper",
+   "frame": { "parent": "arm", "translation": { "x": 0, "y": 0, "z": 130 } },
+   "attributes": { "world": "sim-world", "arm": "arm", "asset": "robotiq_epick" }
+  },
+  {
+   "name": "wrist-ft", "api": "rdk:component:sensor", "model": "viam-labs:mujoco-sim:force_torque",
+   "frame": { "parent": "arm" },
+   "attributes": { "world": "sim-world", "force_noise_n": 0.1, "torque_noise_nm": 0.005, "seed": 1 }
+  },
+  {
+   "name": "scene-cam", "api": "rdk:component:camera", "model": "viam-labs:mujoco-sim:camera",
+   "frame": { "parent": "world", "translation": { "x": 1400, "y": -1200, "z": 900 } },
+   "attributes": { "world": "sim-world", "target": [0.5, 0.0, 0.3], "width": 1280, "height": 720 }
+  }
+ ],
+ "services": [
+  { "name": "servo", "api": "rdk:service:motion", "model": "devrel:diff-ik:servo", "attributes": { "arms": ["arm"], "sensors": ["wrist-ft"] } }
+ ],
+ "network": { "bind_address": "localhost:8086" }
+}

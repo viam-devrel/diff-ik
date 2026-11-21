@@ -11,6 +11,7 @@ import (
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/arm"
+	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
@@ -38,6 +39,8 @@ type Config struct {
 	Arms []string `json:"arms"`
 	// VisionServices names the vision services a live_obstacles session may poll.
 	VisionServices []string `json:"vision_services,omitempty"`
+	// Sensors names the force-torque sensors a guard may poll.
+	Sensors []string `json:"sensors,omitempty"`
 	// Teleop holds servo_start defaults (limits, rate_hz, timeout_ms, ...) for viam:teleop sessions.
 	Teleop map[string]interface{} `json:"teleop,omitempty"`
 }
@@ -61,7 +64,16 @@ func (cfg Config) Validate(path string) ([]string, []string, error) {
 		}
 		seen[v] = true
 	}
+	for _, v := range cfg.Sensors {
+		if v == "" || seen[v] {
+			return nil, nil, fmt.Errorf("%s: sensors must be unique, non-empty names that differ from the arms and vision_services", path)
+		}
+		seen[v] = true
+	}
 	deps := slices.Clone(cfg.Arms)
+	for _, v := range cfg.Sensors {
+		deps = append(deps, sensor.Named(v).String())
+	}
 	for _, v := range cfg.VisionServices {
 		deps = append(deps, vision.Named(v).String()) // full names: a plain name clashes with a camera of the same name
 	}
@@ -114,6 +126,16 @@ func NewServo(ctx context.Context, deps resource.Dependencies, name resource.Nam
 			return nil, err
 		}
 		m.visions[n] = v
+	}
+	if len(conf.Sensors) > 0 {
+		m.sensors = map[string]ForceSource{}
+	}
+	for _, n := range conf.Sensors {
+		v, err := sensor.FromProvider(deps, n)
+		if err != nil {
+			return nil, err
+		}
+		m.sensors[n] = v
 	}
 	srv := newServo(name, logger, m)
 	srv.teleopConf = conf.Teleop
@@ -409,6 +431,10 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 	if live != nil && coll == nil {
 		coll = &CollisionRequest{DMinMM: 10, DActMM: 100}
 	}
+	guard, gsrc, err := s.parseGuard(cmd)
+	if err != nil {
+		return nil, nil, err
+	}
 	frames, err := optBool(cmd, "frames", false)
 	if err != nil {
 		return nil, nil, err
@@ -422,10 +448,59 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 		return nil, nil, err
 	}
 	return s.m.start(ctx, armName, SessionConfig{
-		Frame: frame, Mode: Mode(mode), Loop: lc, Collision: coll, Live: live, LiveSource: src, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
+		Frame: frame, Mode: Mode(mode), Loop: lc, Collision: coll, Live: live, LiveSource: src, Guard: guard, GuardSource: gsrc, Frames: frames, Filter: filter, NoPointVelocities: !pointVel,
 		Timeout: time.Duration(timeout * float64(time.Millisecond)),
 		Ramp:    time.Duration(ramp * float64(time.Millisecond)),
 	})
+}
+
+// parseGuard reads guard; nil means off. It returns the sensor named by its "sensor".
+func (s *diffIkServo) parseGuard(cmd map[string]interface{}) (*GuardConfig, ForceSource, error) {
+	raw, ok := cmd["guard"]
+	if !ok {
+		return nil, nil, nil
+	}
+	gm, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, nil, errors.New("guard must be an object")
+	}
+	c := &GuardConfig{}
+	for k, v := range gm {
+		var dst *float64
+		switch k {
+		case "sensor":
+			name, ok := v.(string)
+			if !ok {
+				return nil, nil, errors.New("guard.sensor must be a string")
+			}
+			c.Sensor = name
+			continue
+		case "force_n":
+			dst = &c.ForceN
+		case "torque_nm":
+			dst = &c.TorqueNm
+		case "rate_hz":
+			dst = &c.RateHz
+		default:
+			return nil, nil, fmt.Errorf("unknown guard key %q", k)
+		}
+		n, err := num(v, "guard."+k)
+		if err != nil {
+			return nil, nil, err
+		}
+		*dst = n
+	}
+	if err := c.withDefaults().validate(); err != nil {
+		return nil, nil, err
+	}
+	if !(c.ForceN > 0) {
+		return nil, nil, fmt.Errorf("guard.force_n must be > 0, got %v", c.ForceN)
+	}
+	src, ok := s.m.sensors[c.Sensor]
+	if !ok {
+		return nil, nil, fmt.Errorf("guard.sensor %q is not in this service's sensors", c.Sensor)
+	}
+	return c, src, nil
 }
 
 // parseLive reads live_obstacles; nil means off. It returns the vision service named by its "vision".
@@ -836,6 +911,13 @@ func statusMap(st SessionStatus) map[string]interface{} {
 		out["live_method"] = st.LiveMethod
 		if st.LiveLastError != "" {
 			out["live_last_error"] = st.LiveLastError
+		}
+	}
+	if g := st.Guard; g != nil {
+		out["guard_reads"], out["guard_errors"] = float64(g.Reads), float64(g.Errors)
+		out["guard_force_n"], out["guard_peak_n"], out["guard_trip_n"] = g.ForceN, g.PeakN, g.TripN
+		if g.Reason != "" {
+			out["guard_reason"] = g.Reason
 		}
 	}
 	qc := make([]interface{}, len(st.QCmd))

@@ -35,6 +35,12 @@ velocity prediction. Design:
 [`docs/superpowers/specs/2026-11-18-diff-ik-live-obstacles-design.md`](docs/superpowers/specs/2026-11-18-diff-ik-live-obstacles-design.md).
 Results: [`docs/results/2026-11-live-obstacles.md`](docs/results/2026-11-live-obstacles.md).
 
+A session can also stop itself on contact (`guard`), watching a wrist force-torque sensor named in the module's
+`sensors`. When it trips, the session commands the measured joints, so the arm stops pressing, and ends as
+`stopped_contact`. In a MuJoCo touch-off onto a rigid table at 10–80 mm/s, it cuts the peak force of a client-side
+stop by 3.5–4.5× and drops what is left after the stop from 46–359 N to 0.3–1.5 N. Results:
+[`docs/results/2026-11-contact-guard.md`](docs/results/2026-11-contact-guard.md).
+
 ## Local SO-101 simulation (Phase 3a)
 
 No cloud machine needed:

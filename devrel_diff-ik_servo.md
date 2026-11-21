@@ -32,6 +32,7 @@ fewer than 6 DOF use the pointing task, which tracks position and tool-axis dire
 |---|---|---|---|
 | `arms` | []string | Required | Arms this service may servo. They become dependencies. |
 | `vision_services` | []string | Optional | Vision services a `live_obstacles` session may poll. They become dependencies. Use the short names; the module declares the full names `rdk:service:vision/<name>` as dependencies. |
+| `sensors` | []string | Optional | Force-torque sensors a `guard` may poll. They become dependencies. |
 | `teleop` | object | Optional | `servo_start` defaults for `teleop_*` sessions (`limits`, `rate_hz`, `timeout_ms`, `ramp_ms`, `target_filter`, `task_weights`, ...), plus `teleop_idle_ms` (default 60000). |
 
 Set the joint limit below the arm driver's own speed limit. Drivers such as the xArm reject streamed points above it,
@@ -89,6 +90,7 @@ second session on a busy arm fails.
 | `collision_specification` | none | `qp` only. Allowed contacts, as the motion service's `CollisionSpecification` list (protojson: a JSON list or a string): `[{"allows": [{"frame1", "frame2"}]}]`. A name is a geometry label (links are `<arm>:<link>`), a frame name (the arm's name covers all its links), or `<frame>_origin`. An unknown name is an error. The name of a frame skipped as movable is a no-op, with a warning. Giving it turns collision on. |
 | `collision` | off | `qp` only. `true`, or `{"d_min_mm", "d_act_mm"}` (defaults 10 and 100; `d_act_mm` must exceed `d_min_mm`; unknown keys are rejected). Collision is also on when `world_state` or `collision_specification` is given. `"collision": false` turns it off even then. Frame-system meshes on the arm or around it (a gripper model, a fixture) are checked as their bounding box in the mesh's own frame, with a warning; cylinders are still skipped. |
 | `live_obstacles` | off | `qp` only. Obstacles from a vision service, polled while the session runs. Turns collision on; `"collision": false` with it is rejected. See below and "Live obstacles". |
+| `guard` | off | Stop on contact: `{"sensor", "force_n", "torque_nm", "rate_hz"}`. See "Contact guard". |
 | `point_velocities` | true | Send per-point target joint velocities to the driver. |
 
 #### `live_obstacles`
@@ -141,7 +143,7 @@ position. Returns `state`, plus `roll_ignored` when the pointing task drops a ro
 `servo_status` returns the status without changing anything.
 
 States: `idle` (no target yet), `running`, `converged`, `stalled` (limit-bound or singular), then one of `stopped`,
-`stopped_timeout`, `stopped_stale` (live obstacles went stale) or `faulted`. Like `stopped_timeout`, `stopped_stale`
+`stopped_timeout`, `stopped_stale` (live obstacles went stale), `stopped_contact` (the guard tripped) or `faulted`. Like `stopped_timeout`, `stopped_stale`
 isn't overwritten by the dead-man; an explicit `servo_stop` turns it into `stopped`.
 
 ### Status fields
@@ -171,6 +173,34 @@ resync.
 `limits.resync_deg` is how far the arm may be from where it should be given that lag before the loop resyncs its
 command to the measured joints. The default is 3 ticks of travel at max joint speed. The gap between command and
 measured joints, and so the size of a resync snap, can reach lag travel + `resync_deg`.
+
+## Contact guard
+
+With `guard`, the session watches a wrist force-torque sensor (one of `sensors`) and stops itself on contact. Any
+solver and mode.
+
+```json
+"guard": { "sensor": "wrist-ft", "force_n": 5, "torque_nm": 0.5, "rate_hz": 500 }
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `sensor` | required | One of `sensors`. Readings are either `force` and `torque` maps of `x`, `y`, `z` (N, N·m; mujoco-sim's `force_torque`) or flat `Fx_N`, `Fy_N`, `Fz_N`, `TRx_Nm`, `TRy_Nm`, `TRz_Nm` (`viam:ufactory:ft_sensor`). |
+| `force_n` | required | Trip when \|F − F₀\| reaches this. Must be > 0. |
+| `torque_nm` | 0 (off) | Also trip when \|T − T₀\| reaches this. |
+| `rate_hz` | 500 | Sensor poll rate, in (0, 2000]. The guard polls in its own goroutine, not once per tick. |
+
+- **Baseline.** `servo_start` averages 5 readings into F₀ and T₀, a software tare, so the tool's weight never counts.
+  A sensor that can't be read fails the start. A load picked up mid-session shifts the baseline.
+- **Trip.** The loop ticks at once, cancels the joint stream (queued points don't play out), calls the arm's `Stop`,
+  then moves it to the *measured* joints (`MoveToJointPositions`), and ends as `stopped_contact`. Commanding the measured joints releases what the arm was pressing with: at contact the
+  command is ahead of a blocked arm by its lag, and a plain stop holds that point. The trip ignores the ramp and the
+  acceleration limit, so a false trip in free space is a hard stop.
+- **Blind sensor.** Three failed reads in a row end the session as `faulted`.
+- **Status:** `guard_reads`, `guard_errors`, `guard_force_n` (latest \|F − F₀\|), `guard_peak_n` (until the trip),
+  `guard_trip_n` and `guard_reason`.
+
+Results: `docs/results/2026-11-contact-guard.md`.
 
 ## QP solver
 

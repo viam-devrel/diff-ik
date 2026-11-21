@@ -176,7 +176,8 @@ const (
 	StateFaulted        State = "faulted"
 	StateStopped        State = "stopped"
 	StateStoppedTimeout State = "stopped_timeout"
-	StateStoppedStale   State = "stopped_stale" // live obstacles went stale
+	StateStoppedStale   State = "stopped_stale"   // live obstacles went stale
+	StateStoppedContact State = "stopped_contact" // the force guard tripped
 )
 
 const (
@@ -223,6 +224,7 @@ type Status struct {
 	LiveBackingAway                    bool    // any live pair has g < 0 this tick
 	CollisionIgnored, CollisionSkipped []string
 	CollisionLate                      string // last "approach faster than v_max" warning
+
 }
 
 const tickWindow = 500 // ticks kept for p50/p99
@@ -276,6 +278,8 @@ type Loop struct {
 	rampStart time.Time     // zero: no ramp
 	rampDur   time.Duration
 	rampFinal State
+	tripFinal State         // non-empty: a guard tripped; the next tick holds the measured joints and ends
+	wake      chan struct{} // Trip wakes Run for an immediate tick
 	status    Status
 	lastReach float64 // pointing mode: |e2_reach| (rad) from the previous tick, for the leash. Not reset on
 	// SetMotion: a streamed servo_target calls SetMotion every tick, and resetting would disable the leash.
@@ -369,7 +373,8 @@ func NewLoop(model referenceframe.Model, io JointIO, cfg LoopConfig) (*Loop, err
 			cfg.MaxJointDegPerS2[i] = math.Min(cfg.MaxJointDegPerS2[i], rad2deg(*a))
 		}
 	}
-	l := &Loop{model: model, io: io, cfg: cfg, lo: make([]float64, dof), hi: make([]float64, dof), lastStep: make([]float64, dof)}
+	l := &Loop{model: model, io: io, cfg: cfg, lo: make([]float64, dof), hi: make([]float64, dof), lastStep: make([]float64, dof),
+		wake: make(chan struct{}, 1)}
 	for i, lim := range limits {
 		// stay fdStep inside the limits so Jacobian perturbations remain valid inputs
 		l.lo[i], l.hi[i] = lim.Min+fdStep, lim.Max-fdStep
@@ -431,6 +436,68 @@ func (l *Loop) RampStop(ramp time.Duration, final State) {
 	if final == StateStopped {
 		l.rampFinal = final
 	}
+}
+
+// Trip ends the session at once, in final: the next tick (run immediately) commands the measured joints,
+// which releases what the arm was pressing with, then stops the arm. It skips the ramp and the acceleration
+// limit on purpose: in contact the arm is already stopped, and the command is only running ahead of it.
+// The first call wins.
+func (l *Loop) Trip(final State) {
+	l.mu.Lock()
+	if l.tripFinal == "" {
+		l.tripFinal = final
+	}
+	l.mu.Unlock()
+	select {
+	case l.wake <- struct{}{}:
+	default:
+	}
+}
+
+// holder is a JointIO that can send a point the arm should come to rest at (zero point velocity).
+type holder interface {
+	Hold(ctx context.Context, q []referenceframe.Input) error
+}
+
+// aborter is a JointIO that can stop at once and hold given joints (armIO's Abort).
+type aborter interface {
+	Abort(ctx context.Context, q []referenceframe.Input) error
+}
+
+// tripStop is tick's trip path: command the measured joints, then stop the arm.
+func (l *Loop) tripStop(ctx context.Context, final State) error {
+	qm, err := l.io.Read(ctx)
+	if ab, ok := l.io.(aborter); ok && err == nil {
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		err = ab.Abort(sctx, qm)
+		l.mu.Lock()
+		l.status.State = final
+		l.qCmd = slices.Clone(qm)
+		l.status.QCmd, l.status.QMeas = slices.Clone(qm), slices.Clone(qm)
+		l.mu.Unlock()
+		if err != nil {
+			err = fmt.Errorf("stopping arm: %w", err)
+		}
+		l.stopErr = err
+		return errRampDone
+	}
+	if err == nil {
+		if h, ok := l.io.(holder); ok {
+			err = h.Hold(ctx, qm)
+		} else {
+			err = l.io.Send(ctx, qm)
+		}
+	}
+	l.mu.Lock()
+	l.status.State = final
+	if err == nil {
+		l.qCmd = slices.Clone(qm)
+		l.status.QCmd, l.status.QMeas = slices.Clone(qm), slices.Clone(qm)
+	}
+	l.mu.Unlock()
+	l.stopErr = l.stop(err)
+	return errRampDone
 }
 
 func (l *Loop) now() time.Time {
@@ -532,6 +599,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return l.stop(ctx.Err())
 		case <-t.C:
+		case <-l.wake:
 		}
 		start := time.Now()
 		// ponytail: one fixed budget; the first tick also opens the stream, so the floor is generous.
@@ -587,6 +655,10 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	// 0. ramp-stop complete: stop the arm and end. This runs before the idle return so an idle ramp ends too.
 	// The ramp lasts until the acceleration limit allows stopping in one tick, which may be after ramp.
 	l.mu.Lock()
+	if final := l.tripFinal; final != "" {
+		l.mu.Unlock()
+		return l.tripStop(ctx, final)
+	}
 	ramping, scale := l.rampScale()
 	if ramping && scale == 0 && l.canStop(dt) {
 		l.status.State = l.rampFinal

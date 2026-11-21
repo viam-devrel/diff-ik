@@ -99,6 +99,37 @@ func (io *armIO) Send(ctx context.Context, q []referenceframe.Input) error {
 	}
 }
 
+// Hold sends q as a point the arm should come to rest at: its point velocity is zero, not the jump from the
+// last point over one tick (the guard's trip snaps the command back to the measured joints).
+func (io *armIO) Hold(ctx context.Context, q []referenceframe.Input) error {
+	if io.batches != nil {
+		io.prevQ = slices.Clone(q)
+	}
+	return io.Send(ctx, q)
+}
+
+// Abort is the guard's trip: cancel the stream at once (no drain, so queued points don't play out), stop the
+// arm, then move it to q, the measured joints, for drivers whose Stop holds the last command.
+func (io *armIO) Abort(ctx context.Context, q []referenceframe.Input) error {
+	var wait chan struct{}
+	if io.batches != nil {
+		io.cancel()
+		close(io.batches)
+		wait, io.batches = io.s.done, nil
+	}
+	err := io.a.Stop(ctx, nil)
+	if err == nil {
+		err = io.a.MoveToJointPositions(ctx, q, nil)
+	}
+	if wait != nil {
+		select {
+		case <-wait:
+		case <-ctx.Done():
+		}
+	}
+	return err
+}
+
 // open starts the streamed move. It runs on its own context so that a canceled loop
 // context doesn't tear the stream down before Stop has run.
 func (io *armIO) open() {

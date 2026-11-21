@@ -98,6 +98,9 @@ type SessionConfig struct {
 	LiveSource LiveSource  // the vision service; Task 6's startSession fills it, tests set it directly
 	// LiveJoints reads the joints for the poller; nil means the arm's JointPositions. Tests inject it.
 	LiveJoints JointReader
+
+	Guard       *GuardConfig // nil: no force guard
+	GuardSource ForceSource
 }
 
 // armJoints adapts an arm's JointPositions to a JointReader.
@@ -123,6 +126,8 @@ type SessionStatus struct {
 	// live obstacles: the poller's session totals (zero when live_obstacles is off)
 	LiveUpdates, LiveErrors, LiveSelfDropped, LiveSkipped, LiveOverflow, LiveClipped int64
 	LiveLastError, LiveMethod                                                        string
+
+	Guard *GuardStats // nil unless the session has a guard
 }
 
 // TargetResult is servo_target's outcome. Raw is the target in the session frame before the filter,
@@ -146,6 +151,7 @@ type session struct {
 	logger        logging.Logger
 	armName       string
 	poller        *poller // nil unless live obstacles
+	guard         *guard  // nil unless a force guard
 
 	// Set once in start() and read-only after, so the frame transform needs no s.mu.
 	fs     *referenceframe.FrameSystem // nil unless Frames
@@ -172,7 +178,7 @@ func (s *session) run(ctx context.Context) { s.finish(s.loop.Run(ctx)) }
 func (s *session) finish(err error) {
 	st := s.status()
 	switch st.State {
-	case StateStopped, StateStoppedTimeout, StateStoppedStale, StateFaulted:
+	case StateStopped, StateStoppedTimeout, StateStoppedStale, StateStoppedContact, StateFaulted:
 	default:
 		st.State = StateStopped // Run ended by context cancel
 	}
@@ -395,7 +401,20 @@ func (s *session) status() SessionStatus {
 	s.mu.Unlock()
 	ss := SessionStatus{Status: s.loop.Status(), Config: s.loop.Config(), LastCmdAge: age, Filter: filt, Clamps: clamps}
 	s.addLive(&ss)
+	if s.guard != nil {
+		gs := s.guard.stats()
+		ss.Guard = &gs
+	}
 	return ss
+}
+
+// trip is the guard's callback: no command lands after it, and the loop ends at once in final.
+func (s *session) trip(final State, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopping = final
+	s.loop.Trip(final)
+	s.logger.Infow("servo guard tripped", "arm", s.armName, "state", final, "reason", reason)
 }
 
 // addLive copies the poller's counters into ss.
@@ -418,6 +437,8 @@ type servoManager struct {
 	manual bool // tests: don't start Run, drive ticks by hand
 	// visions are the vision services a live_obstacles session may poll, by name.
 	visions map[string]LiveSource
+	// sensors are the force-torque sensors a guard may poll, by name.
+	sensors map[string]ForceSource
 
 	mu     sync.Mutex
 	byArm  map[string]*session
@@ -556,6 +577,15 @@ func (m *servoManager) start(ctx context.Context, armName string, cfg SessionCon
 		}
 		s.poller = h.p
 		s.cancel = func() { cancel(); h.Stop() }
+	}
+	if cfg.Guard != nil {
+		g, err := newGuard(ctx, *cfg.Guard, cfg.GuardSource, s.trip)
+		if err != nil {
+			s.cancel()
+			return nil, nil, err
+		}
+		s.guard = g
+		go g.run(runCtx) // finish cancels runCtx, so the guard ends with the loop
 	}
 	l.OnTick = s.onTick
 	m.byArm[armName] = s
