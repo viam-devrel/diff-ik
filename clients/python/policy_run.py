@@ -20,7 +20,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bc_pick  # noqa: E402
-from policy_exec import ClientExec, ModuleExec, MoveExec, jerk_rms, sample_chunk, succeeded  # noqa: E402
+from policy_exec import ClientExec, Executor, ModuleExec, MoveExec, jerk_rms, sample_chunk, succeeded  # noqa: E402
 from policy_layout import chunk_to_poses, state_vector  # noqa: E402
 
 CAMERAS = {"observation.images.scene_cam": "scene-cam", "observation.images.wrist_cam": "wrist-cam"}
@@ -255,6 +255,7 @@ async def main_async(a):
             raise SystemExit(f"policy state/action dims {specs.get('state_dim')}/{specs.get('action_dim')}, want 10/10")
         svc, gripper = MotionClient.from_robot(servo_r, a.service), Gripper.from_robot(servo_r, a.gripper)
         motion = MotionClient.from_robot(servo_r, "builtin")
+        Executor.grip_early = a.grip_early
         makers = {"module": lambda: ModuleExec(svc, gripper, a.arm, a.lead_ms),
                   "client": lambda: ClientExec(svc, gripper, a.arm, a.lead_ms),
                   "move": lambda: MoveExec(motion, gripper, a.arm, svc)}
@@ -298,6 +299,7 @@ def parse_args(argv=None):
     ap.add_argument("--seeds", default="9100", help="N or LO-HI")
     ap.add_argument("--out", help="JSONL file, appended (required unless --once)")
     ap.add_argument("--timeout-s", type=float, default=30.0)
+    ap.add_argument("--grip-early", action="store_true", help="fire the gripper lead early (old behaviour; diagnosis only)")
     ap.add_argument("--checkpoint-label", default="")
     ap.add_argument("--arm", default="arm")
     ap.add_argument("--gripper", default="gripper")

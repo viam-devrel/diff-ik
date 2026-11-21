@@ -95,7 +95,8 @@ Executors share `play(chunk, t_obs)` and `close()`:
 - **move:** one blocking builtin `Move` per row; a new chunk replaces the queued rows. No session.
 
 Gripper: in every mode the runner calls `grab`/`open` when the action column crosses 0.5. In module and client modes
-it fires at that row's scheduled time shifted by the lead the arm uses; in move mode, when that row's `Move` starts.
+it fires at that row's own time (not shifted by the lead: the lead already makes the arm arrive then, and shifting
+the gripper too closed it 13-24 mm short of the grasp in the local gate); in move mode, when that row's `Move` starts.
 
 Metrics, one JSONL row per episode: success, outcome reason, time to success, arm command messages per second,
 `peak_accel_ratio` (module, client), jerk (RMS third difference of the measured flange position, sampled at 30 Hz by

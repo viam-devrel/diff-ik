@@ -78,6 +78,9 @@ START_LIMITS = {"linear_mm_s": 300, "angular_deg_s": 90}
 
 class Executor:
     """Shared: servo start, gripper scheduling, message count. Subclasses implement play / wait_done / close."""
+    # The lead already makes the arm reach row k at its time; firing the gripper lead early closes it a full lag
+    # before the arm arrives (measured 13-24 mm short at grab). True keeps the old behaviour for comparison.
+    grip_early = False
 
     def __init__(self, svc, gripper, arm_name):
         self.svc, self.gripper, self.arm_name = svc, gripper, arm_name
@@ -206,7 +209,7 @@ class ModuleExec(Executor):
         except Exception as e:
             self.errors.append(("session", repr(e)))
             raise
-        self._schedule_gripper(chunk, r["lead_ms"] / 1000)
+        self._schedule_gripper(chunk, r["lead_ms"] / 1000 if self.grip_early else 0.0)
 
     async def close(self) -> dict:
         return await self._stop()
@@ -252,7 +255,7 @@ class ClientExec(Executor):
     async def play(self, chunk: dict) -> None:
         self._check()
         self.prev, self.cur, self.switch_t, self._chunk = self.cur, chunk, time.monotonic(), chunk
-        self._schedule_gripper(chunk, self.lead)
+        self._schedule_gripper(chunk, self.lead if self.grip_early else 0.0)
 
     async def close(self) -> dict:
         await self._cancel(self._task)
