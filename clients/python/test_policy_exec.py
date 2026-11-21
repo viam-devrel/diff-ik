@@ -61,7 +61,7 @@ TS = 0.05  # start() time_scale: test-only, shortens the start motion
 
 class FakeSvc:
     def __init__(self):
-        self.cmds, self.status, self.stop_err = [], "running", False
+        self.cmds, self.status, self.stop_err, self.seq = [], "running", False, []
 
     async def do_command(self, c):
         self.cmds.append(c)
@@ -71,8 +71,9 @@ class FakeSvc:
         if k == "servo_trajectory":
             return {"lead_ms": 80, "remaining_ms": 1000, "state": "running"}
         if k == "servo_status":
-            return {"state": self.status, "peak_accel_ratio": 0.5}
+            return {"state": self.seq.pop(0) if self.seq else self.status, "peak_accel_ratio": 0.5}
         if self.stop_err:
+            self.status = "stopped_timeout"  # the ramp-down finishes
             raise RuntimeError("session ended: timeout")
         return {"state": "stopped", "peak_accel_ratio": 0.5}
 
@@ -153,7 +154,13 @@ async def main():
     svc = FakeSvc(); ex = ModuleExec(svc, FakeGripper(), "arm", 80)
     await ex.start(3, time_scale=TS)
     svc.stop_err = True
-    assert (await ex.close())["state"] == "running"
+    assert (await ex.close())["state"] == "stopped_timeout"  # re-read after the stop error
+    # session error while the module ramps down: poll, never servo_stop
+    svc = FakeSvc(); ex = ModuleExec(svc, FakeGripper(), "arm", 80)
+    await ex.start(3, time_scale=TS)
+    ex.errors.append(("session", "RuntimeError('session stopping: timeout')"))
+    svc.seq = ["running", "running", "stopped_timeout"]
+    assert (await ex.close())["state"] == "stopped_timeout" and not svc.of("servo_stop")
 
     # 2. client: start goal fed before the first chunk; a dead session surfaces in play
     svc = FakeSvc(); ex = ClientExec(svc, FakeGripper(), "arm", 0)
@@ -185,6 +192,14 @@ async def main():
     await asyncio.sleep(0.3)
     assert g.done == ["grab"] and g.calls == ["grab"]
     await ex.close()
+    # close waits for an in-flight grab
+    g = FakeGripper(slow=0.3); ex = ModuleExec(FakeSvc(), g, "arm", 80)
+    await ex.start(3, time_scale=TS)
+    await ex.play(mk_chunk([1.0] * 20, ahead=-0.1))
+    await asyncio.sleep(0.05)
+    assert g.calls == ["grab"] and not g.done
+    await ex.close()
+    assert g.done == ["grab"]
 
 asyncio.run(main())
 print("ok")

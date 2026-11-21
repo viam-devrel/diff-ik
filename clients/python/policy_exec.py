@@ -87,6 +87,7 @@ class Executor:
         self._gtask = None
         self._chunk = None
         self.goal = None
+        self._gcmd = None
 
     # _cmd counts arm commands in self.msgs; raw svc.do_command (status, stop) does not.
     async def _cmd(self, command, **kw):
@@ -124,8 +125,10 @@ class Executor:
             await asyncio.sleep(max(0.0, t - time.monotonic()))
             try:
                 self.closed = what == "grab"  # last commanded state, set before the await
-                # shield: cancelling the scheduler never aborts an in-flight grab/open
-                await asyncio.shield(self.gripper.grab() if what == "grab" else self.gripper.open())
+                # shield + kept reference: cancelling the scheduler never aborts an in-flight grab/open, and
+                # _stop can await it. A flip back mid-command can overlap two gripper commands: rare, harmless.
+                self._gcmd = asyncio.ensure_future(self.gripper.grab() if what == "grab" else self.gripper.open())
+                await asyncio.shield(self._gcmd)
             except Exception as e:  # noqa: BLE001 - recorded, not raised
                 self.errors.append(("gripper", repr(e)))
 
@@ -138,19 +141,43 @@ class Executor:
     async def _cancel(self, task) -> None:
         if task:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001 - a stream that died of a bug must not make close raise
+                self.errors.append(("task", repr(e)))
+
+    @staticmethod
+    def _terminal(state) -> bool:
+        return str(state).startswith("stopped") or state == "faulted"
 
     async def _stop(self) -> dict:
         await self._cancel(self._gtask)
-        st = await self.svc.do_command({"command": "servo_status", "session_id": self.sid})
-        state = st.get("state")
-        if not (str(state).startswith("stopped") or state == "faulted"):  # else already ended: report it
+        if self._gcmd and not self._gcmd.done():  # let an in-flight grab/open finish before the world resets
             try:
-                state = (await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})).get("state")
-            except Exception:  # noqa: BLE001 - "session ended: ..." races; keep the status state
-                pass
-        return {"state": state, "peak_accel_ratio": st.get("peak_accel_ratio"), "msgs": self.msgs}
+                await asyncio.wait_for(self._gcmd, 2.0)
+            except Exception as e:  # noqa: BLE001
+                self.errors.append(("gripper", repr(e)))
+        st = await self.svc.do_command({"command": "servo_status", "session_id": self.sid})
+        state, peak = st.get("state"), st.get("peak_accel_ratio")
+        if not self._terminal(state):
+            ended = any(k == "session" for k, _ in self.errors)  # module is ramping down: a stop would overwrite
+            if not ended:
+                try:
+                    state = (await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})).get("state")
+                except Exception:  # noqa: BLE001 - "session ended/stopping: ..."
+                    ended = True
+            if ended:
+                for _ in range(15):  # re-poll to the terminal state, bounded at 1.5 s
+                    st = await self.svc.do_command({"command": "servo_status", "session_id": self.sid})
+                    state = st.get("state")
+                    if self._terminal(state):
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    state = f"{state} (not terminal)"
+        return {"state": state, "peak_accel_ratio": peak, "msgs": self.msgs}
 
 
 class ModuleExec(Executor):
@@ -163,9 +190,13 @@ class ModuleExec(Executor):
     async def play(self, chunk: dict) -> None:
         self._chunk = chunk
         kw = {} if self.lead_ms is None else {"lead_ms": self.lead_ms}  # None: module uses its measured lag
-        r = await self._cmd("servo_trajectory", session_id=self.sid, poses=chunk["poses"],
-                            dt_ms=chunk["dt"] * 1000, age_ms=(time.monotonic() - chunk["t_obs"]) * 1000,
-                            blend_ms=self.blend_ms, **kw)
+        try:
+            r = await self._cmd("servo_trajectory", session_id=self.sid, poses=chunk["poses"],
+                                dt_ms=chunk["dt"] * 1000, age_ms=(time.monotonic() - chunk["t_obs"]) * 1000,
+                                blend_ms=self.blend_ms, **kw)
+        except Exception as e:
+            self.errors.append(("session", repr(e)))
+            raise
         self._schedule_gripper(chunk, r["lead_ms"] / 1000)
 
     async def close(self) -> dict:
