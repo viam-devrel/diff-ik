@@ -135,7 +135,8 @@ run aborts only when the machine is unreachable or `vla-policy` specs don't matc
 Pure-function checks, `assert`-style like the other clients: async replacement (which rows survive a new chunk),
 the gripper crossing schedule, the success predicate, the jerk metric, the shared playback function (and
 `test_policy_stream.py` still passing). Go: one test per module fix. The expert's tilt sampling gets a check that
-grasp and release waypoints stay vertical and transit tilt stays ≤4°.
+grasp and release waypoints stay vertical, transit tilt stays ≤4°, the same seed gives the same tilts, and slerp
+segments start and end on their waypoints.
 
 ## Deliverables
 
