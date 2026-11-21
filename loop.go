@@ -225,10 +225,13 @@ type Status struct {
 	CollisionIgnored, CollisionSkipped []string
 	CollisionLate                      string // last "approach faster than v_max" warning
 
-	Force        bool    // force control is on
-	ForcePressN  float64 // force control: pressing force along the tool axis this tick
-	ForceContact bool    // force control: contact made (regulating, not approaching)
-	ForceSideN   float64 // force control: sideways contact force on the tool (tool x/y) this tick
+	Traj                        bool    // a servo_trajectory chunk is the target source
+	TrajLeadMS, TrajRemainingMS float64 // servo_trajectory: the lead in use, and how much of the chunk is left after it
+	TrajEnded                   bool    // servo_trajectory: holding the chunk's last pose
+	Force                       bool    // force control is on
+	ForcePressN                 float64 // force control: pressing force along the tool axis this tick
+	ForceContact                bool    // force control: contact made (regulating, not approaching)
+	ForceSideN                  float64 // force control: sideways contact force on the tool (tool x/y) this tick
 }
 
 const tickWindow = 500 // ticks kept for p50/p99
@@ -266,6 +269,7 @@ type Loop struct {
 	live      *liveState      // live-obstacle mode; nil: off
 	coll      *collisionModel // nil: collision avoidance off; rows() is called from the loop goroutine only
 	force     *forceCtl       // nil: no force control; loop goroutine only
+	traj      *trajectory     // servo_trajectory chunk; nil: target/twist mode. Under mu
 	peakAccel float64         // see Status.PeakAccelRatio; loop goroutine only
 
 	sent     [][]float64 // last sent commands, oldest first, at most MaxLagMS of ticks; loop goroutine only
@@ -414,6 +418,23 @@ func (l *Loop) SetMotion(p spatialmath.Pose, vel [6]float64) {
 	}
 	l.lastSet = now
 	l.target, l.vel, l.extrap = p, vel, true
+	l.traj, l.status.Traj = nil, false // a servo_target replaces a trajectory
+	l.errRing = l.errRing[:0]
+}
+
+// SetTrajectory makes tr the target source: each tick samples it at now + lead (see trajectory.sample). It keeps
+// the current trajectory as tr's blend source, and drops anything older. Ignored once a RampStop has begun.
+func (l *Loop) SetTrajectory(tr *trajectory) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.rampStart.IsZero() {
+		return
+	}
+	tr.prev = l.traj
+	if tr.prev != nil {
+		tr.prev.prev = nil
+	}
+	l.traj, l.extrap = tr, false
 	l.errRing = l.errRing[:0]
 }
 
@@ -425,7 +446,7 @@ func (l *Loop) SetVelocity(vel [6]float64) {
 	if !l.rampStart.IsZero() || l.target == nil {
 		return
 	}
-	l.vel, l.extrap = vel, false
+	l.vel, l.extrap, l.traj, l.status.Traj = vel, false, nil, false
 }
 
 // RampStop scales the commanded velocity linearly to zero over ramp, then stops the arm and ends
@@ -542,6 +563,19 @@ func (l *Loop) rampScale() (bool, float64) {
 //     leashS × the speed limit and the advance would grow it (vel · e > 0).
 func (l *Loop) advance(dt float64, cp r3.Vector, cq quat.Number, ramping, hold bool) (spatialmath.Pose, [6]float64) {
 	var zero [6]float64
+	if tr := l.traj; tr != nil && !ramping && !hold {
+		lead := tr.lead
+		if tr.autoLead {
+			lead = time.Duration(l.lagTicks / l.cfg.RateHz * float64(time.Second))
+		}
+		now := l.now()
+		target, vel, ended := tr.sample(now, lead)
+		l.target, l.vel = target, vel
+		l.status.TrajLeadMS = float64(lead) / float64(time.Millisecond)
+		l.status.TrajRemainingMS = math.Max(0, float64(tr.end().Sub(now.Add(lead)))/float64(time.Millisecond))
+		l.status.TrajEnded, l.status.Traj = ended, true
+		return target, vel
+	}
 	vel := l.vel
 	if l.extrap && l.now().Sub(l.lastSet) > l.holdAfter {
 		if l.force == nil {

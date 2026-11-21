@@ -129,6 +129,35 @@ Each target refreshes the dead-man.
 
 Returns `state`, `err_mm`, `err_deg`, `reach_deg`, `pointing_residual_deg`, `target`, `target_raw` and `clamped`.
 
+### `servo_trajectory`
+
+Pose mode. Sets a chunk of timed poses, such as a learned policy's action chunk, in place of a single target. The
+module samples it each tick.
+
+```json
+{ "command": "servo_trajectory", "session_id": "...", "poses": [ { "x": 300, "y": 0, "z": 200, "o_x": 0, "o_y": 0, "o_z": -1, "theta": 0 }, ... ],
+  "dt_ms": 33.3, "age_ms": 150, "lead_ms": 200, "blend_ms": 200 }
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `poses` | required | 2 to 2000 poses in the session frame, `dt_ms` apart. |
+| `dt_ms` | required | Time between poses, in (0, 1000]. |
+| `age_ms` | 0 | How long ago the first pose's moment was, when the command was sent (for a policy, the observation's age). In [0, 10000]. Transit time isn't included. |
+| `lead_ms` | the session's measured lag | Each tick samples the chunk at now + `lead_ms`, to make up for the servo's own delay. In [0, 1000]. The measured lag currently reads 40–60 ms high, so send it explicitly. |
+| `blend_ms` | 0 | Crossfade from the previous chunk over this long. In [0, 2000]. |
+
+- **Following:** the module interpolates between poses (orientation by rotation vector) and feeds forward the
+  segment's velocity.
+- **Expiry:** past the last pose it holds there. The dead-man counts from the last pose, so if no new chunk or target
+  arrives within `timeout_ms` of it, the session ends as `stopped_timeout`.
+- **Cancelling:** a `servo_target` cancels the trajectory.
+- **Target filter:** chunks bypass it (EMA, hold deadband, floor clamp).
+- **Returns** `state`, `lead_ms` and `remaining_ms`. Status adds `trajectory_lead_ms`, `trajectory_remaining_ms` and
+  `trajectory_ended` while a chunk is the target.
+
+Results: `docs/results/2026-11-policy-streaming.md`.
+
 ### `servo_twist`
 
 Sets the latest twist in twist mode: `linear` in mm/s and `angular` in deg/s, each `[x, y, z]`. A zero twist holds

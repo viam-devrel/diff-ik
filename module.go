@@ -176,7 +176,7 @@ func (s *diffIkServo) DoCommand(ctx context.Context, cmd map[string]interface{})
 		return s.servoStart(ctx, cmd)
 	}
 	switch name {
-	case "servo_target", "servo_twist", "servo_stop", "servo_status":
+	case "servo_target", "servo_trajectory", "servo_twist", "servo_stop", "servo_status":
 	default:
 		return nil, fmt.Errorf("unknown command %q", name)
 	}
@@ -216,6 +216,8 @@ func (s *diffIkServo) DoCommand(ctx context.Context, cmd map[string]interface{})
 			"reach_deg": st.ReachDeg, "pointing_residual_deg": st.PointingResidualDeg,
 			"target": poseMap(res.Target), "target_raw": poseMap(res.Raw), "clamped": res.Clamped,
 		}, nil
+	case "servo_trajectory":
+		return s.servoTrajectory(sess, cmd)
 	case "servo_twist":
 		lin, err := vec3(cmd, "linear")
 		if err != nil {
@@ -456,6 +458,67 @@ func (s *diffIkServo) startSession(ctx context.Context, cmd map[string]interface
 		Timeout: time.Duration(timeout * float64(time.Millisecond)),
 		Ramp:    time.Duration(ramp * float64(time.Millisecond)),
 	})
+}
+
+// servoTrajectory parses servo_trajectory: {"poses": [pose, ...], "dt_ms", "age_ms", "lead_ms", "blend_ms"}.
+func (s *diffIkServo) servoTrajectory(sess *session, cmd map[string]interface{}) (map[string]interface{}, error) {
+	items, ok := cmd["poses"].([]interface{})
+	if !ok || len(items) < 2 || len(items) > 2000 {
+		return nil, errors.New("poses must be a list of 2 to 2000 poses")
+	}
+	poses := make([]spatialmath.Pose, len(items))
+	for i, it := range items {
+		pm, ok := it.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("poses[%d] must be a pose object", i)
+		}
+		p, err := parsePose(pm)
+		if err != nil {
+			return nil, fmt.Errorf("poses[%d]: %w", i, err)
+		}
+		poses[i] = p
+	}
+	ms := func(key string, def, lo, hi float64, required bool) (float64, error) {
+		if _, ok := cmd[key]; !ok && required {
+			return 0, fmt.Errorf("%s is required", key)
+		}
+		v, err := optNum(cmd, key, def)
+		if err != nil {
+			return 0, err
+		}
+		if !(v >= lo && v <= hi) || (key == "dt_ms" && v == 0) {
+			return 0, fmt.Errorf("%s must be in [%v, %v] (dt_ms > 0), got %v", key, lo, hi, v)
+		}
+		return v, nil
+	}
+	dt, err := ms("dt_ms", 0, 0, 1000, true)
+	if err != nil {
+		return nil, err
+	}
+	age, err := ms("age_ms", 0, 0, 10000, false)
+	if err != nil {
+		return nil, err
+	}
+	blend, err := ms("blend_ms", 0, 0, 2000, false)
+	if err != nil {
+		return nil, err
+	}
+	var lead *time.Duration
+	if _, ok := cmd["lead_ms"]; ok {
+		v, err := ms("lead_ms", 0, 0, 1000, false)
+		if err != nil {
+			return nil, err
+		}
+		d := time.Duration(v * float64(time.Millisecond))
+		lead = &d
+	}
+	d := func(v float64) time.Duration { return time.Duration(v * float64(time.Millisecond)) }
+	st, err := sess.trajectory(poses, d(dt), d(age), lead, d(blend))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"state": string(st.State), "lead_ms": st.TrajLeadMS,
+		"remaining_ms": st.TrajRemainingMS}, nil
 }
 
 // parseGuard reads guard; nil means off. It returns the sensor named by its "sensor".
@@ -979,6 +1042,10 @@ func statusMap(st SessionStatus) map[string]interface{} {
 		if st.LiveLastError != "" {
 			out["live_last_error"] = st.LiveLastError
 		}
+	}
+	if st.Traj {
+		out["trajectory_lead_ms"], out["trajectory_remaining_ms"] = st.TrajLeadMS, st.TrajRemainingMS
+		out["trajectory_ended"] = st.TrajEnded
 	}
 	if st.Force {
 		out["force_press_n"], out["force_contact"], out["force_side_n"] = st.ForcePressN, st.ForceContact, st.ForceSideN

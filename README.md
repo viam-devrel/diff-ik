@@ -51,6 +51,12 @@ spiral search plus force-controlled insertion put a 20 mm peg into a hole with 1
 [`docs/results/2026-11-peg-in-hole.md`](docs/results/2026-11-peg-in-hole.md)). The force controller reads mujoco-sim's
 `force_torque` and the xArm module's `ft_sensor` readings.
 
+A pose session also takes whole action chunks (`servo_trajectory`: timed poses with the observation's age), as a
+learned policy emits them. The module aligns each chunk by its age, plays it ahead by the servo's own lag, crossfades
+from the previous chunk, and ends the session if no new chunk arrives after the last one runs out. Against an emulated
+policy it matched the best client-side playback with one message per chunk instead of 30 a second:
+[`docs/results/2026-11-policy-streaming.md`](docs/results/2026-11-policy-streaming.md).
+
 ## Local SO-101 simulation (Phase 3a)
 
 No cloud machine needed:

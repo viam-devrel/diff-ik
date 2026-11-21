@@ -341,6 +341,40 @@ func (s *session) target(p spatialmath.Pose, frame string, apply bool) (TargetRe
 	return TargetResult{Status: s.status(), Target: spatialmath.Compose(s.twb, fb), Raw: raw, Clamped: clamped}, nil
 }
 
+// trajectory handles servo_trajectory: poses (session frame, mm) dt apart, the first for the moment age before now.
+// lead nil means the loop's measured lag. The dead-man counts from the chunk's last pose, so a client that stops
+// sending gets the rest of the chunk plus timeout before the session stops.
+func (s *session) trajectory(poses []spatialmath.Pose, dt, age time.Duration, lead *time.Duration, blend time.Duration) (SessionStatus, error) {
+	if err := s.usable(ModePose); err != nil {
+		return SessionStatus{}, err
+	}
+	inv := spatialmath.PoseInverse(s.twb)
+	pb := make([]spatialmath.Pose, len(poses))
+	for i, p := range poses {
+		pb[i] = spatialmath.Compose(inv, p) // base frame
+	}
+	s.mu.Lock()
+	if s.stopping != "" {
+		defer s.mu.Unlock()
+		return SessionStatus{}, fmt.Errorf("session stopping: %s", s.stopping)
+	}
+	now := s.now()
+	tr := newTrajectory(now.Add(-age), dt, pb)
+	tr.arrive, tr.blend = now, blend
+	if lead == nil {
+		tr.autoLead = true
+	} else {
+		tr.lead = *lead
+	}
+	s.lastCmd = now
+	if e := tr.end(); e.After(now) {
+		s.lastCmd = e
+	}
+	s.loop.SetTrajectory(tr)
+	s.mu.Unlock()
+	return s.status(), nil
+}
+
 // twist handles servo_twist: lin (m/s) and ang (rad/s) are in the session frame.
 func (s *session) twist(lin, ang r3.Vector) (SessionStatus, error) {
 	if err := s.usable(ModeTwist); err != nil {
@@ -400,7 +434,7 @@ func (s *session) status() SessionStatus {
 		return s.final
 	}
 	s.mu.Lock()
-	age, filt, clamps := s.now().Sub(s.lastCmd), s.filt.cfg, s.filt.clamps
+	age, filt, clamps := max(0, s.now().Sub(s.lastCmd)), s.filt.cfg, s.filt.clamps // a trajectory's lastCmd can be ahead
 	s.mu.Unlock()
 	ss := SessionStatus{Status: s.loop.Status(), Config: s.loop.Config(), LastCmdAge: age, Filter: filt, Clamps: clamps}
 	s.addLive(&ss)
