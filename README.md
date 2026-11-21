@@ -55,7 +55,9 @@ A pose session also takes whole action chunks (`servo_trajectory`: timed poses w
 learned policy emits them. The module aligns each chunk by its age, plays it ahead by the servo's own lag, crossfades
 from the previous chunk, and ends the session if no new chunk arrives after the last one runs out. Against an emulated
 policy it matched the best client-side playback with one message per chunk instead of 30 a second:
-[`docs/results/2026-11-policy-streaming.md`](docs/results/2026-11-policy-streaming.md).
+[`docs/results/2026-11-policy-streaming.md`](docs/results/2026-11-policy-streaming.md). With a trained ACT policy in MuJoCo (pick-to-bin, 30 seeds), `servo_trajectory` matched careful client streaming on
+success (20/30 vs 21/30) with 0.6 messages a second instead of 29, and was smoother on most seeds; builtin `Move` per
+action scored 7/30: [`docs/results/2026-11-policy-act.md`](docs/results/2026-11-policy-act.md).
 
 ## Local SO-101 simulation (Phase 3a)
 

@@ -79,3 +79,47 @@ Paired metrics are within noise. The misses come from policy accuracy, not timin
   | local 10k | 13/30 (43%) | 10752 | 36.6 / 80.9 | 21.6 |
 
   One short of the 21/30 bar.
+
+## Deployment comparison
+
+Cloud ACT model, 30 eval seeds (9100–9129), `lead_ms` 100, async replans every 10 rows (1 s), 30 s timeout. Gripper
+at the row's time. Module/sync is the gate run.
+
+| mode / cadence | successes | t_success median | jerk median | seam median / p95 (mm) | row0 median (mm) | arm msgs/s | outcomes |
+|---|---|---|---|---|---|---|---|
+| module / sync | 20/30 | 7.6 s | 8632 | 12.0 / 30.7 | 14.7 | 0.6 | timeout 10 |
+| module / async | 20/30 | 7.9 s | 8787 | 9.7 / 40.6 | 14.5 | 1.0 | timeout 10 |
+| client / sync | 21/30 | 7.6 s | 9904 | 12.4 / 28.6 | 14.6 | 29.4 | timeout 9 |
+| client / async | 20/30 | 7.6 s | 9572 | 10.9 / 44.5 | 14.4 | 29.4 | timeout 10 |
+| move / sync | 7/30 | 28.6 s | 14766 | 12.0 / 47.5 | 14.3 | 2.1 | timeout 20, plan 3 |
+| move / async | 4/30 | 28.4 s | 12830 | 62.8 / 195.4 | 14.6 | 2.7 | timeout 22, plan 4 |
+
+Paired per seed (Δ = first − second):
+
+- **module vs client, async:** client jerk higher by a median 654, module smoother on 24/30 seeds; seam and row0 equal
+  (Δ 0.4 mm, −0.1 mm); client sends 28× the messages.
+- **module vs client, sync:** client jerk higher by a median 612 (module smoother on 18/30); seam and row0 equal.
+- **async vs sync, module:** jerk −148 (async lower on 15/30), seam −0.5 mm: no meaningful difference.
+- **async vs sync, client:** jerk +2, seam −1.2 mm: no meaningful difference.
+
+### Reading
+
+- **The servo modes tie on success** (20–21/30; ±15 points at n = 30). Success is set by the policy, not the delivery
+  path: every servo failure is a timeout from a missed grasp, as in the gate.
+- **`servo_trajectory` matches a careful client with one message per chunk** (0.6–1.0/s against 29/s) and is
+  smoother: lower jerk on most paired seeds in both cadences, with equal seams and equal row0. This is the result the
+  emulated-policy run predicted (`2026-11-policy-streaming.md`), now with a trained policy that closes the loop.
+- **Async inference is free with either servo mode:** overlapping chunks didn't cost success or smoothness. The
+  module's age alignment and blend absorb the overlap with no client code.
+- **Builtin `Move` per row fails the task:** 7/30 sync and 4/30 async, a median 28 s to succeed when it does (against
+  7.6 s), and planning errors. Each row is a stop-and-go plan, so the arm falls behind the chunk; the policy then
+  observes states it never saw in training. In async, replacing the queue mid-Move makes the seams jump (p95 195 mm).
+
+## Status and follow-ups
+
+- **Gate:** 20/30 against the 21/30 bar; the user chose to proceed (within the ±15-point noise). Levers if a higher
+  rate is needed: more episodes (eval loss 0.155 vs train 0.028), or a shorter run.
+- **Upstream:** viam-labs/vla-inference-service#26 (LeRobot `02655292`) is open; until it's merged and released, the
+  registry vla 0.3.0 needs the compat copy, so `dev/bc-pick-mujoco.json` still points `vla-policy` at a local path.
+  The `extra-space-values` fix for viam-labs/viam-lerobot-training is pushed but its PR isn't open yet.
+- **diff-ik v0.4.1** (median-lag auto-lead, honest `servo_trajectory` reply) is not released yet.
