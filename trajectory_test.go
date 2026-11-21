@@ -80,3 +80,37 @@ func TestLoopFollowsTrajectory(t *testing.T) {
 		t.Fatal("SetMotion kept the trajectory")
 	}
 }
+
+// The auto-lead reads the median of recent best-fit lag samples, not the jump-up lagTicks; expected() keeps lagTicks.
+func TestAutoLeadUsesMedianLag(t *testing.T) {
+	l, _, m := newTestLoop(t, home, LoopConfig{})
+	l.SetTarget(offsetTarget(t, m, home, r3.Vector{}, 0))
+	runTicks(t, l, 2)
+	l.lagTicks = 9                          // a spike raised the jump-up estimate
+	l.lagSamples = []float64{3, 3, 4, 3, 9} // but most fits say 3
+	tr := newTrajectory(l.now(), 100*time.Millisecond, []spatialmath.Pose{
+		offsetTarget(t, m, home, r3.Vector{}, 0), offsetTarget(t, m, home, r3.Vector{X: 10}, 0)})
+	tr.autoLead = true
+	l.SetTrajectory(tr)
+	runTicks(t, l, 1)
+	want := 3 / l.cfg.RateHz * 1000
+	if st := l.Status(); math.Abs(st.TrajLeadMS-want) > 1e-6 || math.Abs(st.LagMedianMS-want) > 1e-6 {
+		t.Fatalf("lead %v ms, lag median %v ms, want %v", st.TrajLeadMS, st.LagMedianMS, want)
+	}
+	l.lagTicks = 9
+	l.sent = [][]float64{{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10}}
+	if got := l.expected(); got[0] != 1 { // round(lagTicks = 9) ticks before the newest
+		t.Fatalf("expected() used %v, want the command 9 ticks back", got)
+	}
+}
+
+func TestMedian(t *testing.T) {
+	for _, c := range []struct {
+		in   []float64
+		want float64
+	}{{[]float64{3}, 3}, {[]float64{5, 1, 3}, 3}, {[]float64{4, 1, 3, 2}, 2.5}} {
+		if got := median(c.in); got != c.want {
+			t.Fatalf("median(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}

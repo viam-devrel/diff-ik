@@ -201,6 +201,7 @@ type Status struct {
 	LastTick            time.Duration
 	Overruns, Resyncs   int
 	LagMS               float64 // estimated arm lag behind the commands, ms
+	LagMedianMS         float64 // median of recent best-fit lags, ms: the trajectory auto-lead
 	Damping             float64
 	Limited             bool
 	QCmd, QMeas         []float64
@@ -237,7 +238,8 @@ type Status struct {
 const tickWindow = 500 // ticks kept for p50/p99
 
 const (
-	lagAlpha = 0.1 // EMA weight of a new lag sample when the lag estimate falls
+	lagAlpha   = 0.1 // EMA weight of a new lag sample when the lag estimate falls
+	lagSampleN = 25  // best-fit lag samples kept for the trajectory auto-lead's median
 	// moveFrac: qm counts as moving when a joint changed by more than this fraction of one tick of
 	// travel at the top joint speed. Below it, a still arm's sensor noise cannot raise the lag estimate.
 	moveFrac = 0.1
@@ -272,10 +274,11 @@ type Loop struct {
 	traj      *trajectory     // servo_trajectory chunk; nil: target/twist mode. Under mu
 	peakAccel float64         // see Status.PeakAccelRatio; loop goroutine only
 
-	sent     [][]float64 // last sent commands, oldest first, at most MaxLagMS of ticks; loop goroutine only
-	lagTicks float64     // estimated arm lag in ticks; loop goroutine only
-	prevQm   []float64   // measured joints on the previous tick; loop goroutine only
-	moved    bool        // the arm has been seen moving at least once; loop goroutine only
+	sent       [][]float64 // last sent commands, oldest first, at most MaxLagMS of ticks; loop goroutine only
+	lagTicks   float64     // estimated arm lag in ticks; loop goroutine only
+	lagSamples []float64   // recent best-fit lags (ticks), newest last, at most lagSampleN; loop goroutine only
+	prevQm     []float64   // measured joints on the previous tick; loop goroutine only
+	moved      bool        // the arm has been seen moving at least once; loop goroutine only
 
 	mu        sync.Mutex
 	errRing   []float64 // weighted measured error norm, one per tick, for stall detection
@@ -566,7 +569,7 @@ func (l *Loop) advance(dt float64, cp r3.Vector, cq quat.Number, ramping, hold b
 	if tr := l.traj; tr != nil && !ramping && !hold {
 		lead := tr.lead
 		if tr.autoLead {
-			lead = time.Duration(l.lagTicks / l.cfg.RateHz * float64(time.Second))
+			lead = time.Duration(l.leadTicks() / l.cfg.RateHz * float64(time.Second))
 		}
 		now := l.now()
 		target, vel, ended := tr.sample(now, lead)
@@ -921,6 +924,7 @@ func (l *Loop) tick(ctx context.Context, dt float64) error {
 	st.CmdErrMM, st.CmdErrDeg = cmdPos, cmdAng
 	st.Damping, st.Limited = lambda, limited
 	st.LagMS = l.lagTicks / l.cfg.RateHz * 1000
+	st.LagMedianMS = l.leadTicks() / l.cfg.RateHz * 1000
 	st.Task, st.PointingResidualDeg, st.ToolAxis = l.cfg.Task, ms.residualDeg, toolAxis(cq)
 	st.QCmd, st.QMeas = slices.Clone(l.qCmd), slices.Clone(qm)
 	st.QPActive, st.QPIters, st.PeakAccelRatio = qpActive, qpIters, l.peakAccel
@@ -1022,6 +1026,24 @@ func (l *Loop) expected() []float64 {
 	return l.sentAgo(min(int(math.Round(l.lagTicks)), len(l.sent)-1))
 }
 
+// leadTicks is the trajectory auto-lead: the median of recent best-fit lags, which unlike lagTicks
+// (it jumps up to any larger fit) is not held high by a spike. expected() keeps lagTicks.
+func (l *Loop) leadTicks() float64 {
+	if len(l.lagSamples) == 0 {
+		return l.lagTicks
+	}
+	return median(l.lagSamples)
+}
+
+func median(v []float64) float64 {
+	s := slices.Clone(v)
+	slices.Sort(s)
+	if n := len(s); n%2 == 0 {
+		return (s[n/2-1] + s[n/2]) / 2
+	}
+	return s[len(s)/2]
+}
+
 // updateLag fits qm to the ring of sent commands and moves lagTicks toward the best-fit age. It skips
 // ticks where the commands barely moved over the window (under half of ResyncDeg: it must open before
 // the resync test could trip), since the best fit is ambiguous at rest.
@@ -1041,6 +1063,12 @@ func (l *Loop) updateLag(qm []float64) {
 	for d := 0; d < n; d++ {
 		if e := maxAbsDiff(qm, l.sentAgo(d)); e < best {
 			best, bestD = e, d
+		}
+	}
+	if moving {
+		l.lagSamples = append(l.lagSamples, float64(bestD))
+		if len(l.lagSamples) > lagSampleN {
+			l.lagSamples = l.lagSamples[len(l.lagSamples)-lagSampleN:]
 		}
 	}
 	if f := float64(bestD); f > l.lagTicks {
