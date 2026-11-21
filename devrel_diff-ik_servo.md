@@ -153,8 +153,8 @@ module samples it each tick.
   arrives within `timeout_ms` of it, the session ends as `stopped_timeout`.
 - **Cancelling:** a `servo_target` cancels the trajectory.
 - **Target filter:** chunks bypass it (EMA, hold deadband, floor clamp).
-- **Returns** `state`, `lead_ms` and `remaining_ms`, which describe the new chunk. Status adds `trajectory_lead_ms`, `trajectory_remaining_ms` and
-  `trajectory_ended` while a chunk is the target.
+- **Returns** `state`, `lead_ms` and `remaining_ms`; `lead_ms` and `remaining_ms` are the new chunk's. Status adds
+  `trajectory_lead_ms`, `trajectory_remaining_ms` and `trajectory_ended` while a chunk is the target.
 
 Results: `docs/results/2026-11-policy-streaming.md`.
 
