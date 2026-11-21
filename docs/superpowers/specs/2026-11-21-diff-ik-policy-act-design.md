@@ -52,7 +52,7 @@ careful client playback, builtin `Move` per row) under sync and async inference.
 | Topic | Decision |
 |---|---|
 | Gripper action | Convert with `--gripper-key input`: the gripper column is the latched 0/1 command (`grab` 1, `open` 0). The converter builds state and action from the same key (action = next state), so the state's gripper value is the latch too; the cameras show whether the block is held. The runner reads `input` from the gripper's `{"command": "position"}` reply for `state_vector`, and closes when the action is above 0.5, opens below. No converter change. |
-| Tilt randomization | At each transit waypoint (start, pre-grasp, lift, above-bin) the expert tilts the tool up to 4° off vertical at a random azimuth, applied as a small rotation on top of the tool-down orientation with the waypoint's yaw (`theta`) unchanged. The grasp face choice and `theta` are computed as today, on the untilted pose. Grasp descent and release stay vertical. Waypoint poses carry a full orientation (scipy `Rotation`); segments interpolate position min-jerk and orientation by slerp on the same min-jerk phase (replacing the `(x, y, z, theta)`-only interpolation and `bc_pick.pose_map`'s fixed `o = (0, 0, -1)`). Tilts are drawn in `sample_scene` from the seed, so a seed always gives the same episode. Target: r02/r12 std about 0.03 (was 0.002/0.001). |
+| Tilt randomization | At the start, pre-grasp and lift waypoints the expert tilts the tool up to 4° off vertical at a random azimuth: a small world-frame rotation (tx, ty) applied on top of the tool-down orientation with the waypoint's yaw (`theta`). The grasp face choice and `theta` are computed as today, on the untilted pose. The grasp, above-bin (where the gripper releases) and retreat waypoints stay vertical. Expert poses become `(x, y, z, theta, tx, ty)`; segments interpolate position, `theta` (short way) and the tilt vector on the same min-jerk phase (for tilts this small that equals slerp), and `bc_pick.pose_map` turns the tuple into an orientation vector instead of a fixed `o = (0, 0, -1)`. Tilts are drawn in `sample_scene` from the seed after all existing draws, so a seed gives the same episode and v2 seeds keep their block, nudge and speed. Target: r02/r12 std about 0.03 (was 0.002/0.001). |
 | Episodes | 100 training (seeds 2000–2099), 30 eval (seeds 9100–9129), captured in batches with the existing `add`. The eval set measures expert success and supplies the closed-loop layouts; it never trains. |
 | Episode start | Expert and policy episodes both start at the seed's randomized start pose (servoed there, settle 0.5 s). The policy never starts from `home`, which removes the smoke test's 345 mm first-chunk jump; no warm-up logic. |
 | Check before full capture | 10 expert episodes succeed 10/10 with tilt; local conversion's `meta/stats.json` shows the new r02/r12 std. User check-in. |
@@ -106,9 +106,11 @@ a side task in every mode), row0-to-state distance per chunk, chunk-seam gap at 
 
 1. The `servo_trajectory` reply reports the new chunk's own `lead_ms` and `remaining_ms` (it returns the stale
    pre-tick session status today).
-2. The lag estimate (`lagTicks`) uses a median of recent lag samples instead of the jump-up / ease-down estimate that
-   reads 40–60 ms high. It feeds both the trajectory auto-lead and `expected()` (the lag-compensated measured-joint
-   prediction); both paths get tests. The servo doc's "send `lead_ms` explicitly" advice goes away.
+2. The trajectory auto-lead uses a median of recent best-fit lag samples instead of `lagTicks`, the jump-up /
+   ease-down estimate that reads 40–60 ms high. `lagTicks` stays as it is for `expected()` (the lag-compensated
+   prediction behind resync): its jump-up is deliberate, so a trailing estimate doesn't trip resyncs as motion starts.
+   Status adds `lag_median_ms`. Tests cover the auto-lead using the median and `expected()` still using `lagTicks`.
+   The servo doc's "send `lead_ms` explicitly" advice goes away.
 
 Releasing v0.4.1 (merge to `main`, tag, push) is confirmed with the user at the time.
 
@@ -135,8 +137,8 @@ run aborts only when the machine is unreachable or `vla-policy` specs don't matc
 Pure-function checks, `assert`-style like the other clients: async replacement (which rows survive a new chunk),
 the gripper crossing schedule, the success predicate, the jerk metric, the shared playback function (and
 `test_policy_stream.py` still passing). Go: one test per module fix. The expert's tilt sampling gets a check that
-grasp and release waypoints stay vertical, transit tilt stays ≤4°, the same seed gives the same tilts, and slerp
-segments start and end on their waypoints.
+grasp, above-bin and retreat waypoints stay vertical, tilt stays ≤4°, the same seed gives the same tilts, v2 seeds
+keep their earlier draws, and segments start and end on their waypoints.
 
 ## Deliverables
 
