@@ -185,3 +185,24 @@ Run: `cd ~/src/viam-sequence-to-lerobot && uv run python ~/src/diff-ik/dev/check
 - The gripper action is ~100 open and ~44 holding, never near 0. A runner must treat values below ~70 as "close"; a 30/70
   hysteresis with "close below 30" would never close.
 - action == next state is by construction (a layout check), not evidence of data quality.
+
+### Smoke test (Task 9): local ACT -> `viam-labs:vla:policy` -> `servo_trajectory`
+- **Training env:** `lerobot[training]` at 02655292 needs **Python 3.12** (the plan's 3.11 fails to resolve); venv
+  built with `uv venv --python 3.12`. `lerobot-train` runs. The v2 dataset written by the converter's env **loaded
+  as-is** in this env (no re-conversion needed).
+- **Training:** ACT, chunk 20, n_action_steps 20, batch 8, 300 steps, MPS, ~45 s of training (50 s wall including
+  startup). Loss step 25 **23.33** -> step 300 **2.99** (l1 0.78 -> 0.53). Checkpoint:
+  `.runs/policy-sim/act-smoke/checkpoints/000300/pretrained_model` (config.json, model.safetensors,
+  policy_{pre,post}processor.json and their normalizer safetensors, train_config.json), untracked.
+- **Service:** `vla-policy` (`viam-labs:vla:policy`, vla 0.3.0, device mps). The first load failed with
+  `DecodingError: The fields dtype, optimizer_fused are not valid for ACTConfig` (the module's bundled LeRobot is
+  older than the training commit). Fix: a copy `checkpoints/000300-compat` whose `config.json` drops those two null
+  fields; it then reached `ready`. `specs`: image keys `observation.images.scene_cam`, `observation.images.wrist_cam`
+  (3x224x224), state `[10]`, action_dim 10, `n_action_steps` 20, no RTC. (Sub-project 2: pin training and module
+  LeRobot versions together, or strip those fields after training.)
+- **`policy_run.py --once`** (world reset first; via the cloud address with the API key): rows 20, row_width 10,
+  `infer_s` 0.64, max step 7.4 mm, first pose (555.6, -71.9, 218.5), last (555.4, -78.7, 222.2), all inside the
+  workspace; gripper column ~97 (open). Arm moved from (492.0, 134.0, 488.0) to (537.0, -15.6, 300.7), i.e. toward
+  the chunk (still travelling when the session was stopped: the chunk is 2 s, the start is ~400 mm from it).
+  `accepted` "idle", status "running", `peak_accel_ratio` 1.0, no fault. A second run, watched in `overview`, showed
+  the arm descending smoothly from home toward the block. Task success not expected.

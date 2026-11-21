@@ -61,7 +61,9 @@
   {"name": "servo", "api": "rdk:service:motion", "model": "devrel:diff-ik:servo", "attributes": {"arms": ["arm"]}},
   {"name": "world-state", "api": "rdk:service:world_state_store", "model": "viam-labs:mujoco-sim:world_state", "attributes": {"world": "sim-world"}},
   {"name": "data-manager", "api": "rdk:service:data_manager", "model": "rdk:builtin:builtin",
-   "attributes": {"sync_interval_mins": 0.1, "capture_control_sensor": {"name": "demo-capture", "key": "overrides"}}}
+   "attributes": {"sync_interval_mins": 0.1, "capture_control_sensor": {"name": "demo-capture", "key": "overrides"}}},
+  {"name": "vla-policy", "api": "rdk:service:generic", "model": "viam-labs:vla:policy",
+   "attributes": {"model_path": "/Users/nick.hehr/src/diff-ik/.runs/policy-sim/act-smoke/checkpoints/000300-compat/pretrained_model", "device": "mps"}}
  ],
  "network": {"bind_address": "localhost:8089"}
 }
