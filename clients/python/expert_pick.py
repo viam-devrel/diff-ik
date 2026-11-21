@@ -175,7 +175,7 @@ async def cmd_run(a):
     ep = Episode(conns, a)
     os.makedirs(".runs/policy-sim", exist_ok=True)
     log_path = f".runs/policy-sim/expert-{a.capture or 'bar'}.jsonl"
-    kept = 0
+    kept = n = 0
     seeds = seed_range(a.seeds)
     try:
         with open(log_path, "a") as log:
@@ -184,6 +184,7 @@ async def cmd_run(a):
                 if a.capture:
                     tags = [f"cmd:{INSTRUCTION}", f"episode:{a.capture}-{seed}", "expert:v1"]
                 info = await ep.run(seed, tags)
+                n += 1
                 if a.capture:
                     info["tags"] = tags
                 kept += info["kept"]
@@ -196,8 +197,7 @@ async def cmd_run(a):
     finally:
         for c in conns:
             await c.close()
-    n = len(seeds)
-    print(json.dumps({"episodes": n, "kept": kept, "success": kept / n, "log": log_path}))
+    print(json.dumps({"episodes": n, "kept": kept, "success": kept / max(n, 1), "log": log_path}))
 
 
 async def cmd_add(a):
@@ -238,9 +238,17 @@ async def cmd_add(a):
         ds = [d for d in await data.list_datasets_by_organization_id(a.org_id) if d.name == a.dataset]
         dataset_id = ds[0].id if ds else await data.create_dataset(
             name=a.dataset, organization_id=a.org_id, type=DatasetType.DATASET_TYPE_SEQUENCE_DATA)
-        if found:
-            await data.add_sequences_to_dataset(dataset_id=dataset_id, sequence_ids=list(found.values()))
-        print(json.dumps({"dataset_id": dataset_id, "added": len(found), "missing": missing}))
+        present, token = set(), None
+        while True:
+            seqs, token, _ = await data.sequences_by_dataset_id(dataset_id, page_token=token, page_size=100)
+            present.update(s.id for s in seqs)
+            if not token:
+                break
+        new = [sid for sid in found.values() if sid not in present]
+        if new:
+            await data.add_sequences_to_dataset(dataset_id=dataset_id, sequence_ids=new)
+        print(json.dumps({"dataset_id": dataset_id, "added": len(new), "already": len(found) - len(new),
+                          "missing": missing}))
     finally:
         client.close()
 
