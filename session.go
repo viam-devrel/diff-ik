@@ -372,7 +372,16 @@ func (s *session) trajectory(poses []spatialmath.Pose, dt, age time.Duration, le
 	}
 	s.loop.SetTrajectory(tr)
 	s.mu.Unlock()
-	return s.status(), nil
+	// The loop hasn't sampled the chunk yet, so describe it here rather than from the stale status.
+	st := s.status()
+	ld := tr.lead
+	if tr.autoLead {
+		ld = time.Duration(st.LagMedianMS * float64(time.Millisecond))
+	}
+	st.Traj, st.TrajEnded = true, false
+	st.TrajLeadMS = float64(ld) / float64(time.Millisecond)
+	st.TrajRemainingMS = max(0, float64(tr.end().Sub(now.Add(ld)))/float64(time.Millisecond))
+	return st, nil
 }
 
 // twist handles servo_twist: lin (m/s) and ang (rad/s) are in the session frame.

@@ -144,7 +144,7 @@ module samples it each tick.
 | `poses` | required | 2 to 2000 poses in the session frame, `dt_ms` apart. |
 | `dt_ms` | required | Time between poses, in (0, 1000]. |
 | `age_ms` | 0 | How long ago the first pose's moment was, when the command was sent (for a policy, the observation's age). In [0, 10000]. Transit time isn't included. |
-| `lead_ms` | the session's measured lag | Each tick samples the chunk at now + `lead_ms`, to make up for the servo's own delay. In [0, 1000]. The measured lag currently reads 40–60 ms high, so send it explicitly. |
+| `lead_ms` | the session's measured lag (median of recent fits, `lag_median_ms` in status) | Each tick samples the chunk at now + `lead_ms`, to make up for the servo's own delay. In [0, 1000]. |
 | `blend_ms` | 0 | Crossfade from the previous chunk over this long. In [0, 2000]. |
 
 - **Following:** the module interpolates between poses (orientation by rotation vector) and feeds forward the
@@ -153,7 +153,7 @@ module samples it each tick.
   arrives within `timeout_ms` of it, the session ends as `stopped_timeout`.
 - **Cancelling:** a `servo_target` cancels the trajectory.
 - **Target filter:** chunks bypass it (EMA, hold deadband, floor clamp).
-- **Returns** `state`, `lead_ms` and `remaining_ms`. Status adds `trajectory_lead_ms`, `trajectory_remaining_ms` and
+- **Returns** `state`, `lead_ms` and `remaining_ms`, which describe the new chunk. Status adds `trajectory_lead_ms`, `trajectory_remaining_ms` and
   `trajectory_ended` while a chunk is the target.
 
 Results: `docs/results/2026-11-policy-streaming.md`.
@@ -181,7 +181,7 @@ isn't overwritten by the dead-man; an explicit `servo_stop` turns it into `stopp
 `servo_status` and `servo_stop` return:
 - `state`, `task`, `err_mm`, `err_deg`;
 - `rate_hz`, `tick_p50_ms`, `tick_p99_ms`, `overruns`;
-- `resyncs`, `lag_ms`, `damping`, `clamps`, `last_command_age_ms`;
+- `resyncs`, `lag_ms`, `lag_median_ms`, `damping`, `clamps`, `last_command_age_ms`;
 - the active `limits` and `target_filter`;
 - `solver`, `q_cmd_deg` (the commanded joints, in degrees) and `peak_accel_ratio`;
 - `pointing_residual_deg`, for the pointing task;
