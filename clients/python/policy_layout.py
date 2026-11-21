@@ -5,6 +5,9 @@ from scipy.spatial.transform import Rotation
 from viam.spatialmath import OrientationVector, RotationMatrix
 
 
+TILT_MIN_DEG = 1.0  # orientation vectors lose the tilt direction near the pole (1 - |o_z| <= 1e-4, ~0.81 deg)
+
+
 def rotation(pose: dict) -> Rotation:
     q = OrientationVector(pose["o_x"], pose["o_y"], pose["o_z"], np.deg2rad(pose["theta"])).to_quaternion()
     return Rotation.from_matrix(np.asarray(q.to_rotation_matrix().elements, dtype=np.float64).reshape(3, 3))
@@ -25,7 +28,10 @@ def _rows_rotation(r) -> Rotation:
 
 
 def pose_map_from(xyz, R: Rotation) -> dict:
-    """A position (mm) and a scipy Rotation as a pose map (orientation vector, theta in degrees)."""
+    """A position (mm) and a scipy Rotation as a pose map (orientation vector, theta in degrees); tilts under TILT_MIN_DEG snap to tool-down."""
+    z = R.apply([0, 0, 1])
+    if np.degrees(np.arccos(np.clip(-z[2], -1, 1))) < TILT_MIN_DEG:  # the server would read a tilt toward +x
+        R = Rotation.align_vectors([[0, 0, -1]], [z])[0] * R  # tool down, same yaw
     v = RotationMatrix(R.as_matrix().reshape(9).tolist()).to_quaternion().to_orientation_vector()
     return {"x": float(xyz[0]), "y": float(xyz[1]), "z": float(xyz[2]), "o_x": float(v.o_x),
             "o_y": float(v.o_y), "o_z": float(v.o_z), "theta": float(np.degrees(v.theta))}

@@ -17,7 +17,7 @@ LIFT = 100.0
 PLACE_ABOVE_RIM = 120.0
 RETREAT = 50.0
 TILT_MAX_DEG = 4.0
-TILT_MIN_DEG = 1.0  # orientation vectors lose the tilt direction near the pole (1 - |o_z| <= 1e-4, ~0.81 deg)
+from policy_layout import TILT_MIN_DEG, pose_map_from, rotation  # noqa: E402
 TILTED = ("start", "pregrasp", "lift")  # grasp, above-bin (release) and retreat stay vertical
 
 
@@ -108,17 +108,11 @@ def pose_map(p) -> dict:
     (tx, ty) degrees."""
     if len(p) < 6 or math.hypot(p[4], p[5]) < TILT_MIN_DEG:
         return {"x": p[0], "y": p[1], "z": p[2], "o_x": 0, "o_y": 0, "o_z": -1, "theta": p[3]}
-    import numpy as np  # here so bc_pick imports without them for callers that never tilt
+    import numpy as np
     from scipy.spatial.transform import Rotation
-    from viam.spatialmath import RotationMatrix
 
-    from policy_layout import rotation
-
-    down = rotation({"o_x": 0, "o_y": 0, "o_z": -1, "theta": p[3]})
-    R = Rotation.from_rotvec(np.radians([p[4], p[5], 0.0])) * down
-    v = RotationMatrix(R.as_matrix().reshape(9).tolist()).to_quaternion().to_orientation_vector()
-    return {"x": p[0], "y": p[1], "z": p[2], "o_x": float(v.o_x), "o_y": float(v.o_y), "o_z": float(v.o_z),
-            "theta": float(np.degrees(v.theta))}
+    R = Rotation.from_rotvec(np.radians([p[4], p[5], 0.0])) * rotation({"o_x": 0, "o_y": 0, "o_z": -1, "theta": p[3]})
+    return pose_map_from(p[0:3], R)
 
 
 async def connect(address: str, insecure: bool, n: int = 1) -> list:

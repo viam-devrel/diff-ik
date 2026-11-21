@@ -2,6 +2,7 @@
 import math
 
 import numpy as np
+from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Slerp, Rotation
 
 from bc_pick import in_bin
@@ -27,24 +28,19 @@ def gripper_events(gcol, t_obs: float, dt: float, closed: bool, lead: float) -> 
 
 
 def jerk_rms(samples) -> float:
-    """RMS of the 3-D jerk (mm/s^3) from (t, x, y, z) samples; NaN under 4 samples."""
+    """RMS 3-D jerk (mm/s^3) of (t, x, y, z) samples, resampled evenly (cubic spline; linear interpolation's kinks swamp the third difference) so timing jitter doesn't blow up the difference; NaN under 4 samples. Only comparable between runs at the same sample rate (position noise dominates at 30 Hz)."""
     if len(samples) < 4:
         return float("nan")
     a = np.asarray(samples, dtype=float)
-    dt = np.diff(a[:, 0]).mean()
-    j = np.diff(a[:, 1:], n=3, axis=0) / dt**3
+    t = np.linspace(a[0, 0], a[-1, 0], len(a))
+    dt = t[1] - t[0]
+    j = np.diff(CubicSpline(a[:, 0], a[:, 1:])(t), n=3, axis=0) / dt**3
     return float(np.sqrt((np.linalg.norm(j, axis=1) ** 2).mean()))
 
 
 def succeeded(b1, b2, gripper_input: float) -> bool:
-    """Block in the bin, at rest between two readings, and the gripper released."""
+    """Block in the bin, at rest (under 1 mm between two reads about 0.3 s apart), and the gripper released."""
     return in_bin(b2) and math.dist(b1, b2) < 1.0 and gripper_input < 0.5
-
-
-def _blend(a: dict, b: dict, f: float) -> dict:
-    ra, rb = rotation(a), rotation(b)
-    R = Slerp([0.0, 1.0], Rotation.concatenate([ra, rb]))([f])[0]
-    return pose_map_from([a[k] + f * (b[k] - a[k]) for k in "xyz"], R)
 
 
 def sample_chunk(chunk: dict, t: float) -> dict:
@@ -52,12 +48,13 @@ def sample_chunk(chunk: dict, t: float) -> dict:
     p, n = chunk["poses"], len(chunk["poses"])
     s = min(max((t - chunk["t_obs"]) / chunk["dt"], 0.0), n - 1)
     k = min(int(math.floor(s)), max(n - 2, 0))
-    return _blend(p[k], p[min(k + 1, n - 1)], s - k)
+    return mix_pose(p[k], p[min(k + 1, n - 1)], s - k)
 
 
 def mix_pose(a: dict, b: dict, w: float) -> dict:
     """Pose w of the way from a to b (w=0 is a, w=1 is b), for crossfading between chunks."""
-    return _blend(a, b, w)
+    R = Slerp([0.0, 1.0], Rotation.concatenate([rotation(a), rotation(b)]))([w])[0]
+    return pose_map_from([a[k] + w * (b[k] - a[k]) for k in "xyz"], R)
 
 
 # --- executors ---

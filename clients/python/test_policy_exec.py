@@ -3,7 +3,7 @@
 # dependencies = ["viam-sdk", "numpy", "scipy"]
 # ///
 """Pure-path checks for policy_exec.py. Run: uv run clients/python/test_policy_exec.py"""
-import math, os, sys
+import math, os, random, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from policy_exec import first_live_row, gripper_events, jerk_rms, mix_pose, sample_chunk, succeeded  # noqa: E402
 
@@ -24,6 +24,12 @@ assert jerk_rms(line) < 1e-6
 cubic = [(i / 30, (i / 30) ** 3, 0, 0) for i in range(60)]
 assert abs(jerk_rms(cubic) - 6.0) < 1e-6
 assert math.isnan(jerk_rms(line[:3]))
+
+# jitter (1/30 s plus up to 8 ms) must not blow it up
+rng = random.Random(0)
+ts = [i / 30 + rng.uniform(0, 0.008) for i in range(60)]
+assert jerk_rms([(t, t * 60.0, 0, 0) for t in ts]) < 1e-6
+assert abs(jerk_rms([(t, t**3, 0, 0) for t in ts]) / 6.0 - 1) < 0.05
 
 # success: in the bin, at rest, gripper open
 from bc_pick import BIN_XY  # noqa: E402

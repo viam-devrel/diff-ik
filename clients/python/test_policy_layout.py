@@ -34,6 +34,18 @@ p, _ = chunk_to_poses([noisy])
 n = np.linalg.norm([p[0]["o_x"], p[0]["o_y"], p[0]["o_z"]])
 assert abs(n - 1) < 1e-6
 
+# pole band: a sub-TILT_MIN_DEG tilt snaps to tool-down at the same yaw; a bigger one passes through
+from scipy.spatial.transform import Rotation  # noqa: E402
+from policy_layout import pose_map_from, rotation  # noqa: E402
+
+down = rotation({"o_x": 0, "o_y": 0, "o_z": -1, "theta": 33})
+want = pose_map_from([1, 2, 3], down)
+snap = pose_map_from([1, 2, 3], Rotation.from_rotvec(np.radians([0.5, 0.0, 0.0])) * down)
+assert (snap["o_x"], snap["o_y"], snap["o_z"]) == (0, 0, -1) or max(abs(snap[k] - want[k]) for k in want) < 1e-6
+assert abs(snap["theta"] - want["theta"]) < 1e-6 and abs(snap["o_z"] + 1) < 1e-9
+tilt = pose_map_from([1, 2, 3], Rotation.from_rotvec(np.radians([2.0, 0.0, 0.0])) * down)
+assert abs(tilt["o_z"] + 1) > 1e-5 and abs(abs(np.degrees(np.arccos(-tilt["o_z"]))) - 2) < 1e-3
+
 # the same layout as the converter's pose_state (the dataset's source of truth)
 conv = os.path.expanduser("~/src/viam-sequence-to-lerobot/src")
 if os.path.isdir(conv):
