@@ -163,7 +163,11 @@ resolvable within the stated fallbacks.
 
 ---
 
-### Task 1: mujoco-sim gripper `position` command
+### Task 1: mujoco-sim gripper `position` command, and camera capture timestamps
+
+Task 0 found that a sequence dataset export contains **no camera images**. The likely cause: mujoco-sim's camera
+`get_images` returns `ResponseMetadata()` with no `captured_at`, so the images look like they were taken in 1970,
+outside the sequence's time window. The user approved fixing it on the same mujoco-sim branch (Steps 7–9 below).
 
 **Files:** modify `/Users/nick.hehr/src/viam-mujoco-sim/src/mujoco_module/models/gripper.py` (`do_command`, about
 line 201); test in `/Users/nick.hehr/src/viam-mujoco-sim/tests/test_gripper.py`.
@@ -245,6 +249,47 @@ line 201); test in `/Users/nick.hehr/src/viam-mujoco-sim/tests/test_gripper.py`.
   git add src/mujoco_module/models/gripper.py tests/test_gripper.py README.md
   git commit -m "feat: gripper position command (opening percent and latch) for capture"
   ```
+- [ ] **Step 8: Camera `captured_at`, test first.**
+  1. In `tests/test_camera.py`, add a test, modelled on that file's existing model-level `get_images` test. Use
+     `running_sim` if the model needs the sim thread. It calls `get_images()` and asserts that the returned
+     `ResponseMetadata.captured_at` is set (`seconds > 0`) and within 5 s of `time.time()`.
+  2. Run it to see it fail (`captured_at.seconds == 0`).
+  3. In `src/mujoco_module/models/camera.py` `get_images` (about line 141), take the time just before rendering and
+     return it:
+     ```python
+     from google.protobuf.timestamp_pb2 import Timestamp  # module-level import
+
+             captured = Timestamp()
+             captured.GetCurrentTime()  # before the render, as a real camera stamps exposure
+             ...  # existing rendering
+             return images, ResponseMetadata(captured_at=captured)
+     ```
+  4. Run `uv run pytest tests/test_camera.py -q`: all pass.
+  5. Commit:
+     ```bash
+     git add src/mujoco_module/models/camera.py tests/test_camera.py
+     git commit -m "fix: cameras stamp captured_at, so data capture and sequence exports keep their images"
+     ```
+- [ ] **Step 9: Prove the export now carries images.** Rebuild the local module (Step 6). On the machine
+  `diff-ik-policy-sim` (machine id `25f31a32-828c-48eb-ad96-f2017532bd31`, part id
+  `e731b4a1-9187-40d6-94a3-aa166b803114`; credentials in
+  `/private/tmp/claude-501/-Users-nick-hehr-src-diff-ik/e10380c1-756d-4aba-a5c0-b82042e5e9c3/scratchpad/diff-ik-policy-sim/cell.json`;
+  its viam-server is already running):
+  1. Switch the mujoco-sim module entry to the local `run.sh` (`set_machine_config`; keep everything else), wait
+     until ready, and set the gripper's `docommand_input` to `{"command": "position"}`.
+  2. Capture 5 s with `demo-capture` (`start_capture` at 10 Hz, tag `probe:export-fix`; then `stop_capture`), and
+     wait 60 s.
+  3. Find the sequence by tag (the scratch scripts from Task 0 in the scratchpad do this), create a sequence dataset
+     `diff-ik-probe-export`, add the sequence, and run `viam dataset export --dataset-id <id> --destination <scratch>/pe-fix`.
+  4. Unzip it. **Pass:**
+     - `binary_data.parquet` has rows for both cameras (about 50 each);
+     - the images exist under `binary_data/`;
+     - the gripper's `DoCommand` rows hold `docommand_output.position`.
+  5. Delete the probe dataset with the CLI (`viam dataset delete --dataset-id <id>`; the machine key can't).
+  6. Append a "Task 1: gripper reading and export fix" section to `docs/results/2026-11-policy-sim-data.md` with the
+     counts, and commit it in diff-ik: `git add docs/results/2026-11-policy-sim-data.md` only.
+
+  If images are still missing, stop and report BLOCKED with what the export contains.
 
 ---
 
