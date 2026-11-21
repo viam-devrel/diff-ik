@@ -114,3 +114,23 @@ func TestMedian(t *testing.T) {
 		}
 	}
 }
+
+// Lag samples are kept only while the arm moves (a frozen qm under moving commands is a stall), capped at lagSampleN.
+func TestLagSamplesMovingOnlyAndCapped(t *testing.T) {
+	l, _, _ := newTestLoop(t, home, LoopConfig{})
+	l.lagSamples = nil
+	for i := range 11 {
+		l.sent = append(l.sent, []float64{float64(i) / 10}) // 1 rad span, well over ResyncDeg/2
+	}
+	l.prevQm, l.moved = []float64{0.5}, true
+	l.updateLag([]float64{0.5}) // frozen
+	if len(l.lagSamples) != 0 {
+		t.Fatalf("frozen qm added samples %v", l.lagSamples)
+	}
+	for i := range 2 * lagSampleN {
+		l.updateLag([]float64{0.5 + 0.1*float64(i%2+1)}) // alternating, so each tick moves
+	}
+	if len(l.lagSamples) != lagSampleN {
+		t.Fatalf("%d samples, want %d", len(l.lagSamples), lagSampleN)
+	}
+}
