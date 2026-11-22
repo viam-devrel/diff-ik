@@ -92,6 +92,15 @@ stop = BadEnd([None, "approach_stall"])
 row = asyncio.run(policy_run.run_episode(a, c, 9100, stop=stop))
 assert row["trigger"] == "approach_stall" and Exec.last.closed, row
 
+class BadClose(Exec):
+    async def close(self):
+        raise RuntimeError("close boom")
+
+
+c2 = dict(c, make_exec=BadClose)
+row = asyncio.run(policy_run.run_episode(a, c2, 9100, stop=Stop([None, "approach_stall"])))
+assert row["trigger"] == "approach_stall" and row["outcome"] != "trigger", row
+
 a = policy_run.parse_args(["--address", "x", "--out", os.devnull, "--timeout-s", "0.3"])
 row = asyncio.run(policy_run.run_episode(a, c, 9100))
 assert row["trigger"] is None and row["outcome"] == "timeout", row
