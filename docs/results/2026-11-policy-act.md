@@ -136,8 +136,15 @@ Paired per seed (Δ = first − second):
   **Gate (45 s timeout; inference 0.4 s per 50-row chunk): 0/30**, but with consistent chunks (seam 26 mm median, row0
   26 mm): undertrained, not incoherent. Flow-matching eval loss, like diffusion's, didn't pick a usable checkpoint.
 - **Reading:** eval-loss checkpoint selection works for ACT (a deterministic L1 regression loss) and fails for the
-  generative policies (diffusion's denoising loss, SmolVLA's flow-matching loss, both sampled at random noise levels).
-  The training script should default those to a fixed run and `last`, and keep `best`/early stop for ACT.
+  generative policies (diffusion's denoising loss, SmolVLA's flow-matching loss, both sampled at random noise levels):
+
+  | policy | checkpoint picked by eval loss | fixed run, last checkpoint |
+  |---|---|---|
+  | ACT | step 18k: **24/30** | (v1, 30k last: 20/30) |
+  | SmolVLA | step 1k: 0/30 | step 20k: **20/30** (eval loss had risen 0.25 → 0.88) |
+  | diffusion (96 px) | step 2k: 0/30 (old runner) | step 100k: **16/30** (fixed runner; 16/25 clean) |
+
+  The training script now defaults those to a fixed run and `last`, and keeps `best`/early stop for ACT.
 - **Diffusion v2** (100k steps, `last`, no early stop; job `6b02646b770b27184e4017a9`) is training.
 - **Runner bug, sync cadence, found by the pi05/Cosmos3 readiness audit:** each chunk was stamped with its full age since
   the observation, although the arm holds still during inference in sync. When inference outlasts the chunk (diffusion:
