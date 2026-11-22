@@ -1,0 +1,209 @@
+# Learned policy in sim, sub-project 2: ACT and the deployment comparison — Results
+
+Date: 2026-11-21. Spec: `docs/superpowers/specs/2026-11-21-diff-ik-policy-act-design.md`. Plan:
+`docs/superpowers/plans/2026-11-21-diff-ik-policy-act.md`.
+
+## v3 dataset
+
+- **Expert changes:** tool tilts of 1–4° at the start, pre-grasp and lift waypoints, drawn from the seed after all
+  v1 draws (`bc_pick.sample_scene`), so v2 seeds keep their scenes. Grasp, above-bin and retreat stay vertical. Tilts
+  under 1° are sent as tool-down: Viam's orientation vector can't carry a tilt's direction below about 0.81° (the
+  server reads it as a tilt toward +x), which made segments through that band jump about 1.5° in one tick.
+  `policy_layout.pose_map_from` snaps the same band for every pose the runner sends.
+- **Gripper action:** the latched command (`--gripper-key input`, 0/1) in both state and action.
+- **10-episode check (seeds 9100–9109):** 10/10 kept. A converted probe showed r02/r12 std 0.020/0.018 (v2:
+  0.002/0.001), max tilt about 3.8°, gripper column only 0/1.
+- **Capture:** `diff-ik-pick-v3` (`6b01d1fbb11eaafd4d0a331a`), seeds 2000–2099, **100/100 kept**, 9171 frames
+  (75–112 per episode, median 90). `diff-ik-pick-v3-eval` (`6b01d1fc9d30069f0fb8f2c1`), seeds 9100–9129,
+  **30/30 kept**, 2741 frames. Tag `expert:v2`. Converted with the converter's `--action-space ee --grippers gripper
+  --gripper-key input --image-size 224 --fps 10`; no NaNs, `action[t] == state[t+1]`.
+
+## Local ACT (Track 2)
+
+- **Training:** LeRobot `02655292`, MPS, ACT defaults, `chunk_size` 20, `n_action_steps` 20, batch 8, 20k steps
+  (about 17 epochs), about 45 min. Loss 23 → 0.51 (5k) → 0.22 (10k) → 0.16 (15k) → 0.13 (20k).
+- **Serving:** `vla-policy` (vla 0.3.0) with `-compat` copies that drop `dtype` and `optimizer_fused`
+  (the module's LeRobot is older; viam-labs/vla-inference-service#26 aligns them).
+- **Open loop (200 v3-eval frames, 20k):** first-row xyz error median 14.6 mm (p90 34.5), last-row 12.9 mm (p90 44.1),
+  gripper error median 0.03.
+- **Closed loop, module mode, sync, `lead_ms` 100, 10 eval seeds each:**
+
+  | checkpoint | successes |
+  |---|---|
+  | 5k | 2/10 |
+  | 10k | 4/10 |
+  | 15k | 1/10 |
+  | 20k | 3/10 |
+
+  The 10k checkpoint on all 30 eval seeds: **13/30 (43%)**. Short of the 70% gate.
+- **Failure mode:** the policy runs the right sequence (descend, grab, lift, over the bin, open) but lands the grab off
+  target: one episode closed with the tool tip 76 mm above and 42 mm beside the block, another at the right height
+  but 31 mm off in y. Misses are followed by re-open/re-grab dithering until the 30 s timeout.
+
+### Gripper timing (found and fixed, no effect on success)
+
+The runner fired each gripper command `lead` early, as the spec said. Logging commanded vs measured pose at every
+gripper command showed the arm 13–24 mm short of the row pose (mostly in z) at the grab: the lead already makes the
+*arm* reach row k at its time, so shifting the gripper too closes it a full lag before the arm arrives. The gripper now
+fires at the row's own time (`--grip-early` keeps the old timing). A/B on the 30 eval seeds, 10k checkpoint:
+
+| gripper timing | successes | jerk median | seam median (mm) |
+|---|---|---|---|
+| row time (fixed) | 13/30 | 10752 | 36.6 |
+| lead early (old) | 14/30 | 10698 | 39.0 |
+
+Paired metrics are within noise. The misses come from policy accuracy, not timing.
+
+## Cloud ACT (Track 1)
+
+- **Pipeline:** viam-labs/viam-sequence-to-lerobot#10 and viam-labs/viam-lerobot-training#1 squash-merged (converter
+  `3215dc0`). Training script `lerobot-training` v1, then v2 (below), uploaded to DevRelDemos.
+- **Containers:** `docker.io/hipsterbrown/viam-lerobot-training:0.1.0-1` (17.3 GB; all curated policies) took about 50 min
+  from submit to the program starting, most of it the image pull. `0.1.0-slim-1` (5.0 GB; `lerobot[training,peft]`
+  only, ACT/diffusion) started within minutes.
+- **Job 1 (`6b01f137…`) failed:** `viam train submit --args` rejects `=` inside a value, so the README's
+  `extra="'--policy.chunk_size=50 …'"` can't be submitted; the space form `--policy.chunk_size 50` passed the CLI but the
+  script parsed `50` as a flag (`argument --policy.n_action_steps: expected one argument`). Fixed in the script (`extra`
+  accepts `--flag value` pairs; branch `extra-space-values`, uploaded as v2; the PR is pending a working `gh`).
+- **Job 2 (`6b02006f…`):** slim container, 2 × A100 40GB (`accelerate`, one process per GPU), batch 32 per GPU (64 in
+  all), 30k steps (233 epochs of 9171 frames, 10% of episodes held out), lr 3e-5 policy and backbone (√8 × ACT's 1e-5 for
+  8× the batch), chunk 20. 0.08 s/step once warm (data 0.004 s: compute-bound, 4 workers per process), 2.45 GB per GPU,
+  **43 min of training**. Final train loss 0.028, eval loss 0.155 (best 0.152). Model `diff-ik-pick-act` v1.
+- **Open loop (same 200 frames as local):** first-row error median 11.8 mm, but p90 124 mm: on some frames the
+  prediction collapses to about the dataset-mean pose, which reads as overfitting (train 0.028 vs eval 0.155).
+- **Gate (module, sync, `lead_ms` 100, 30 eval seeds; served from a compat copy on vla 0.3.0):**
+
+  | model | successes | jerk median | seam median / p95 (mm) | row0 median (mm) |
+  |---|---|---|---|---|
+  | cloud 30k | **20/30 (67%)** | 8632 | 12.0 / 30.7 | 14.7 |
+  | local 10k | 13/30 (43%) | 10752 | 36.6 / 80.9 | 21.6 |
+
+  One short of the 21/30 bar.
+
+## Deployment comparison
+
+Cloud ACT model, 30 eval seeds (9100–9129), `lead_ms` 100, async replans every 10 rows (1 s), 30 s timeout. Gripper
+at the row's time. Module/sync is the gate run.
+
+| mode / cadence | successes | t_success median | jerk median | seam median / p95 (mm) | row0 median (mm) | arm msgs/s | outcomes |
+|---|---|---|---|---|---|---|---|
+| module / sync | 20/30 | 7.6 s | 8632 | 12.0 / 30.7 | 14.7 | 0.6 | timeout 10 |
+| module / async | 20/30 | 7.9 s | 8787 | 9.7 / 40.6 | 14.5 | 1.0 | timeout 10 |
+| client / sync | 21/30 | 7.6 s | 9904 | 12.4 / 28.6 | 14.6 | 29.4 | timeout 9 |
+| client / async | 20/30 | 7.6 s | 9572 | 10.9 / 44.5 | 14.4 | 29.4 | timeout 10 |
+| move / sync | 7/30 | 28.6 s | 14766 | 12.0 / 47.5 | 14.3 | 2.1 | timeout 20, plan 3 |
+| move / async | 4/30 | 28.4 s | 12830 | 62.8 / 195.4 | 14.6 | 2.7 | timeout 22, plan 4 |
+
+Paired per seed (Δ = first − second):
+
+- **module vs client, async:** client jerk higher by a median 654, module smoother on 24/30 seeds; seam and row0 equal
+  (Δ 0.4 mm, −0.1 mm); client sends 28× the messages.
+- **module vs client, sync:** client jerk higher by a median 612 (module smoother on 18/30); seam and row0 equal.
+- **async vs sync, module:** jerk −148 (async lower on 15/30), seam −0.5 mm: no meaningful difference.
+- **async vs sync, client:** jerk +2, seam −1.2 mm: no meaningful difference.
+
+### Reading
+
+- **The servo modes tie on success** (20–21/30; ±15 points at n = 30). Success is set by the policy, not the delivery
+  path: every servo failure is a timeout from a missed grasp, as in the gate.
+- **`servo_trajectory` matches a careful client with one message per chunk** (0.6–1.0/s against 29/s) and is
+  smoother: lower jerk on most paired seeds in both cadences, with equal seams and equal row0. This is the result the
+  emulated-policy run predicted (`2026-11-policy-streaming.md`), now with a trained policy that closes the loop.
+- **Async inference is free with either servo mode:** overlapping chunks didn't cost success or smoothness. The
+  module's age alignment and blend absorb the overlap with no client code.
+- **Builtin `Move` per row fails the task:** 7/30 sync and 4/30 async, a median 28 s to succeed when it does (against
+  7.6 s), and planning errors. Each row is a stop-and-go plan, so the arm falls behind the chunk; the policy then
+  observes states it never saw in training. In async, replacing the queue mid-Move makes the seams jump (p95 195 mm).
+
+## Longer training, early stopping, and the other policies
+
+- **Training script v3** (viam-labs/viam-lerobot-training#2, open): `--checkpoint best` (default) packages the checkpoint
+  with the lowest held-out eval loss (saved at every eval, best + newest kept), and `--early_stop_patience N` stops
+  after N evals without improvement (SIGTERM to the run; at LeRobot 02655292 eval runs before the save, so checkpoint S
+  holds the weights whose loss is logged at S). pi0/cosmos3 evaluate every 5000 steps. `extra` takes `--flag value`.
+- **Eval loss plateaus early for ACT:** 0.209 (1k) → 0.150 (10k) → 0.147–0.157 up to 60k, with or without image
+  augmentation. Early stopping on the augmented run stopped at 28k with the best at 18k.
+- **ACT v2** (augmentation on the GPU, best checkpoint, 20k steps; job `6b02504c770b27184e3ad9e5`, 33 min): packaged
+  step 18k, eval loss 0.147. **Gate (module, sync, 30 seeds): 24/30 (80%)**, above the 70% bar; row0 11.3 mm (v1 14.7),
+  seam 12.3 / 35.8 mm, jerk 10043.
+- **Diffusion v1** (gated before the sync-cadence runner fix below; `n_obs_steps` 1, horizon 32, `n_action_steps` 20, 96 px; slim-2 container): early stopping packaged
+  step 2k (eval loss 0.029) and stopped at 12k. **Gate (45 s timeout, inference 2.6 s per chunk on MPS): 0/30**, seams
+  168 mm median: consecutive chunks disagree, i.e. undertrained. Diffusion's eval loss is the denoising error on random
+  noise draws, noisy and weakly tied to rollouts, so early stopping on it picks far too early; train diffusion for a
+  fixed long run (100k+) and choose by rollout instead.
+- **SmolVLA v1** (fine-tuned from `smolvla_base`, chunk 50, lr 1e-4; job `6b02504c770b27184e3ad9f7`, 60 min): eval loss
+  *rose* from 0.258 (1k) to 0.642 (11k), so early stopping packaged step 1k (about 8 epochs) and stopped at 11k.
+  **Gate (45 s timeout; inference 0.4 s per 50-row chunk): 0/30**, but with consistent chunks (seam 26 mm median, row0
+  26 mm): undertrained, not incoherent. Flow-matching eval loss, like diffusion's, didn't pick a usable checkpoint.
+- **Reading:** eval-loss checkpoint selection works for ACT (a deterministic L1 regression loss) and fails for the
+  generative policies (diffusion's denoising loss, SmolVLA's flow-matching loss, both sampled at random noise levels):
+
+  | policy | checkpoint picked by eval loss | fixed run, last checkpoint |
+  |---|---|---|
+  | ACT | step 18k: **24/30** | (v1, 30k last: 20/30) |
+  | SmolVLA | step 1k: 0/30 | step 20k: **20/30** (eval loss had risen 0.25 → 0.88) |
+  | diffusion (96 px) | step 2k: 0/30 (old runner) | step 100k: **16/30** (fixed runner; 16/25 clean) |
+  | diffusion (224 px, augmented) | — | step 100k: **25/30** |
+
+  The training script now defaults those to a fixed run and `last`, and keeps `best`/early stop for ACT.
+- **Diffusion v2** (100k steps, `last`, no early stop; job `6b02646b770b27184e4017a9`) is training.
+- **Runner bug, sync cadence, found by the pi05/Cosmos3 readiness audit:** each chunk was stamped with its full age since
+  the observation, although the arm holds still during inference in sync. When inference outlasts the chunk (diffusion:
+  2.6 s against a 2.0 s chunk), `servo_trajectory` treats the chunk as played out and holds its last pose, so the planned
+  path is skipped. Fixed: sync chunks start when inference returns (`policy_run.py`); async keeps the real age. ACT and
+  SmolVLA (inference under 0.5 s) were unaffected; diffusion's earlier gates were.
+- **Diffusion v2 re-gated on the fixed runner** (100k, 96 px; 45 s timeout, 6 s dead-man, 10 s infer timeout):
+  **16/30 (53%)**, seam 9.3 / 60.2 mm (was 92.5 / 245.8), t_success median 20 s. Five late episodes failed on the laptop,
+  not the policy: inference slowed from 2.6 s to 3–10 s (one infer timeout, two dead-man stops, then two `arm busy`
+  starts), so 16 of 25 clean episodes (64%). The earlier "96 px can't localize the block" reading was wrong: that episode
+  was distorted by the skipped chunks.
+- **SmolVLA v2** (fixed 20k steps, `last`, `n_action_steps` 20 of a 50-row chunk; script v4; job
+  `6b02f2ad614c32cdd7b604f1`, 1.75 h): eval loss rose from 0.252 (1k) to 0.878 (20k), the pattern where best-by-eval-loss
+  picked the 0/30 checkpoint in v1. **Gate (module, sync, 30 seeds, 30 s): 20/30 (67%)**, t_success 9.9 s, and the
+  smoothest seams of any policy: 6.5 / 11.7 mm (ACT 12.3 / 35.8). This is the case for `last` as the default for the
+  generative policies.
+- **Diffusion v3** (224 px, GPU image augmentation, 100k steps, `last`; job `6b02f1f6614c32cdd7b5d7fd`, 3.4 h; eval loss
+  0.152 against v2's 0.204). **Gate (fixed runner, 45 s, 8 s dead-man, 15 s infer timeout): 25/30 (83%)**, the best of any
+  policy; every miss a plain timeout, inference 2.5 s median; seam 5.9 / 46.2 mm, t_success 17.5 s. Resolution plus
+  augmentation took diffusion from 16/30 (96 px) to 25/30.
+- **SmolVLA v3** (448 px, same 100 episodes, 20k, `last`; job `6b031281b11eaafd4d603ea0`, 1.8 h): **22/30 (73%)** against
+  v2's 20/30 at 224 px, within noise. Paired: row0 lower on 21/30 seeds (11.4 mm against 14.8, better localization),
+  jerk higher on 23/30, seams equal (5.6 mm), inference unchanged at 0.41 s (the vision encoder runs at 512 either way).
+  Resolution alone is a small lever for SmolVLA here.
+- **SmolVLA v4** (448 px, `diff-ik-pick-v3-200`: 198 episodes, 18.2k frames, 20k steps = 78 epochs, `last`; job
+  `6b031724614c32cdd7c03b33`; eval loss best 0.181, final 0.546 against v3's 0.853): **23/30 (77%)** against v3's 22/30,
+  within noise; paired metrics a wash. SmolVLA plateaued at 20 → 22 → 23 across resolution and data doubling.
+- **Failures cluster at the edges of the block's training area** (x 425–675, y −60–140 mm). Seed 9101 (667, −56), the
+  far corner, fails for all five good models (ACT v2, diffusion v3, SmolVLA v2–v4); 9110 (659, −49) and 9111 (603, 140)
+  fail for diffusion and every SmolVLA; 9115 (452, 64) and 9124 (444, 101), near the min-x edge, fail only for SmolVLA.
+  Uniform sampling leaves the edges thin, so doubling the data uniformly added little where policies fail. Next levers:
+  capture with the block area widened 20–30 mm past the eval area, or oversample edges and corners; check the scene
+  camera's view of the far corner.
+- **Camera view at the episode start** (block set, arm at the seed's nudged start, 448 px frames): in seeds 9101 and
+  9110 the right finger of the open gripper covers most of the block in the wrist camera, while the scene camera sees it
+  clearly next to the bin. Those are the two far-x, low-y seeds where the most models fail. In 9111 the block sits on
+  the table's dark stained patch in both views (low contrast). 9115 and 9124 are plainly visible in both cameras, so
+  SmolVLA's misses there are coverage, not visibility. Fix candidates: move or widen the wrist camera so the fingers
+  don't cover the area under the tool, and use a table texture without dark patches; add edge-area demos regardless.
+- **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
+  environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
+  time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
+- **Containers:** `0.1.0-slim-2` (9.1 GB: ACT, diffusion, smolvla, SmolVLM2 cached) for diffusion/SmolVLA.
+
+### Viam job status bug
+
+Five jobs were marked `TRAINING_STATUS_FAILED` with code 14 ("The service is currently unavailable") while they were
+still training; the flips clustered at about :05 past the hour. Their own logs show them finishing ("Job completed
+successfully"), but a job marked failed is never published and can't be cancelled (`viam train cancel`: "already
+completed"), so it keeps its GPUs until it ends. Jobs `6b022a3e…`, `6b023245…` (ACT 60k, both completed), `6b024298…`
+(ACT early stop, completed), `6b024bfb…` (SmolVLA, still training when marked failed). Judge jobs by their logs, not
+`viam train get`; report to Viam.
+
+## Status and follow-ups
+
+- **Gate:** 20/30 against the 21/30 bar; the user chose to proceed (within the ±15-point noise). Levers if a higher
+  rate is needed: more episodes (eval loss 0.155 vs train 0.028), or a shorter run.
+- **Upstream:** viam-labs/vla-inference-service#26 (LeRobot `02655292`) is open; until it's merged and released, the
+  registry vla 0.3.0 needs the compat copy, so `dev/bc-pick-mujoco.json` still points `vla-policy` at a local path.
+  The `extra-space-values` fix for viam-labs/viam-lerobot-training is pushed but its PR isn't open yet.
+- **diff-ik v0.4.1** (median-lag auto-lead, honest `servo_trajectory` reply) is not released yet.

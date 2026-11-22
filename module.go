@@ -1024,7 +1024,7 @@ func statusMap(st SessionStatus) map[string]interface{} {
 			"tol_mm": st.Config.TolMM, "tol_deg": st.Config.TolDeg, "gain": st.Config.Gain,
 		},
 		"tick_p50_ms": ms(st.TickP50), "tick_p99_ms": ms(st.TickP99),
-		"overruns": float64(st.Overruns), "resyncs": float64(st.Resyncs), "lag_ms": st.LagMS, "damping": st.Damping,
+		"overruns": float64(st.Overruns), "resyncs": float64(st.Resyncs), "lag_ms": st.LagMS, "lag_median_ms": st.LagMedianMS, "damping": st.Damping,
 	}
 	out["clamps"] = float64(st.Clamps)
 	out["target_filter"] = filterMap(st.Filter)

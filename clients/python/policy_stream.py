@@ -76,6 +76,7 @@ async def run(a):
     import time
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from playback import blended
     from touch_sweep import connect, goto
     from viam.components.arm import Arm
     from viam.services.motion import MotionClient
@@ -161,13 +162,11 @@ async def run(a):
             cur = state["cur"]
             target = None
             if cur is not None:
-                target = chunk_action(cur, ta if aligned else tick, a.policy_hz, aligned, cur["t_arrive"])
                 prev = state["prev"]
-                if a.strategy == "blend" and prev is not None and target is not None:
-                    w = min(1.0, (tick - state["switch_t"]) * 1000 / a.blend_ms)
-                    old = chunk_action(prev, ta, a.policy_hz, True, prev["t_arrive"])
-                    if old is not None and w < 1:
-                        target = blend(old, target, w)
+                w = (min(1.0, (tick - state["switch_t"]) * 1000 / a.blend_ms)
+                     if a.strategy == "blend" and prev is not None else 1.0)  # prev guard: blend_ms 0 only matters with a prev
+                target = blended(cur, prev, ta if aligned else tick,
+                                 w, lambda c, t: chunk_action(c, t, a.policy_hz, aligned, c["t_arrive"]), blend)
             if target is None and last_target is not None:
                 ends.append(tick)  # chunk used up and no new one: hold the last action
                 target = last_target

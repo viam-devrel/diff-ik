@@ -843,3 +843,33 @@ func TestSessionPointVelocitiesOption(t *testing.T) {
 		}
 	}
 }
+
+// The reply describes the new chunk, not the status from before the loop's next tick samples it.
+func TestSessionTrajectoryReplyReportsNewChunk(t *testing.T) {
+	m, _, clk := newTestManager(t, spatialmath.NewZeroPose())
+	s, p := mustStart(t, m, testSessionCfg(ModePose))
+	poses := make([]spatialmath.Pose, 10)
+	for i := range poses {
+		poses[i] = p
+	}
+	lead := 80 * time.Millisecond
+	st, err := s.trajectory(poses, 100*time.Millisecond, 50*time.Millisecond, &lead, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Traj || st.TrajEnded || st.TrajLeadMS != 80 || st.TrajRemainingMS != 770 {
+		t.Fatalf("traj %v ended %v lead %v remaining %v, want true false 80 770", st.Traj, st.TrajEnded, st.TrajLeadMS, st.TrajRemainingMS)
+	}
+	// A tick publishes the median; 3 ticks at 50 Hz is 60 ms.
+	s.loop.mu.Lock()
+	s.loop.lagSamples = []float64{3}
+	s.loop.mu.Unlock()
+	step(t, s, clk, 1)
+	st, err = s.trajectory(poses, 100*time.Millisecond, 50*time.Millisecond, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.TrajLeadMS != 60 || st.TrajRemainingMS != 790 {
+		t.Fatalf("auto lead %v remaining %v, want 60 790", st.TrajLeadMS, st.TrajRemainingMS)
+	}
+}
