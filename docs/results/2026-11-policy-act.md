@@ -143,6 +143,7 @@ Paired per seed (Δ = first − second):
   | ACT | step 18k: **24/30** | (v1, 30k last: 20/30) |
   | SmolVLA | step 1k: 0/30 | step 20k: **20/30** (eval loss had risen 0.25 → 0.88) |
   | diffusion (96 px) | step 2k: 0/30 (old runner) | step 100k: **16/30** (fixed runner; 16/25 clean) |
+  | diffusion (224 px, augmented) | — | step 100k: **25/30** |
 
   The training script now defaults those to a fixed run and `last`, and keeps `best`/early stop for ACT.
 - **Diffusion v2** (100k steps, `last`, no early stop; job `6b02646b770b27184e4017a9`) is training.
@@ -161,6 +162,10 @@ Paired per seed (Δ = first − second):
   picked the 0/30 checkpoint in v1. **Gate (module, sync, 30 seeds, 30 s): 20/30 (67%)**, t_success 9.9 s, and the
   smoothest seams of any policy: 6.5 / 11.7 mm (ACT 12.3 / 35.8). This is the case for `last` as the default for the
   generative policies.
+- **Diffusion v3** (224 px, GPU image augmentation, 100k steps, `last`; job `6b02f1f6614c32cdd7b5d7fd`, 3.4 h; eval loss
+  0.152 against v2's 0.204). **Gate (fixed runner, 45 s, 8 s dead-man, 15 s infer timeout): 25/30 (83%)**, the best of any
+  policy; every miss a plain timeout, inference 2.5 s median; seam 5.9 / 46.2 mm, t_success 17.5 s. Resolution plus
+  augmentation took diffusion from 16/30 (96 px) to 25/30.
 - **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
   environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
   time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
