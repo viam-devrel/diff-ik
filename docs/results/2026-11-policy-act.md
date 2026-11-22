@@ -115,6 +115,36 @@ Paired per seed (Δ = first − second):
   7.6 s), and planning errors. Each row is a stop-and-go plan, so the arm falls behind the chunk; the policy then
   observes states it never saw in training. In async, replacing the queue mid-Move makes the seams jump (p95 195 mm).
 
+## Longer training, early stopping, and the other policies
+
+- **Training script v3** (viam-labs/viam-lerobot-training#2, open): `--checkpoint best` (default) packages the checkpoint
+  with the lowest held-out eval loss (saved at every eval, best + newest kept), and `--early_stop_patience N` stops
+  after N evals without improvement (SIGTERM to the run; at LeRobot 02655292 eval runs before the save, so checkpoint S
+  holds the weights whose loss is logged at S). pi0/cosmos3 evaluate every 5000 steps. `extra` takes `--flag value`.
+- **Eval loss plateaus early for ACT:** 0.209 (1k) → 0.150 (10k) → 0.147–0.157 up to 60k, with or without image
+  augmentation. Early stopping on the augmented run stopped at 28k with the best at 18k.
+- **ACT v2** (augmentation on the GPU, best checkpoint, 20k steps; job `6b02504c770b27184e3ad9e5`, 33 min): packaged
+  step 18k, eval loss 0.147. **Gate (module, sync, 30 seeds): 24/30 (80%)**, above the 70% bar; row0 11.3 mm (v1 14.7),
+  seam 12.3 / 35.8 mm, jerk 10043.
+- **Diffusion v1** (`n_obs_steps` 1, horizon 32, `n_action_steps` 20, 96 px; slim-2 container): early stopping packaged
+  step 2k (eval loss 0.029) and stopped at 12k. **Gate (45 s timeout, inference 2.6 s per chunk on MPS): 0/30**, seams
+  168 mm median: consecutive chunks disagree, i.e. undertrained. Diffusion's eval loss is the denoising error on random
+  noise draws, noisy and weakly tied to rollouts, so early stopping on it picks far too early; train diffusion for a
+  fixed long run (100k+) and choose by rollout instead.
+- **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
+  environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
+  time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
+- **Containers:** `0.1.0-slim-2` (9.1 GB: ACT, diffusion, smolvla, SmolVLM2 cached) for diffusion/SmolVLA.
+
+### Viam job status bug
+
+Five jobs were marked `TRAINING_STATUS_FAILED` with code 14 ("The service is currently unavailable") while they were
+still training; the flips clustered at about :05 past the hour. Their own logs show them finishing ("Job completed
+successfully"), but a job marked failed is never published and can't be cancelled (`viam train cancel`: "already
+completed"), so it keeps its GPUs until it ends. Jobs `6b022a3e…`, `6b023245…` (ACT 60k, both completed), `6b024298…`
+(ACT early stop, completed), `6b024bfb…` (SmolVLA, still training when marked failed). Judge jobs by their logs, not
+`viam train get`; report to Viam.
+
 ## Status and follow-ups
 
 - **Gate:** 20/30 against the 21/30 bar; the user chose to proceed (within the ±15-point noise). Levers if a higher
