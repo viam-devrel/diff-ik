@@ -245,7 +245,9 @@ async def run_episode(a, c, seed, stop=None) -> dict:
     outcome = outcome_from(errors, close["state"], ev.is_set())
     if a.once and outcome == "timeout":
         outcome = "once"
-    if trigger and not str(close["state"]).startswith("close_failed"):  # a close failure stays visible
+    st_ = str(close["state"])
+    if trigger and (st_.startswith("stopped") or st_ in ("faulted", "done")) and "not terminal" not in st_:
+        # only a session that really ended: the DAgger runner opens a new one for the expert on "trigger"
         outcome = "trigger"
     row = episode_row(
         seed=seed, mode=a.mode, cadence=a.cadence, replan_every=a.replan_every, lead_ms=a.lead_ms, outcome=outcome,

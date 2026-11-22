@@ -99,7 +99,7 @@ class BadClose(Exec):
 
 c2 = dict(c, make_exec=BadClose)
 row = asyncio.run(policy_run.run_episode(a, c2, 9100, stop=Stop([None, "approach_stall"])))
-assert row["trigger"] == "approach_stall" and row["outcome"] != "trigger", row
+assert row["trigger"] == "approach_stall" and row["outcome"] == "timeout", row
 
 a = policy_run.parse_args(["--address", "x", "--out", os.devnull, "--timeout-s", "0.3"])
 row = asyncio.run(policy_run.run_episode(a, c, 9100))
