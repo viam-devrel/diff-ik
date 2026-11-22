@@ -41,7 +41,7 @@ the policy started. `hist` holds recent states (enough for the stall window). Ki
 
 | kind | condition (defaults are CLI flags) |
 |---|---|
-| `drop` | holding in an earlier state, not holding now, and the block at rest (two consecutive block reads under 1 mm apart, as in `policy_exec.succeeded`) and not in the bin (`bc_pick.in_bin`). A block still falling after a release over the bin is not a drop. |
+| `drop` | holding in an earlier state, not holding now, and the block at rest (two consecutive 10 Hz samples, 0.1 s apart, under 1 mm apart) and not in the bin (`bc_pick.in_bin`). A block still falling after a release over the bin is not a drop. |
 | `empty_grasp` | gripper commanded closed for ≥ 1.0 s without a firm grasp |
 | `approach_stall` | not holding; TCP more than 15 mm from the grasp point (block centre + `GRASP_ABOVE_CENTER`), and its distance to it shrank by less than 10 mm over the last 2.0 s |
 | `carry_stall` | holding; TCP more than 15 mm (xy) from the release point above the bin, and its distance to it shrank by less than 10 mm over the last 2.0 s |
@@ -56,7 +56,8 @@ Two new `bc_pick` helpers, so the expert and the trigger can read any pose the p
 
 - `six_tuple_from_pose(pose)`: the inverse of `pose_map`. It turns a Viam flange pose (arm frame, orientation vector)
   into the expert's `(x, y, z, theta, tx, ty)`: orientation = tool-down · rotvec(tx, ty, 0) applied as `pose_map`
-  does, solved for theta and (tx, ty). Tested by round-tripping random tuples (tilts up to 10°) through `pose_map`.
+  does, solved for theta and (tx, ty). Tested by round-tripping random tuples (tilt sizes in [`TILT_MIN_DEG`, 10°]) through `pose_map`, plus a tool-down
+  pose that returns zero tilt (`pose_map` snaps tilts under `TILT_MIN_DEG` to tool-down).
 - `tcp_world(pose)`: the TCP in world mm for any flange orientation (flange + R · (0, 0, `TCP_MM`) + `ARM_BASE`).
   Equals `flange_from_tcp`'s inverse for a tool-down pose (tested).
 
@@ -121,9 +122,10 @@ expert's own values.
 ### 6. Training: two cloud jobs
 
 Both from `viam:16518049-9dd3-479f-9644-c5d112aa42d8/diff-ik-pick-smolvla@4`, identical flags apart from the dataset:
-448 px, 10k steps, `last` checkpoint, v4's batch size and peak learning rate. The script already scales the schedule to
-the run: the LR decays to zero at `--steps` after a `min(500, steps/10)`-step warmup (policies.py), so both jobs get a
-500-step warmup and decay to 10k.
+448 px, 10k steps, `last` checkpoint, v4's batch size and SmolVLA's class-default schedule (no scheduler flags). LeRobot's
+cosine scheduler scales itself when `--steps` is below its decay steps (warmup 1000, decay 30k, LR 1e-4 → 2.5e-6), so a
+10k run gets about 333 warmup steps and reaches 2.5e-6 at 10k. Both jobs get the same schedule; confirm the scaling
+from the scheduler's "Auto-scaling" log line in the local check (§5) or the job log.
 
 - **A (DAgger):** `diff-ik-pick-v3-200-dagger1`.
 - **B (control):** `diff-ik-pick-v3-200`.
