@@ -42,6 +42,8 @@ class Policy:
 class Exec:
     def __init__(self):
         self.errors, self.msgs = [], 0
+        Exec.last = self
+        self.closed = False
 
     async def start(self, seed):
         pass
@@ -50,9 +52,10 @@ class Exec:
         pass
 
     async def wait_done(self):
-        pass
+        await asyncio.sleep(0.01)
 
     async def close(self):
+        self.closed = True
         return {"state": "stopped", "peak_accel_ratio": None, "msgs": 0}
 
 
@@ -77,8 +80,17 @@ c = {"make_exec": Exec, "world": World(), "gripper": Grip(), "policy": Policy(),
 a = policy_run.parse_args(["--address", "x", "--out", os.devnull, "--timeout-s", "5"])
 stop = Stop([None, "approach_stall"])
 row = asyncio.run(policy_run.run_episode(a, c, 9100, stop=stop))
-assert row["trigger"] == "approach_stall" and row["chunks"] == 2, row
+assert row["trigger"] == "approach_stall" and row["outcome"] == "trigger" and row["chunks"] == 2, row
 assert stop.t0 is not None and stop.ended
+
+class BadEnd(Stop):
+    def end(self):
+        raise RuntimeError("hook bug")
+
+
+stop = BadEnd([None, "approach_stall"])
+row = asyncio.run(policy_run.run_episode(a, c, 9100, stop=stop))
+assert row["trigger"] == "approach_stall" and Exec.last.closed, row
 
 a = policy_run.parse_args(["--address", "x", "--out", os.devnull, "--timeout-s", "0.3"])
 row = asyncio.run(policy_run.run_episode(a, c, 9100))

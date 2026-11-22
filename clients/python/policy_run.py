@@ -156,7 +156,8 @@ async def jerk_task(arm, samples):
 
 
 async def run_episode(a, c, seed, stop=None) -> dict:
-    """t_success_s is the time of the confirming read (it lags the block settling by 0.3-0.6 s)."""
+    """t_success_s is the time of the confirming read (it lags the block settling by 0.3-0.6 s).
+    stop (optional): begin(t0) / check() -> trigger or None / end(); end() may come without begin() (setup failed)."""
     ex = c["make_exec"]()
     errors_extra, infer_s, row0, seam, samples = [], [], [], [], []
     st = {"t_success_s": None}
@@ -228,8 +229,6 @@ async def run_episode(a, c, seed, stop=None) -> dict:
             elif not any(k == "session" for k, _ in ex.errors):
                 ex.errors.append(("session", repr(e)))
     finally:
-        if stop is not None:
-            stop.end()
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -237,10 +236,17 @@ async def run_episode(a, c, seed, stop=None) -> dict:
             close = await asyncio.wait_for(ex.close(), CLOSE_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001
             close = {"state": f"close_failed: {e!r}", "peak_accel_ratio": None, "msgs": ex.msgs}
+        if stop is not None:
+            try:
+                stop.end()
+            except Exception:  # noqa: BLE001 - a hook bug must not skip teardown or abort the run
+                pass
     errors = list(ex.errors) + errors_extra
     outcome = outcome_from(errors, close["state"], ev.is_set())
     if a.once and outcome == "timeout":
         outcome = "once"
+    if trigger:
+        outcome = "trigger"
     row = episode_row(
         seed=seed, mode=a.mode, cadence=a.cadence, replan_every=a.replan_every, lead_ms=a.lead_ms, outcome=outcome,
         t_success_s=st["t_success_s"], duration_s=duration, close=close, jerk=jerk_rms(samples),
