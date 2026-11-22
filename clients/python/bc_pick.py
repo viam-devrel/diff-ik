@@ -23,6 +23,7 @@ PLACE_ABOVE_RIM = 120.0
 RETREAT = 50.0
 TILT_MAX_DEG = 4.0
 TILTED = ("start", "pregrasp", "lift")  # grasp, above-bin (release) and retreat stay vertical
+RELEASE_TCP = (BIN_XY[0], BIN_XY[1], BIN_RIM_Z + PLACE_ABOVE_RIM)  # where the expert releases (TCP, world mm)
 
 
 def tilt_vector(mag_deg: float, azimuth_deg: float) -> tuple:
@@ -115,6 +116,28 @@ def pose_map(p) -> dict:
     down = rotation({"o_x": 0, "o_y": 0, "o_z": -1, "theta": p[3]})
     R = Rotation.from_rotvec(np.radians([p[4], p[5], 0.0])) * down
     return pose_map_from(p[0:3], R)
+
+
+def six_tuple_from_pose(pose: dict) -> tuple:
+    """The inverse of pose_map: a flange pose map (arm frame) as (x, y, z, theta, tx, ty). The tilt is the smallest
+    rotation about a horizontal axis that takes tool-down to the pose's tool axis; tilts under TILT_MIN_DEG read as
+    tool-down, as pose_map writes them."""
+    R = rotation(pose)
+    z = R.apply([0.0, 0.0, 1.0])  # the tool axis in the arm frame
+    axis = np.array([z[1], -z[0], 0.0])  # (0, 0, -1) x z: horizontal
+    ang = math.degrees(math.atan2(np.linalg.norm(axis), -z[2]))
+    tx = ty = 0.0
+    if ang >= TILT_MIN_DEG:
+        tx, ty = (float(v) for v in axis[:2] / np.linalg.norm(axis) * ang)
+    tilt = Rotation.from_rotvec(np.radians([tx, ty, 0.0]))
+    theta = pose_map_from((0.0, 0.0, 0.0), tilt.inv() * R)["theta"]  # tool-down after removing the tilt
+    return (float(pose["x"]), float(pose["y"]), float(pose["z"]), theta, tx, ty)
+
+
+def tcp_world(pose: dict) -> tuple:
+    """The tool point in world mm for a flange pose map in the arm frame, any orientation."""
+    off = rotation(pose).apply([0.0, 0.0, TCP_MM])
+    return tuple(float(pose[k] + o + b) for k, o, b in zip("xyz", off, ARM_BASE))
 
 
 async def connect(address: str, insecure: bool, n: int = 1) -> list:

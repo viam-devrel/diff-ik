@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bc_pick import (  # noqa: E402
     block_pose, start_pose,
+    ARM_BASE, BIN_RIM_Z, PLACE_ABOVE_RIM, RELEASE_TCP, six_tuple_from_pose, tcp_world,
     BIN_XY, BLOCK_AREA, TCP_MM, TILT_MAX_DEG, TILT_MIN_DEG, angle_diff, flange_from_tcp, grasp_theta, in_bin, minjerk_segment, pose_map,
     sample_scene, tilt_vector, world_to_arm, yaw_from_wxyz,
 )
@@ -98,5 +99,29 @@ assert pos == [bx / 1000, by / 1000, 0.32] and q == [math.cos(yaw / 2), 0, 0, ma
 sp = start_pose({"x": 0, "y": 0, "z": 0, "theta": 180}, 1003)
 assert sp[4:] == tuple(sc["tilts"]["start"])
 assert sp[:4] == (*sc["nudge_xyz"], 180 + sc["nudge_yaw_deg"])
+
+# six_tuple_from_pose inverts pose_map (tilts at or above the floor), and tool-down reads as zero tilt
+r = random.Random(7)
+for _ in range(200):
+    mag, az = r.uniform(TILT_MIN_DEG + 0.01, 10.0), r.uniform(0, 360)
+    t = (r.uniform(-200, 600), r.uniform(-400, 400), r.uniform(50, 500), r.uniform(-180, 180), *tilt_vector(mag, az))
+    back = six_tuple_from_pose(pose_map(t))
+    assert all(abs(a - b) < 1e-6 for a, b in zip(back[:3], t[:3])), (t, back)
+    assert abs(angle_diff(back[3], t[3])) < 1e-4, (t, back)
+    assert abs(back[4] - t[4]) < 1e-4 and abs(back[5] - t[5]) < 1e-4, (t, back)
+down = six_tuple_from_pose(pose_map((10.0, 20.0, 30.0, 33.0)))
+assert down[4] == 0.0 and down[5] == 0.0 and abs(angle_diff(down[3], 33.0)) < 1e-4, down
+under = six_tuple_from_pose(pose_map((0.0, 0.0, 0.0, 10.0, 0.5, 0.0)))  # pose_map snaps it to tool-down
+assert under[4] == 0.0 and under[5] == 0.0, under
+
+# tcp_world: tool-down agrees with flange_from_tcp; any tilt keeps the TCP at TCP_MM from the flange
+p = pose_map((100.0, 50.0, 300.0, 15.0))
+tcp = tcp_world(p)
+assert all(abs(a - b) < 1e-6 for a, b in zip(tcp, (100.0 + ARM_BASE[0], 50.0 + ARM_BASE[1], 300.0 - TCP_MM + ARM_BASE[2])))
+assert all(abs(a - b) < 1e-6 for a, b in zip(flange_from_tcp(world_to_arm(tcp)), (100.0, 50.0, 300.0)))
+pt = pose_map((100.0, 50.0, 300.0, 15.0, *tilt_vector(10.0, 45.0)))
+d = [a - b - c for a, b, c in zip(tcp_world(pt), (100.0, 50.0, 300.0), ARM_BASE)]
+assert abs(math.hypot(*d) - TCP_MM) < 1e-6 and d[2] < -0.98 * TCP_MM
+assert RELEASE_TCP == (BIN_XY[0], BIN_XY[1], BIN_RIM_Z + PLACE_ABOVE_RIM)
 
 print("ok")
