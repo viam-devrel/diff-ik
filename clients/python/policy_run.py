@@ -22,6 +22,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bc_pick  # noqa: E402
 from policy_exec import ClientExec, Executor, ModuleExec, MoveExec, jerk_rms, sample_chunk, succeeded  # noqa: E402
 from policy_layout import chunk_to_poses, state_vector  # noqa: E402
+# Imported before any connection: the SDK only builds clients for resource APIs registered when the robot connects.
+from viam.components.arm import Arm  # noqa: E402
+from viam.components.camera import Camera  # noqa: E402
+from viam.components.generic import Generic as GenericComponent  # noqa: E402
+from viam.components.gripper import Gripper  # noqa: E402
+from viam.services.generic import Generic  # noqa: E402
+from viam.services.motion import MotionClient  # noqa: E402
 
 CAMERAS = {"observation.images.scene_cam": "scene-cam", "observation.images.wrist_cam": "wrist-cam"}
 MIME_ENC = {"image/jpeg": "jpeg", "image/png": "png"}
@@ -259,13 +266,6 @@ async def run_episode(a, c, seed, stop=None) -> dict:
 
 
 async def build_context(a, servo_r, obs_r, side_r) -> dict:
-    from viam.components.arm import Arm
-    from viam.components.camera import Camera
-    from viam.components.gripper import Gripper
-    from viam.components.generic import Generic as GenericComponent
-    from viam.services.generic import Generic
-    from viam.services.motion import MotionClient
-
     policy, world = Generic.from_robot(obs_r, a.policy), GenericComponent.from_robot(side_r, a.world)  # the sim world is a component
     specs = await policy.do_command({"command": "specs"})
     keys = specs["image_feature_keys"]
