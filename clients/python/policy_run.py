@@ -155,12 +155,12 @@ async def jerk_task(arm, samples):
         await asyncio.sleep(max(0.0, 1 / 30 - (time.monotonic() - t)))
 
 
-async def run_episode(a, c, seed) -> dict:
+async def run_episode(a, c, seed, stop=None) -> dict:
     """t_success_s is the time of the confirming read (it lags the block settling by 0.3-0.6 s)."""
     ex = c["make_exec"]()
     errors_extra, infer_s, row0, seam, samples = [], [], [], [], []
     st = {"t_success_s": None}
-    ev, chunks, old = asyncio.Event(), 0, None
+    ev, chunks, old, trigger = asyncio.Event(), 0, None, None
     t0, duration, started, tasks = time.monotonic(), 0.0, False, []
     close = {"state": None, "peak_accel_ratio": None, "msgs": 0}
     try:
@@ -173,6 +173,8 @@ async def run_episode(a, c, seed) -> dict:
                 await c["gripper"].open()
                 await ex.start(seed)
                 t0, started = time.monotonic(), True
+                if stop is not None:
+                    stop.begin(t0)
                 tasks = [asyncio.create_task(success_task(c["world"], c["side_grip"], t0, ev, st)),
                          asyncio.create_task(jerk_task(c["side_arm"], samples))]
                 while not ev.is_set() and time.monotonic() - t0 < a.timeout_s and not ex.errors:
@@ -214,6 +216,10 @@ async def run_episode(a, c, seed) -> dict:
                         await race(ev, left, ex.wait_done())
                     else:
                         await race(ev, min(left, t_obs + a.replan_every * DT - time.monotonic()))
+                    if stop is not None and not ev.is_set():
+                        trigger = stop.check()
+                        if trigger:
+                            break
                 duration = time.monotonic() - t0
         except Exception as e:  # noqa: BLE001 - this episode only; TimeoutError included
             duration = time.monotonic() - t0
@@ -222,6 +228,8 @@ async def run_episode(a, c, seed) -> dict:
             elif not any(k == "session" for k, _ in ex.errors):
                 ex.errors.append(("session", repr(e)))
     finally:
+        if stop is not None:
+            stop.end()
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -233,14 +241,16 @@ async def run_episode(a, c, seed) -> dict:
     outcome = outcome_from(errors, close["state"], ev.is_set())
     if a.once and outcome == "timeout":
         outcome = "once"
-    return episode_row(
+    row = episode_row(
         seed=seed, mode=a.mode, cadence=a.cadence, replan_every=a.replan_every, lead_ms=a.lead_ms, outcome=outcome,
         t_success_s=st["t_success_s"], duration_s=duration, close=close, jerk=jerk_rms(samples),
         row0_to_state_mm=row0, seam_gap_mm=seam, infer_s=infer_s, chunks=chunks, checkpoint=a.checkpoint_label,
         errors=errors)
+    row["trigger"] = trigger
+    return row
 
 
-async def main_async(a):
+async def build_context(a, servo_r, obs_r, side_r) -> dict:
     from viam.components.arm import Arm
     from viam.components.camera import Camera
     from viam.components.gripper import Gripper
@@ -248,26 +258,31 @@ async def main_async(a):
     from viam.services.generic import Generic
     from viam.services.motion import MotionClient
 
+    policy, world = Generic.from_robot(obs_r, a.policy), GenericComponent.from_robot(side_r, a.world)  # the sim world is a component
+    specs = await policy.do_command({"command": "specs"})
+    keys = specs["image_feature_keys"]
+    if set(keys) != set(CAMERAS):
+        raise SystemExit(f"policy wants image keys {keys}, cell has {list(CAMERAS)}")
+    if specs.get("state_dim") != 10 or specs.get("action_dim") != 10:
+        raise SystemExit(f"policy state/action dims {specs.get('state_dim')}/{specs.get('action_dim')}, want 10/10")
+    svc, gripper = MotionClient.from_robot(servo_r, a.service), Gripper.from_robot(servo_r, a.gripper)
+    motion = MotionClient.from_robot(servo_r, "builtin")
+    Executor.grip_early = a.grip_early
+    Executor.session_timeout_ms = a.session_timeout_ms
+    makers = {"module": lambda: ModuleExec(svc, gripper, a.arm, a.lead_ms),
+              "client": lambda: ClientExec(svc, gripper, a.arm, a.lead_ms),
+              "move": lambda: MoveExec(motion, gripper, a.arm, svc)}
+    c = {"make_exec": makers[a.mode], "world": world, "gripper": gripper, "policy": policy, "specs": specs,
+         "cams": {k: Camera.from_robot(obs_r, cam) for k, cam in CAMERAS.items()},
+         "arm": Arm.from_robot(obs_r, a.arm), "grip": Gripper.from_robot(obs_r, a.gripper),
+         "side_arm": Arm.from_robot(side_r, a.arm), "side_grip": Gripper.from_robot(side_r, a.gripper)}
+    return c
+
+
+async def main_async(a):
     servo_r, obs_r, side_r = await bc_pick.connect(a.address, a.insecure, 3)
     try:
-        policy, world = Generic.from_robot(obs_r, a.policy), GenericComponent.from_robot(side_r, a.world)  # the sim world is a component
-        specs = await policy.do_command({"command": "specs"})
-        keys = specs["image_feature_keys"]
-        if set(keys) != set(CAMERAS):
-            raise SystemExit(f"policy wants image keys {keys}, cell has {list(CAMERAS)}")
-        if specs.get("state_dim") != 10 or specs.get("action_dim") != 10:
-            raise SystemExit(f"policy state/action dims {specs.get('state_dim')}/{specs.get('action_dim')}, want 10/10")
-        svc, gripper = MotionClient.from_robot(servo_r, a.service), Gripper.from_robot(servo_r, a.gripper)
-        motion = MotionClient.from_robot(servo_r, "builtin")
-        Executor.grip_early = a.grip_early
-        Executor.session_timeout_ms = a.session_timeout_ms
-        makers = {"module": lambda: ModuleExec(svc, gripper, a.arm, a.lead_ms),
-                  "client": lambda: ClientExec(svc, gripper, a.arm, a.lead_ms),
-                  "move": lambda: MoveExec(motion, gripper, a.arm, svc)}
-        c = {"make_exec": makers[a.mode], "world": world, "gripper": gripper, "policy": policy, "specs": specs,
-             "cams": {k: Camera.from_robot(obs_r, cam) for k, cam in CAMERAS.items()},
-             "arm": Arm.from_robot(obs_r, a.arm), "grip": Gripper.from_robot(obs_r, a.gripper),
-             "side_arm": Arm.from_robot(side_r, a.arm), "side_grip": Gripper.from_robot(side_r, a.gripper)}
+        c = await build_context(a, servo_r, obs_r, side_r)
         seeds, wins, outcomes = seed_range(a.seeds), 0, []
         if a.out:
             os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
@@ -292,7 +307,7 @@ async def main_async(a):
             await r.close()
 
 
-def parse_args(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--address", required=True)
     ap.add_argument("--insecure", action="store_true")
@@ -313,6 +328,11 @@ def parse_args(argv=None):
     ap.add_argument("--policy", default="vla-policy")
     ap.add_argument("--service", default="servo")
     ap.add_argument("--world", default="sim-world")
+    return ap
+
+
+def parse_args(argv=None, parser=None):
+    ap = parser or build_parser()
     a = ap.parse_args(argv)
     if a.once:
         a.mode, a.cadence = "module", "sync"
