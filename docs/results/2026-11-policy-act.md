@@ -170,6 +170,15 @@ Paired per seed (Δ = first − second):
   v2's 20/30 at 224 px, within noise. Paired: row0 lower on 21/30 seeds (11.4 mm against 14.8, better localization),
   jerk higher on 23/30, seams equal (5.6 mm), inference unchanged at 0.41 s (the vision encoder runs at 512 either way).
   Resolution alone is a small lever for SmolVLA here.
+- **SmolVLA v4** (448 px, `diff-ik-pick-v3-200`: 198 episodes, 18.2k frames, 20k steps = 78 epochs, `last`; job
+  `6b031724614c32cdd7c03b33`; eval loss best 0.181, final 0.546 against v3's 0.853): **23/30 (77%)** against v3's 22/30,
+  within noise; paired metrics a wash. SmolVLA plateaued at 20 → 22 → 23 across resolution and data doubling.
+- **Failures cluster at the edges of the block's training area** (x 425–675, y −60–140 mm). Seed 9101 (667, −56), the
+  far corner, fails for all five good models (ACT v2, diffusion v3, SmolVLA v2–v4); 9110 (659, −49) and 9111 (603, 140)
+  fail for diffusion and every SmolVLA; 9115 (452, 64) and 9124 (444, 101), near the min-x edge, fail only for SmolVLA.
+  Uniform sampling leaves the edges thin, so doubling the data uniformly added little where policies fail. Next levers:
+  capture with the block area widened 20–30 mm past the eval area, or oversample edges and corners; check the scene
+  camera's view of the far corner.
 - **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
   environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
   time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
