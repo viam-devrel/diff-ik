@@ -131,6 +131,14 @@ Paired per seed (Δ = first − second):
   168 mm median: consecutive chunks disagree, i.e. undertrained. Diffusion's eval loss is the denoising error on random
   noise draws, noisy and weakly tied to rollouts, so early stopping on it picks far too early; train diffusion for a
   fixed long run (100k+) and choose by rollout instead.
+- **SmolVLA v1** (fine-tuned from `smolvla_base`, chunk 50, lr 1e-4; job `6b02504c770b27184e3ad9f7`, 60 min): eval loss
+  *rose* from 0.258 (1k) to 0.642 (11k), so early stopping packaged step 1k (about 8 epochs) and stopped at 11k.
+  **Gate (45 s timeout; inference 0.4 s per 50-row chunk): 0/30**, but with consistent chunks (seam 26 mm median, row0
+  26 mm): undertrained, not incoherent. Flow-matching eval loss, like diffusion's, didn't pick a usable checkpoint.
+- **Reading:** eval-loss checkpoint selection works for ACT (a deterministic L1 regression loss) and fails for the
+  generative policies (diffusion's denoising loss, SmolVLA's flow-matching loss, both sampled at random noise levels).
+  The training script should default those to a fixed run and `last`, and keep `best`/early stop for ACT.
+- **Diffusion v2** (100k steps, `last`, no early stop; job `6b02646b770b27184e4017a9`) is training.
 - **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
   environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
   time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
