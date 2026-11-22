@@ -256,6 +256,7 @@ async def main_async(a):
         svc, gripper = MotionClient.from_robot(servo_r, a.service), Gripper.from_robot(servo_r, a.gripper)
         motion = MotionClient.from_robot(servo_r, "builtin")
         Executor.grip_early = a.grip_early
+        Executor.session_timeout_ms = a.session_timeout_ms
         makers = {"module": lambda: ModuleExec(svc, gripper, a.arm, a.lead_ms),
                   "client": lambda: ClientExec(svc, gripper, a.arm, a.lead_ms),
                   "move": lambda: MoveExec(motion, gripper, a.arm, svc)}
@@ -299,6 +300,7 @@ def parse_args(argv=None):
     ap.add_argument("--seeds", default="9100", help="N or LO-HI")
     ap.add_argument("--out", help="JSONL file, appended (required unless --once)")
     ap.add_argument("--timeout-s", type=float, default=30.0)
+    ap.add_argument("--session-timeout-ms", type=float, default=3000, help="servo dead-man; raise it for slow policies")
     ap.add_argument("--grip-early", action="store_true", help="fire the gripper lead early (old behaviour; diagnosis only)")
     ap.add_argument("--checkpoint-label", default="")
     ap.add_argument("--arm", default="arm")

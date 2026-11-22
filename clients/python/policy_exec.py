@@ -81,6 +81,9 @@ class Executor:
     # The lead already makes the arm reach row k at its time; firing the gripper lead early closes it a full lag
     # before the arm arrives (measured 13-24 mm short at grab). True keeps the old behaviour for comparison.
     grip_early = False
+    # The servo dead-man. Module mode sends nothing between the start pose and the first chunk, so it must outlast
+    # one observe + infer (diffusion infers in about 2.7 s on a laptop GPU).
+    session_timeout_ms = 3000
 
     def __init__(self, svc, gripper, arm_name):
         self.svc, self.gripper, self.arm_name = svc, gripper, arm_name
@@ -101,7 +104,7 @@ class Executor:
         """servo_start, min-jerk to the seed's start pose at 30 Hz, hold 0.5 s. time_scale < 1 shortens the
         motion and hold (test-only hook; leave at 1.0 for real runs)."""
         r = await self._cmd("servo_start", component_name=self.arm_name, frame="arm_origin", mode="pose", gain=8,
-                            timeout_ms=3000, limits=START_LIMITS)
+                            timeout_ms=self.session_timeout_ms, limits=START_LIMITS)
         self.sid, p0 = r["session_id"], r["pose"]
         goal = self.goal = bc_pick.start_pose(p0, seed)
         cur = (p0["x"], p0["y"], p0["z"], p0["theta"])
