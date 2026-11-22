@@ -565,9 +565,9 @@ assert takeover_tags("dagger1", "r1", 3005, "drop") == [
     "cmd:Pick up the red block and place it in the bin", "episode:dagger1-3005", "dagger:r1", "trigger:drop",
     "expert:v2-takeover"]
 
-row = {"seed": 3005, "outcome": "timeout", "trigger": "drop", "errors": [], "chunks": 4, "checkpoint": "v4",
+row = {"seed": 3005, "outcome": "trigger", "trigger": "drop", "errors": [], "chunks": 4, "checkpoint": "v4",
        "jerk_rms": 1.0}
-assert log_row(row) == {"seed": 3005, "outcome": "timeout", "trigger": "drop", "errors": [], "chunks": 4,
+assert log_row(row) == {"seed": 3005, "outcome": "trigger", "trigger": "drop", "errors": [], "chunks": 4,
                         "checkpoint": "v4"}
 
 a = parse_args(["--address", "x"])
@@ -703,7 +703,7 @@ async def main_async(a):
         for seed in policy_run.seed_range(a.seeds):
             row = await policy_run.run_episode(a, c, seed, stop=watch)
             rec = log_row(row)
-            if row["trigger"]:
+            if row["outcome"] == "trigger":  # a trigger with a failed close leaves the session live: no takeover
                 kinds[row["trigger"]] += 1
                 tags = takeover_tags(a.name, a.round, seed, row["trigger"])
                 info = await ep.takeover(seed, tags)
