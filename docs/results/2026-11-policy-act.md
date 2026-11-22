@@ -179,6 +179,12 @@ Paired per seed (Δ = first − second):
   Uniform sampling leaves the edges thin, so doubling the data uniformly added little where policies fail. Next levers:
   capture with the block area widened 20–30 mm past the eval area, or oversample edges and corners; check the scene
   camera's view of the far corner.
+- **Camera view at the episode start** (block set, arm at the seed's nudged start, 448 px frames): in seeds 9101 and
+  9110 the right finger of the open gripper covers most of the block in the wrist camera, while the scene camera sees it
+  clearly next to the bin. Those are the two far-x, low-y seeds where the most models fail. In 9111 the block sits on
+  the table's dark stained patch in both views (low contrast). 9115 and 9124 are plainly visible in both cameras, so
+  SmolVLA's misses there are coverage, not visibility. Fix candidates: move or widen the wrist camera so the fingers
+  don't cover the area under the tool, and use a table texture without dark patches; add edge-area demos regardless.
 - **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
   environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
   time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
