@@ -149,6 +149,11 @@ Paired per seed (Δ = first − second):
   not the policy: inference slowed from 2.6 s to 3–10 s (one infer timeout, two dead-man stops, then two `arm busy`
   starts), so 16 of 25 clean episodes (64%). The earlier "96 px can't localize the block" reading was wrong: that episode
   was distorted by the skipped chunks.
+- **SmolVLA v2** (fixed 20k steps, `last`, `n_action_steps` 20 of a 50-row chunk; script v4; job
+  `6b02f2ad614c32cdd7b604f1`, 1.75 h): eval loss rose from 0.252 (1k) to 0.878 (20k), the pattern where best-by-eval-loss
+  picked the 0/30 checkpoint in v1. **Gate (module, sync, 30 seeds, 30 s): 20/30 (67%)**, t_success 9.9 s, and the
+  smoothest seams of any policy: 6.5 / 11.7 mm (ACT 12.3 / 35.8). This is the case for `last` as the default for the
+  generative policies.
 - **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
   environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
   time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
