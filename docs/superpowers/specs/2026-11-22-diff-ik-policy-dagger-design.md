@@ -41,13 +41,13 @@ the policy started. `hist` holds recent states (enough for the stall window). Ki
 
 | kind | condition (defaults are CLI flags) |
 |---|---|
-| `drop` | holding in an earlier state, not holding now, and the block at rest (two consecutive 10 Hz samples, 0.1 s apart, under 1 mm apart) and not in the bin (`bc_pick.in_bin`). A block still falling after a release over the bin is not a drop. |
-| `empty_grasp` | gripper commanded closed for ≥ 1.0 s with no firm grasp at any point since it closed |
+| `drop` | holding in an earlier state, not holding now, and the block at rest (two consecutive 10 Hz samples, 0.1 s apart, under 1 mm apart) and not in the bin (`bc_pick.in_bin`). A block still falling after a release over the bin is not a drop. The TCP must also be more than 15 mm from the block's grasp point (the block has left the fingers). |
+| `empty_grasp` | gripper commanded closed for ≥ 2.5 s (the expert waits up to 2.6 s for a firm grasp) with no firm grasp at any point since it closed |
 | `approach_stall` | not holding; the block at rest and not in the bin; TCP more than 15 mm from the grasp point (block centre + `GRASP_ABOVE_CENTER`), and its distance to it shrank by less than 10 mm over the last 2.0 s |
 | `carry_stall` | holding; TCP more than 40 mm (xy) from the release point above the bin (a release anywhere inside that works; the bin's inner half-width is 70 mm), and its 3-D distance to the release point shrank by less than 10 mm over the last 2.0 s (3-D, so a vertical lift counts as progress) |
 | `timeout` | no success after 25 s |
 
-The stall checks need a full 2 s window before they can fire, so a policy's slow start is not a stall. Time and
+Each stall looks only at a window spent wholly in its phase (not holding for `approach_stall`, holding for `carry_stall`), so the grasp itself never reads as a stall. The stall checks need a full 2 s window before they can fire, so a policy's slow start is not a stall. Time and
 history start at the policy's `t0` (after the move to the start pose), not at the reset.
 
 ### 2. Expert from any state: `expert_pick.py` and `bc_pick.py`
