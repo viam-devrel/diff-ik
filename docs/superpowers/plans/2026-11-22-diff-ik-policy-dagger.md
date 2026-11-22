@@ -600,7 +600,7 @@ Expected: `ModuleNotFoundError: No module named 'dagger_run'`
 runs; on a trigger the scripted expert finishes from that state, and only the expert's segment is captured.
 
   uv run clients/python/dagger_run.py --address <addr> --seeds 3000-3299 --max-kept 80
-  uv run clients/python/expert_pick.py add --log .runs/policy-dagger/dagger1.jsonl --dataset diff-ik-pick-dagger-r1 \\
+  uv run clients/python/expert_pick.py add --log .runs/policy-dagger/dagger-r1.jsonl --dataset diff-ik-pick-dagger-r1 \\
       --part-id <part>
 """
 import asyncio
@@ -977,7 +977,7 @@ git commit -m "--pretrained viam:<org>/<model>@<version>: fine-tune from a regis
 
 ### Task 9 ★: Datasets
 
-- [ ] **Step 1:** `expert_pick.py add --log .runs/policy-dagger/dagger1.jsonl --dataset diff-ik-pick-dagger-r1 --part-id <part>`;
+- [ ] **Step 1:** `expert_pick.py add --log .runs/policy-dagger/dagger-r1.jsonl --dataset diff-ik-pick-dagger-r1 --part-id <part>`;
   `missing` must be empty.
 - [ ] **Step 2:** Create the sequence dataset `diff-ik-pick-v3-200-dagger1` and copy into it every sequence id of
   `6b0316ea770b27184e6eb985` and of `diff-ik-pick-dagger-r1` (`sequences_by_dataset_id` + `add_sequences_to_dataset`,

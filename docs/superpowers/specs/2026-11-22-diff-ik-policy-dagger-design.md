@@ -83,13 +83,13 @@ expert's own values.
 - `run_episode`'s `finally` already closes the policy executor (`servo_stop`), so `dagger_run` does not close it again.
   On a trigger, `dagger_run` then opens an expert `servo_start` session in pose
   mode from the current pose, starts capture on the `demo-capture` sensor with tags
-  `cmd:<instruction>`, `episode:dagger1-<seed>`, `dagger:r1`, `trigger:<kind>`, `expert:v2-takeover`, and runs
+  `cmd:<instruction>`, `episode:dagger-r1-<seed>`, `dagger:r1`, `trigger:<kind>`, `expert:v2-takeover`, and runs
   `finish_from`. Capture stops when the expert finishes or fails. Only the expert segment is captured.
 - A rollout the policy finishes on its own is logged with no capture. A rollout that ends on an observe, infer or
   session error without a trigger is logged with its errors, with no takeover.
 - Every rollout is a JSONL row (seed, outcome, trigger, `kept`, `t_start`, tags) in
-  `.runs/policy-dagger/dagger1.jsonl`, in the format `expert_pick add` reads (captured rows carry `tags`, `kept` and `t_start`), so
-  `expert_pick.py add --log .runs/policy-dagger/dagger1.jsonl` builds the dataset unchanged. A correction is `kept` only when the expert's in-bin check passes.
+  `.runs/policy-dagger/dagger-r1.jsonl`, in the format `expert_pick add` reads (captured rows carry `tags`, `kept` and `t_start`), so
+  `expert_pick.py add --log .runs/policy-dagger/dagger-r1.jsonl` builds the dataset unchanged. A correction is `kept` only when the expert's in-bin check passes.
 - Same flags as `policy_run` (module mode, sync cadence by default), plus the trigger thresholds, `--max-kept`
   (default 80) and `--seeds` (default 3000-3299).
 

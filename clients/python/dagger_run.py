@@ -6,7 +6,7 @@
 runs; on a trigger the scripted expert finishes from that state, and only the expert's segment is captured.
 
   uv run clients/python/dagger_run.py --address <addr> --seeds 3000-3299 --max-kept 80
-  uv run clients/python/expert_pick.py add --log .runs/policy-dagger/dagger1.jsonl --dataset diff-ik-pick-dagger-r1 \\
+  uv run clients/python/expert_pick.py add --log .runs/policy-dagger/dagger-r1.jsonl --dataset diff-ik-pick-dagger-r1 \\
       --part-id <part>
 """
 import asyncio

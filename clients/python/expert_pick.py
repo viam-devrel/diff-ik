@@ -180,6 +180,18 @@ class Episode:
             await self._close(info, capturing)
         return info
 
+    async def _rested_block(self, cur) -> tuple:
+        """The block's world position once two reads 0.3 s apart agree within 1 mm (holding cur); Discard after 2 s."""
+        deadline = time.monotonic() + 2.0
+        while True:
+            b1, _ = await self.block_world_mm()
+            await self.hold(cur, 0.3)
+            b2, _ = await self.block_world_mm()
+            if math.dist(b1, b2) < 1.0:
+                return b2
+            if time.monotonic() > deadline:
+                raise Discard("block not at rest")
+
     async def takeover(self, seed, tags=None) -> dict:
         """Finish the pick from wherever the policy left the arm (DAgger spec §2-3). Capture (when tags are given)
         starts before the first expert move, so the episode's first frame is the takeover state."""
@@ -190,13 +202,17 @@ class Episode:
         try:
             cur = C.six_tuple_from_pose(await self._start_session())
             holding = bool((await self.gripper.is_holding_something()).meta.get("firm_grasp"))
-            info["holding"] = holding
+            closed = (await self.gripper.do_command({"command": "position"}))["input"] > 0.5
+            info["holding"], info["closed"] = holding, closed
+            if not holding and not closed:
+                # nothing to release: check the block before capture, so the episode doesn't open on still frames
+                (wx, wy, wz) = await self._rested_block(cur)
             if tags is not None:
                 await self.capture.do_command({"start_capture": True, "frequency_hz": self.a.rate_hz, "tags": tags})
                 capturing, info["t_start"] = True, datetime.now(timezone.utc).isoformat()
-                # capture's first frame lags start_capture: hold so the episode opens on the takeover state (e.g. the
-                # gripper still closed on nothing) and records the expert's first action as a change from it
-                await self.hold(cur, 0.5)
+                # capture's first frame lags start_capture (~0.1 s): hold so the episode opens on the takeover state.
+                # Longer when the gripper is closed on nothing, so the closed state and the open both get frames.
+                await self.hold(cur, 0.5 if closed and not holding else 0.15)
             if holding:
                 info["block_at_takeover"] = [round(v, 1) for v in (await self.block_world_mm())[0]]
                 over_z = C.flange_from_tcp(C.world_to_arm(C.RELEASE_TCP))[2]
@@ -204,16 +220,9 @@ class Episode:
                     cur = await self.move(cur, (cur[0], cur[1], over_z, cur[3], 0.0, 0.0), sc["speed"] * 0.8,
                                           check_grasp=True)
             else:
-                await self.hold_during(cur, 0.6, self.gripper.open())
-                deadline = time.monotonic() + 2.0
-                while True:  # wait for the released block to rest
-                    b1, _ = await self.block_world_mm()
-                    await self.hold(cur, 0.3)
-                    (wx, wy, wz), _ = await self.block_world_mm()
-                    if math.dist(b1, (wx, wy, wz)) < 1.0:
-                        break
-                    if time.monotonic() > deadline:
-                        raise Discard("block not at rest")
+                if closed:
+                    await self.hold_during(cur, 0.6, self.gripper.open())
+                    (wx, wy, wz) = await self._rested_block(cur)
                 info["block_at_takeover"] = [round(v, 1) for v in (wx, wy, wz)]
                 if C.in_bin((wx, wy, wz)):
                     raise Discard("block already in bin")
