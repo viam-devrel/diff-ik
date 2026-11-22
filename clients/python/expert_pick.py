@@ -53,7 +53,7 @@ class Episode:
     async def move(self, cur, goal, speed, check_grasp=False):
         """Stream a min-jerk segment from cur to goal (flange, arm frame, (x, y, z, theta, tx, ty)); returns goal."""
         dist = math.dist(cur[:3], goal[:3])
-        # tilt term: run's tilts are <= 4 deg (<= 0.07 s), under the 0.6 s minimum, so run's timing is unchanged
+        # tilt term: run's tilts are <= 4 deg (<= 0.14 s (8° between two 4° tilts)), under the 0.6 s minimum, so run's timing is unchanged
         tilt = math.hypot(goal[4] - cur[4], goal[5] - cur[5]) / 60.0 if len(goal) == 6 and len(cur) == 6 else 0.0
         dur = max(0.6, dist / (BASE_MM_S * speed), abs(C.angle_diff(goal[3], cur[3])) / 60.0, tilt)
         for i, p in enumerate(C.minjerk_segment(cur, goal, dur, TICK_HZ)):
