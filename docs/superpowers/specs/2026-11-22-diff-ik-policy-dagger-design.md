@@ -34,21 +34,34 @@ more than the same amount of extra training on the existing data?
 
 ### 1. Takeover trigger: `clients/python/dagger_trigger.py` (new, pure)
 
-`check(state, hist, cfg) -> str | None` returns the trigger kind or `None`. `state` holds the TCP position (world mm),
+`check(state, hist, cfg) -> str | None` returns the trigger kind or `None`. `state` holds the TCP position (world mm,
+from `bc_pick.tcp_world(pose)`, see §2),
 the block pose (world mm, from the sim), the gripper's commanded `input` (0/1), `holding` (firm grasp), and time since
 the policy started. `hist` holds recent states (enough for the stall window). Kinds, checked in this order:
 
 | kind | condition (defaults are CLI flags) |
 |---|---|
-| `drop` | holding in an earlier state, not holding now, block not in the bin (`bc_pick.in_bin`) |
+| `drop` | holding in an earlier state, not holding now, and the block at rest (two consecutive block reads under 1 mm apart, as in `policy_exec.succeeded`) and not in the bin (`bc_pick.in_bin`). A block still falling after a release over the bin is not a drop. |
 | `empty_grasp` | gripper commanded closed for ≥ 1.0 s without a firm grasp |
 | `approach_stall` | not holding; TCP more than 15 mm from the grasp point (block centre + `GRASP_ABOVE_CENTER`), and its distance to it shrank by less than 10 mm over the last 2.0 s |
 | `carry_stall` | holding; TCP more than 15 mm (xy) from the release point above the bin, and its distance to it shrank by less than 10 mm over the last 2.0 s |
 | `timeout` | no success after 25 s |
 
-The stall checks need a full 2 s window before they can fire, so a policy's slow start is not a stall.
+The stall checks need a full 2 s window before they can fire, so a policy's slow start is not a stall. Time and
+history start at the policy's `t0` (after the move to the start pose), not at the reset.
 
-### 2. Expert from any state: `expert_pick.py`
+### 2. Expert from any state: `expert_pick.py` and `bc_pick.py`
+
+Two new `bc_pick` helpers, so the expert and the trigger can read any pose the policy leaves, tilted or not:
+
+- `six_tuple_from_pose(pose)`: the inverse of `pose_map`. It turns a Viam flange pose (arm frame, orientation vector)
+  into the expert's `(x, y, z, theta, tx, ty)`: orientation = tool-down · rotvec(tx, ty, 0) applied as `pose_map`
+  does, solved for theta and (tx, ty). Tested by round-tripping random tuples (tilts up to 10°) through `pose_map`.
+- `tcp_world(pose)`: the TCP in world mm for any flange orientation (flange + R · (0, 0, `TCP_MM`) + `ARM_BASE`).
+  Equals `flange_from_tcp`'s inverse for a tool-down pose (tested).
+
+`finish_from` starts from `six_tuple_from_pose(servo_start's pose)`; its first segments return the tilt to the
+expert's own values.
 
 `Episode.run` is split so the scripted run from the start pose and the takeover share one tail:
 
@@ -59,19 +72,23 @@ The stall checks need a full 2 s window before they can fire, so a policy's slow
 
 ### 3. Rollouts with takeover: `clients/python/dagger_run.py` (new)
 
-- `policy_run.run_episode` gains an optional `stop` callback, checked once per chunk (after `play` returns or the
-  async replan wait ends). It returns the trigger kind, which ends the loop like a timeout and is recorded in the row
-  as `trigger`. Without the callback, behaviour is unchanged.
-- A background task samples the state for the trigger at 10 Hz (TCP, block pose, gripper input, holding), on the
-  side connection that `success_task` already uses.
-- On a trigger, `dagger_run` closes the policy executor (`servo_stop`), opens an expert `servo_start` session in pose
+- `policy_run.run_episode` gains an optional `stop` callback object. `run_episode` calls `stop.begin(t0)` when the
+  policy starts (after `ex.start`), and `stop.check()` once per chunk (after `play` returns or the async replan wait
+  ends). A non-`None` result is the trigger kind: it ends the loop like a timeout, and the row records it as
+  `trigger`. Without the callback, behaviour is unchanged.
+- `begin(t0)` starts a background task that samples the state for the trigger at 10 Hz (flange pose → `tcp_world`,
+  block pose, gripper input, holding) on the side connection `success_task` already uses; `check()` evaluates
+  `dagger_trigger.check` on the latest samples. The task is cancelled when the episode ends.
+- `run_episode`'s `finally` already closes the policy executor (`servo_stop`), so `dagger_run` does not close it again.
+  On a trigger, `dagger_run` then opens an expert `servo_start` session in pose
   mode from the current pose, starts capture on the `demo-capture` sensor with tags
   `cmd:<instruction>`, `episode:dagger1-<seed>`, `dagger:r1`, `trigger:<kind>`, `expert:v2-takeover`, and runs
   `finish_from`. Capture stops when the expert finishes or fails. Only the expert segment is captured.
-- A rollout the policy finishes on its own is logged with no capture.
+- A rollout the policy finishes on its own is logged with no capture. A rollout that ends on an observe, infer or
+  session error without a trigger is logged with its errors, with no takeover.
 - Every rollout is a JSONL row (seed, outcome, trigger, `kept`, `t_start`, tags) in
-  `.runs/policy-dagger/dagger1.jsonl`, in the format `expert_pick add` reads, so the existing `add` command (moved to a
-  shared helper if needed) builds the dataset. A correction is `kept` only when the expert's in-bin check passes.
+  `.runs/policy-dagger/dagger1.jsonl`, in the format `expert_pick add` reads (captured rows carry `tags`, `kept` and `t_start`), so
+  `expert_pick.py add --log .runs/policy-dagger/dagger1.jsonl` builds the dataset unchanged. A correction is `kept` only when the expert's in-bin check passes.
 - Same flags as `policy_run` (module mode, sync cadence by default), plus the trigger thresholds, `--max-kept`
   (default 80) and `--seeds` (default 3000-3299).
 
@@ -83,14 +100,16 @@ The stall checks need a full 2 s window before they can fire, so a policy's slow
 - Dry run first: 5 rollouts with capture, then convert the sequences with the same converter settings as v3
   (`--action-space ee --gripper-key input`), and check the episode count, lengths, task text and that the first frame
   is the takeover state.
-- Datasets: `diff-ik-pick-dagger-r1` (corrections only) and `diff-ik-pick-v3-200-dagger1` (the 198 v3-200 sequences
-  plus the corrections).
+- Datasets: `diff-ik-pick-dagger-r1` (corrections only, via `expert_pick add`) and `diff-ik-pick-v3-200-dagger1`:
+  a new sequence dataset filled by copying the 198 sequence ids of `diff-ik-pick-v3-200` (`6b0316ea770b27184e6eb985`)
+  and of `diff-ik-pick-dagger-r1` with `add_sequences_to_dataset` (a small script in the scratchpad, or the MCP tool).
 
 ### 5. Fine-tuning from the registry checkpoint: viam-lerobot-training
 
-- `--pretrained viam:<org_id>/<model_name>@<version>` downloads the registry ML model package with the job's
+- `--pretrained viam:<org_id>/<model_name>@<version>` is resolved right after argument parsing (before
+  `train_flags` and `check_checkpoint`, which then see an ordinary local path): it downloads the registry ML model package with the job's
   `API_KEY` / `API_KEY_ID` environment variables (set by Viam training jobs: an org-scoped key with the submitter's
-  permissions), unpacks it, finds the folder holding `config.json`, and uses that path as the base checkpoint
+  permissions), unpacks it, finds the shallowest folder holding `config.json` (a `tokenizer/` folder can hold its own), and uses that path as the base checkpoint
   (`--policy.pretrained_path` for SmolVLA). Any other `--pretrained` value behaves as today.
 - Missing credentials, an unknown package, or a package without `config.json` fail before the dataset conversion with
   a clear error.
@@ -102,7 +121,9 @@ The stall checks need a full 2 s window before they can fire, so a policy's slow
 ### 6. Training: two cloud jobs
 
 Both from `viam:16518049-9dd3-479f-9644-c5d112aa42d8/diff-ik-pick-smolvla@4`, identical flags apart from the dataset:
-448 px, 10k steps, `last` checkpoint, the v4 batch size and schedule.
+448 px, 10k steps, `last` checkpoint, v4's batch size and peak learning rate. The script already scales the schedule to
+the run: the LR decays to zero at `--steps` after a `min(500, steps/10)`-step warmup (policies.py), so both jobs get a
+500-step warmup and decay to 10k.
 
 - **A (DAgger):** `diff-ik-pick-v3-200-dagger1`.
 - **B (control):** `diff-ik-pick-v3-200`.
@@ -123,6 +144,9 @@ Viam status bug can mark a running job FAILED).
 
 - `dagger_trigger`: table tests for every kind, the order of precedence, and the 2 s warm-up (no stall fires before
   the window fills).
+- `six_tuple_from_pose` and `tcp_world`: round-trip tests through `pose_map` and against `flange_from_tcp`.
+- `drop`: a table case "released over the bin, block still falling" that must not fire.
+- `--pretrained viam:`: unit test with a mocked package lookup and download, including the shallowest `config.json`.
 - `finish_from`: a sim smoke run from forced mid-task states, one not holding (arm displaced from the block) and one
   holding (after a scripted grasp), both ending with the block in the bin; and a check that `run` still produces the
   v2 scene for a fixed seed.
