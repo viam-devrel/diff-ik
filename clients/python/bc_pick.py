@@ -66,6 +66,14 @@ def yaw_from_wxyz(q) -> float:
     return angle_diff(math.degrees(2 * math.atan2(q[3], q[0])), 0)
 
 
+def block_yaw_deg(q) -> float:
+    """Yaw (degrees, wrapped) of a block quaternion [w, x, y, z] in any orientation: the world-xy heading of the
+    block axis that lies most nearly horizontal. A cube repeats every 90 degrees, which grasp_theta already handles."""
+    m = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    col = m[:, int(np.argmin(np.abs(m[2])))]
+    return angle_diff(math.degrees(math.atan2(col[1], col[0])), 0)
+
+
 def grasp_theta(block_yaw_deg: float, current_theta_deg: float) -> float:
     """The tool's orientation-vector theta (tool pointing down) that lines the jaws up with a block face, choosing
     the face nearest the current theta. For o = (0, 0, −1), the tool's x axis points at 180° − theta in the world,

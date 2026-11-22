@@ -53,7 +53,9 @@ class Episode:
     async def move(self, cur, goal, speed, check_grasp=False):
         """Stream a min-jerk segment from cur to goal (flange, arm frame, (x, y, z, theta, tx, ty)); returns goal."""
         dist = math.dist(cur[:3], goal[:3])
-        dur = max(0.6, dist / (BASE_MM_S * speed), abs(C.angle_diff(goal[3], cur[3])) / 60.0)
+        # tilt term: run's tilts are <= 4 deg (<= 0.07 s), under the 0.6 s minimum, so run's timing is unchanged
+        tilt = math.hypot(goal[4] - cur[4], goal[5] - cur[5]) / 60.0 if len(goal) == 6 and len(cur) == 6 else 0.0
+        dur = max(0.6, dist / (BASE_MM_S * speed), abs(C.angle_diff(goal[3], cur[3])) / 60.0, tilt)
         for i, p in enumerate(C.minjerk_segment(cur, goal, dur, TICK_HZ)):
             t = time.monotonic()
             await self.target(p)
@@ -100,7 +102,7 @@ class Episode:
 
     async def _pick(self, cur, sc):
         (wx, wy, wz), q = await self.block_world_mm()
-        theta = C.grasp_theta(C.yaw_from_wxyz(q), cur[3])
+        theta = C.grasp_theta(C.block_yaw_deg(q), cur[3])
         grasp_tcp = C.world_to_arm((wx, wy, wz + C.GRASP_ABOVE_CENTER))
         pre = C.flange_from_tcp((grasp_tcp[0], grasp_tcp[1], grasp_tcp[2] + C.PREGRASP_ABOVE)) + (theta, *sc["tilts"]["pregrasp"])
         grasp = C.flange_from_tcp(grasp_tcp) + (theta, 0.0, 0.0)
@@ -193,13 +195,25 @@ class Episode:
                 await self.capture.do_command({"start_capture": True, "frequency_hz": self.a.rate_hz, "tags": tags})
                 capturing, info["t_start"] = True, datetime.now(timezone.utc).isoformat()
             if holding:
+                info["block_at_takeover"] = [round(v, 1) for v in (await self.block_world_mm())[0]]
                 over_z = C.flange_from_tcp(C.world_to_arm(C.RELEASE_TCP))[2]
                 if cur[2] < over_z:  # rise straight up first, clear of the bin walls
                     cur = await self.move(cur, (cur[0], cur[1], over_z, cur[3], 0.0, 0.0), sc["speed"] * 0.8,
                                           check_grasp=True)
             else:
                 await self.hold_during(cur, 0.6, self.gripper.open())
-                (wx, wy, wz), _ = await self.block_world_mm()
+                deadline = time.monotonic() + 2.0
+                while True:  # wait for the released block to rest
+                    b1, _ = await self.block_world_mm()
+                    await self.hold(cur, 0.3)
+                    (wx, wy, wz), _ = await self.block_world_mm()
+                    if math.dist(b1, (wx, wy, wz)) < 1.0:
+                        break
+                    if time.monotonic() > deadline:
+                        raise Discard("block not at rest")
+                info["block_at_takeover"] = [round(v, 1) for v in (wx, wy, wz)]
+                if C.in_bin((wx, wy, wz)):
+                    raise Discard("block already in bin")
                 pre_tcp = (wx, wy, wz + C.GRASP_ABOVE_CENTER + C.PREGRASP_ABOVE)
                 pre_z = C.flange_from_tcp(C.world_to_arm(pre_tcp))[2]
                 if cur[2] < pre_z:  # rise straight up to pregrasp height, clear of the block

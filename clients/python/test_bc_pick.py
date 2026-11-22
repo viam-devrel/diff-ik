@@ -4,6 +4,8 @@
 # ///
 """Pure-path checks for bc_pick.py. Run: uv run clients/python/test_bc_pick.py"""
 import math
+
+from scipy.spatial.transform import Rotation
 import os
 import random
 import sys
@@ -13,7 +15,7 @@ from bc_pick import (  # noqa: E402
     block_pose, start_pose,
     ARM_BASE, BIN_RIM_Z, PLACE_ABOVE_RIM, RELEASE_TCP, six_tuple_from_pose, tcp_world,
     BIN_XY, BLOCK_AREA, TCP_MM, TILT_MAX_DEG, TILT_MIN_DEG, angle_diff, flange_from_tcp, grasp_theta, in_bin, minjerk_segment, pose_map,
-    sample_scene, tilt_vector, world_to_arm, yaw_from_wxyz,
+    sample_scene, tilt_vector, world_to_arm, yaw_from_wxyz, block_yaw_deg,
 )
 
 # scenes: deterministic, in range
@@ -123,5 +125,13 @@ pt = pose_map((100.0, 50.0, 300.0, 15.0, *tilt_vector(10.0, 45.0)))
 d = [a - b - c for a, b, c in zip(tcp_world(pt), (100.0, 50.0, 300.0), ARM_BASE)]
 assert abs(math.hypot(*d) - TCP_MM) < 1e-6 and d[2] < -0.98 * TCP_MM
 assert RELEASE_TCP == (BIN_XY[0], BIN_XY[1], BIN_RIM_Z + PLACE_ABOVE_RIM)
+
+# block_yaw_deg: matches yaw_from_wxyz for z-only rotations, and finds the yaw of a cube lying on a side face
+for y in (-170, -90, -33, 0, 15, 60, 120):
+    qz = Rotation.from_euler("z", y, degrees=True).as_quat()
+    assert abs(angle_diff(block_yaw_deg([qz[3], *qz[:3]]), y)) < 1e-6, y
+qs = (Rotation.from_euler("z", 30, degrees=True) * Rotation.from_euler("x", 90, degrees=True)).as_quat()
+r = angle_diff(block_yaw_deg([qs[3], *qs[:3]]), 30) % 90
+assert min(r, 90 - r) < 1e-6, r
 
 print("ok")
