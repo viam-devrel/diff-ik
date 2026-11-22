@@ -166,6 +166,10 @@ Paired per seed (Δ = first − second):
   0.152 against v2's 0.204). **Gate (fixed runner, 45 s, 8 s dead-man, 15 s infer timeout): 25/30 (83%)**, the best of any
   policy; every miss a plain timeout, inference 2.5 s median; seam 5.9 / 46.2 mm, t_success 17.5 s. Resolution plus
   augmentation took diffusion from 16/30 (96 px) to 25/30.
+- **SmolVLA v3** (448 px, same 100 episodes, 20k, `last`; job `6b031281b11eaafd4d603ea0`, 1.8 h): **22/30 (73%)** against
+  v2's 20/30 at 224 px, within noise. Paired: row0 lower on 21/30 seeds (11.4 mm against 14.8, better localization),
+  jerk higher on 23/30, seams equal (5.6 mm), inference unchanged at 0.41 s (the vision encoder runs at 512 either way).
+  Resolution alone is a small lever for SmolVLA here.
 - **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
   environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
   time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
