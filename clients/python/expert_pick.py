@@ -91,15 +91,67 @@ class Episode:
         await self.world.do_command({"command": "set_prop_pose", "prop": "block", "position": pos,
                                      "orientation_wxyz": q})
 
-    async def run(self, seed, tags=None) -> dict:
-        sc = C.sample_scene(seed)
-        await self.place(seed)
-        await self.gripper.open()
+    async def _start_session(self) -> dict:
         r = await self.svc.do_command({"command": "servo_start", "component_name": self.a.arm, "frame": "arm_origin",
                                        "mode": "pose", "gain": 8, "timeout_ms": 3000,
                                        "limits": {"linear_mm_s": 300, "angular_deg_s": 90}})
         self.sid = r["session_id"]
-        p0 = r["pose"]
+        return r["pose"]
+
+    async def _pick(self, cur, sc):
+        (wx, wy, wz), q = await self.block_world_mm()
+        theta = C.grasp_theta(C.yaw_from_wxyz(q), cur[3])
+        grasp_tcp = C.world_to_arm((wx, wy, wz + C.GRASP_ABOVE_CENTER))
+        pre = C.flange_from_tcp((grasp_tcp[0], grasp_tcp[1], grasp_tcp[2] + C.PREGRASP_ABOVE)) + (theta, *sc["tilts"]["pregrasp"])
+        grasp = C.flange_from_tcp(grasp_tcp) + (theta, 0.0, 0.0)
+        cur = await self.move(cur, pre, sc["speed"])
+        cur = await self.move(cur, grasp, sc["speed"] * 0.6)
+        await self.hold(cur, 0.2)
+        await self.hold_during(cur, 0.6, self.gripper.grab())
+        deadline = time.monotonic() + 2.0
+        while not (await self.gripper.is_holding_something()).meta.get("firm_grasp"):
+            if time.monotonic() > deadline:
+                raise Discard("grasp timeout")
+            await self.hold(cur, 0.1)
+        lift = (cur[0], cur[1], cur[2] + C.LIFT, cur[3], *sc["tilts"]["lift"])
+        cur = await self.move(cur, lift, sc["speed"] * 0.8, check_grasp=True)
+        return cur
+
+    async def _place(self, cur, sc):
+        bin_tcp = C.world_to_arm((C.BIN_XY[0], C.BIN_XY[1], C.BIN_RIM_Z + C.PLACE_ABOVE_RIM))
+        over_bin = C.flange_from_tcp(bin_tcp) + (cur[3], 0.0, 0.0)
+        cur = await self.move(cur, over_bin, sc["speed"], check_grasp=True)
+        await self.hold_during(cur, 0.6, self.gripper.open())
+        cur = await self.move(cur, (cur[0], cur[1], cur[2] + C.RETREAT, cur[3], 0.0, 0.0), sc["speed"])
+        await self.hold(cur, 0.4)
+        b1, _ = await self.block_world_mm()
+        await self.hold(cur, 0.3)
+        b2, _ = await self.block_world_mm()
+        if not (C.in_bin(b2) and math.dist(b1, b2) < 1.0):
+            raise Discard(f"block not in bin at rest: {tuple(round(v) for v in b2)}")
+
+    async def _close(self, info, capturing):
+        if self.sid is not None:
+            try:
+                await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})
+            except Exception as e:
+                print(f"warning: servo_stop failed: {e!r}", file=sys.stderr)
+        if capturing:
+            try:
+                await self.capture.do_command({"stop_capture": True})
+                info["t_stop"] = datetime.now(timezone.utc).isoformat()
+            except Exception as e:
+                # capture may still run under this episode's tag: don't trust this episode or the next
+                print(f"warning: stop_capture failed: {e!r}", file=sys.stderr)
+                info["kept"] = False
+                info["reason"] = (info["reason"] + "; " if info["reason"] else "") + f"stop_capture failed: {e!r}"
+                info["abort"] = True
+
+    async def run(self, seed, tags=None) -> dict:
+        sc = C.sample_scene(seed)
+        await self.place(seed)
+        await self.gripper.open()
+        p0 = await self._start_session()
         cur = (p0["x"], p0["y"], p0["z"], p0["theta"], 0.0, 0.0)
         info = {"seed": seed, "scene": sc, "kept": False, "reason": ""}
         capturing = False
@@ -113,33 +165,8 @@ class Episode:
             if tags is not None:
                 await self.capture.do_command({"start_capture": True, "frequency_hz": self.a.rate_hz, "tags": tags})
                 capturing, info["t_start"] = True, datetime.now(timezone.utc).isoformat()
-            (wx, wy, wz), q = await self.block_world_mm()
-            theta = C.grasp_theta(C.yaw_from_wxyz(q), cur[3])
-            grasp_tcp = C.world_to_arm((wx, wy, wz + C.GRASP_ABOVE_CENTER))
-            pre = C.flange_from_tcp((grasp_tcp[0], grasp_tcp[1], grasp_tcp[2] + C.PREGRASP_ABOVE)) + (theta, *sc["tilts"]["pregrasp"])
-            grasp = C.flange_from_tcp(grasp_tcp) + (theta, 0.0, 0.0)
-            cur = await self.move(cur, pre, sc["speed"])
-            cur = await self.move(cur, grasp, sc["speed"] * 0.6)
-            await self.hold(cur, 0.2)
-            await self.hold_during(cur, 0.6, self.gripper.grab())
-            deadline = time.monotonic() + 2.0
-            while not (await self.gripper.is_holding_something()).meta.get("firm_grasp"):
-                if time.monotonic() > deadline:
-                    raise Discard("grasp timeout")
-                await self.hold(cur, 0.1)
-            lift = (cur[0], cur[1], cur[2] + C.LIFT, cur[3], *sc["tilts"]["lift"])
-            cur = await self.move(cur, lift, sc["speed"] * 0.8, check_grasp=True)
-            bin_tcp = C.world_to_arm((C.BIN_XY[0], C.BIN_XY[1], C.BIN_RIM_Z + C.PLACE_ABOVE_RIM))
-            over_bin = C.flange_from_tcp(bin_tcp) + (cur[3], 0.0, 0.0)
-            cur = await self.move(cur, over_bin, sc["speed"], check_grasp=True)
-            await self.hold_during(cur, 0.6, self.gripper.open())
-            cur = await self.move(cur, (cur[0], cur[1], cur[2] + C.RETREAT, cur[3], 0.0, 0.0), sc["speed"])
-            await self.hold(cur, 0.4)
-            b1, _ = await self.block_world_mm()
-            await self.hold(cur, 0.3)
-            b2, _ = await self.block_world_mm()
-            if not (C.in_bin(b2) and math.dist(b1, b2) < 1.0):
-                raise Discard(f"block not in bin at rest: {tuple(round(v) for v in b2)}")
+            cur = await self._pick(cur, sc)
+            await self._place(cur, sc)
             info["kept"] = True
         except Discard as e:
             info["reason"] = str(e)
@@ -148,20 +175,44 @@ class Episode:
         except Exception as e:
             info["reason"] = f"error: {e!r}"
         finally:
-            try:
-                await self.svc.do_command({"command": "servo_stop", "session_id": self.sid})
-            except Exception as e:
-                print(f"warning: servo_stop failed: {e!r}", file=sys.stderr)
-            if capturing:
-                try:
-                    await self.capture.do_command({"stop_capture": True})
-                    info["t_stop"] = datetime.now(timezone.utc).isoformat()
-                except Exception as e:
-                    # capture may still run under this episode's tag: don't trust this episode or the next
-                    print(f"warning: stop_capture failed: {e!r}", file=sys.stderr)
-                    info["kept"] = False
-                    info["reason"] = (info["reason"] + "; " if info["reason"] else "") + f"stop_capture failed: {e!r}"
-                    info["abort"] = True
+            await self._close(info, capturing)
+        return info
+
+    async def takeover(self, seed, tags=None) -> dict:
+        """Finish the pick from wherever the policy left the arm (DAgger spec §2-3). Capture (when tags are given)
+        starts before the first expert move, so the episode's first frame is the takeover state."""
+        sc = C.sample_scene(seed)
+        info = {"seed": seed, "scene": sc, "kept": False, "reason": ""}
+        capturing = False
+        self.sid = None
+        try:
+            cur = C.six_tuple_from_pose(await self._start_session())
+            holding = bool((await self.gripper.is_holding_something()).meta.get("firm_grasp"))
+            info["holding"] = holding
+            if tags is not None:
+                await self.capture.do_command({"start_capture": True, "frequency_hz": self.a.rate_hz, "tags": tags})
+                capturing, info["t_start"] = True, datetime.now(timezone.utc).isoformat()
+            if holding:
+                over_z = C.flange_from_tcp(C.world_to_arm(C.RELEASE_TCP))[2]
+                if cur[2] < over_z:  # rise straight up first, clear of the bin walls
+                    cur = await self.move(cur, (cur[0], cur[1], over_z, cur[3], 0.0, 0.0), sc["speed"] * 0.8,
+                                          check_grasp=True)
+            else:
+                await self.hold_during(cur, 0.6, self.gripper.open())
+                (wx, wy, wz), _ = await self.block_world_mm()
+                pre_tcp = (wx, wy, wz + C.GRASP_ABOVE_CENTER + C.PREGRASP_ABOVE)
+                pre_z = C.flange_from_tcp(C.world_to_arm(pre_tcp))[2]
+                if cur[2] < pre_z:  # rise straight up to pregrasp height, clear of the block
+                    cur = await self.move(cur, (cur[0], cur[1], pre_z, *cur[3:]), sc["speed"])
+                cur = await self._pick(cur, sc)
+            await self._place(cur, sc)
+            info["kept"] = True
+        except Discard as e:
+            info["reason"] = str(e)
+        except Exception as e:
+            info["reason"] = f"error: {e!r}"
+        finally:
+            await self._close(info, capturing)
         return info
 
 
