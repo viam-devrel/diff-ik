@@ -194,6 +194,9 @@ class Episode:
             if tags is not None:
                 await self.capture.do_command({"start_capture": True, "frequency_hz": self.a.rate_hz, "tags": tags})
                 capturing, info["t_start"] = True, datetime.now(timezone.utc).isoformat()
+                # capture's first frame lags start_capture: hold so the episode opens on the takeover state (e.g. the
+                # gripper still closed on nothing) and records the expert's first action as a change from it
+                await self.hold(cur, 0.5)
             if holding:
                 info["block_at_takeover"] = [round(v, 1) for v in (await self.block_world_mm())[0]]
                 over_z = C.flange_from_tcp(C.world_to_arm(C.RELEASE_TCP))[2]
