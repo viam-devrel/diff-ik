@@ -126,7 +126,7 @@ Paired per seed (Δ = first − second):
 - **ACT v2** (augmentation on the GPU, best checkpoint, 20k steps; job `6b02504c770b27184e3ad9e5`, 33 min): packaged
   step 18k, eval loss 0.147. **Gate (module, sync, 30 seeds): 24/30 (80%)**, above the 70% bar; row0 11.3 mm (v1 14.7),
   seam 12.3 / 35.8 mm, jerk 10043.
-- **Diffusion v1** (`n_obs_steps` 1, horizon 32, `n_action_steps` 20, 96 px; slim-2 container): early stopping packaged
+- **Diffusion v1** (gated before the sync-cadence runner fix below; `n_obs_steps` 1, horizon 32, `n_action_steps` 20, 96 px; slim-2 container): early stopping packaged
   step 2k (eval loss 0.029) and stopped at 12k. **Gate (45 s timeout, inference 2.6 s per chunk on MPS): 0/30**, seams
   168 mm median: consecutive chunks disagree, i.e. undertrained. Diffusion's eval loss is the denoising error on random
   noise draws, noisy and weakly tied to rollouts, so early stopping on it picks far too early; train diffusion for a
@@ -139,6 +139,16 @@ Paired per seed (Δ = first − second):
   generative policies (diffusion's denoising loss, SmolVLA's flow-matching loss, both sampled at random noise levels).
   The training script should default those to a fixed run and `last`, and keep `best`/early stop for ACT.
 - **Diffusion v2** (100k steps, `last`, no early stop; job `6b02646b770b27184e4017a9`) is training.
+- **Runner bug, sync cadence, found by the pi05/Cosmos3 readiness audit:** each chunk was stamped with its full age since
+  the observation, although the arm holds still during inference in sync. When inference outlasts the chunk (diffusion:
+  2.6 s against a 2.0 s chunk), `servo_trajectory` treats the chunk as played out and holds its last pose, so the planned
+  path is skipped. Fixed: sync chunks start when inference returns (`policy_run.py`); async keeps the real age. ACT and
+  SmolVLA (inference under 0.5 s) were unaffected; diffusion's earlier gates were.
+- **Diffusion v2 re-gated on the fixed runner** (100k, 96 px; 45 s timeout, 6 s dead-man, 10 s infer timeout):
+  **16/30 (53%)**, seam 9.3 / 60.2 mm (was 92.5 / 245.8), t_success median 20 s. Five late episodes failed on the laptop,
+  not the policy: inference slowed from 2.6 s to 3–10 s (one infer timeout, two dead-man stops, then two `arm busy`
+  starts), so 16 of 25 clean episodes (64%). The earlier "96 px can't localize the block" reading was wrong: that episode
+  was distorted by the skipped chunks.
 - **Serving diffusion on vla 0.3.0** needed two local fixes (to carry into the vla module): `diffusers` isn't in its
   environment (it installs only the smolvla/evo1 extras), and LeRobot's single-observation `predict_action_chunk` adds a
   time axis to images but not to the state, so a (1, 10) state reads as 10 observation steps; vla must add it.
