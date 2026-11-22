@@ -188,13 +188,17 @@ async def run_episode(a, c, seed) -> dict:
                         t_inf = time.monotonic()
                         r = await asyncio.wait_for(c["policy"].do_command(
                             {"command": "infer", "images": images, "state": {"values": state_vector(pose, g)},
-                             "task": TASK}), INFER_TIMEOUT_S)
+                             "task": TASK}), a.infer_timeout_s)
                         infer_s.append(time.monotonic() - t_inf)
                         poses, gcol = chunk_to_poses(r["actions"]["rows"])
                     except Exception as e:  # noqa: BLE001
                         errors_extra.append(("infer", repr(e)))
                         break
-                    chunk = {"t_obs": t_obs, "dt": DT, "poses": poses, "grip": gcol}
+                    # Sync: the arm held still while the policy thought, so row 0 is due now, not at t_obs (an inference
+                    # longer than the chunk would otherwise arrive already played out). Async: the arm kept moving, so
+                    # the chunk keeps its real age.
+                    chunk = {"t_obs": time.monotonic() if a.cadence == "sync" else t_obs, "dt": DT, "poses": poses,
+                             "grip": gcol}
                     row0.append(math.dist([poses[0][k] for k in "xyz"], [pose[k] for k in "xyz"]))
                     if old is not None:
                         now = time.monotonic()
@@ -300,6 +304,7 @@ def parse_args(argv=None):
     ap.add_argument("--seeds", default="9100", help="N or LO-HI")
     ap.add_argument("--out", help="JSONL file, appended (required unless --once)")
     ap.add_argument("--timeout-s", type=float, default=30.0)
+    ap.add_argument("--infer-timeout-s", type=float, default=INFER_TIMEOUT_S, help="raise it for slow policies")
     ap.add_argument("--session-timeout-ms", type=float, default=3000, help="servo dead-man; raise it for slow policies")
     ap.add_argument("--grip-early", action="store_true", help="fire the gripper lead early (old behaviour; diagnosis only)")
     ap.add_argument("--checkpoint-label", default="")
