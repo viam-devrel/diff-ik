@@ -335,7 +335,8 @@ sim smoke in Task 7.
     returns `cur`.
   - `async def _place(self, cur, sc)`: from `bin_tcp = ...` through the in-bin check (raises `Discard`).
   - `async def _close(self, info, capturing)`: the body of `run`'s `finally` (servo_stop, then stop_capture with the
-    same warning, `kept=False`, `reason` and `abort` handling).
+    same warning, `kept=False`, `reason` and `abort` handling). Skip the `servo_stop` when `self.sid is None` (a
+    `servo_start` that failed in `takeover`).
   - `run` becomes: scene, place, open, `p0 = await self._start_session()`, the same `cur`/`info`/tool-down check, the
     start move and hold, the capture start, `cur = await self._pick(cur, sc)`, `await self._place(cur, sc)`,
     `info["kept"] = True`, the same `except` clauses, `finally: await self._close(info, capturing)`.
@@ -347,11 +348,11 @@ sim smoke in Task 7.
         """Finish the pick from wherever the policy left the arm (DAgger spec §2-3). Capture (when tags are given)
         starts before the first expert move, so the episode's first frame is the takeover state."""
         sc = C.sample_scene(seed)
-        p0 = await self._start_session()
-        cur = C.six_tuple_from_pose(p0)
         info = {"seed": seed, "scene": sc, "kept": False, "reason": ""}
         capturing = False
+        self.sid = None
         try:
+            cur = C.six_tuple_from_pose(await self._start_session())
             holding = bool((await self.gripper.is_holding_something()).meta.get("firm_grasp"))
             info["holding"] = holding
             if tags is not None:
@@ -521,8 +522,9 @@ Expected: `TypeError: run_episode() got an unexpected keyword argument 'stop'`
 2. `build_parser()`: everything in today's `parse_args` up to `a = ap.parse_args(argv)`, returning `ap`.
    `parse_args(argv=None, parser=None)`: `ap = parser or build_parser()`, then today's parsing and validation.
 3. `async def build_context(a, servo_r, obs_r, side_r) -> dict`: the body of `main_async` from `policy, world = ...`
-   through building `c` (the specs checks and `Executor` class settings included), returning `c`. `main_async` calls
-   it.
+   through building `c` (the specs checks and `Executor` class settings included), returning `c`. Move the function-
+   local imports (`Arm`, `Camera`, `Gripper`, `GenericComponent`, `Generic`, `MotionClient`) into `build_context` with
+   it. `main_async` calls it. No test calls `build_context`; check it with `--once` in Task 7.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -697,7 +699,7 @@ async def main_async(a):
         watch = Watch(c["side_arm"], c["side_grip"], c["world"], cfg_from_args(a))
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         n = kept = 0
-        kinds = collections.Counter()
+        kinds, outcomes = collections.Counter(), []
         for seed in policy_run.seed_range(a.seeds):
             row = await policy_run.run_episode(a, c, seed, stop=watch)
             rec = log_row(row)
@@ -708,6 +710,7 @@ async def main_async(a):
                 rec.update(info, tags=tags)
             n += 1
             kept += bool(rec.get("kept"))
+            outcomes.append(row["outcome"])
             with open(a.out, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             print(f"seed {seed} {rec['outcome']} trigger={rec['trigger']} kept={rec.get('kept')} "
@@ -716,6 +719,9 @@ async def main_async(a):
                 print("aborting: stop_capture failed", flush=True)
                 break
             if kept >= a.max_kept:
+                break
+            if policy_run.should_abort(outcomes):
+                print("aborting: the cell is not usable (repeated setup/close failures)", flush=True)
                 break
         print(json.dumps({"rollouts": n, "kept": kept, "triggers": dict(kinds), "log": a.out}))
     finally:
@@ -945,6 +951,7 @@ git commit -m "--pretrained viam:<org>/<model>@<version>: fine-tune from a regis
 
 ### Task 7 ★: Sim smoke and a 5-rollout dry run
 
+- [ ] **Step 0:** `uv run clients/python/policy_run.py --address <addr> --once` (checks `build_context` live).
 - [ ] **Step 1:** Run all diff-ik checks: `for t in clients/python/test_bc_pick.py clients/python/test_dagger_trigger.py clients/python/test_policy_run.py clients/python/test_policy_run_stop.py clients/python/test_dagger_run.py clients/python/test_policy_exec.py clients/python/test_policy_layout.py; do uv run $t; done`: all `ok`.
 - [ ] **Step 2: Expert regression.** `uv run clients/python/expert_pick.py run --address <addr> --seeds 1003-1005` (no
   capture): all `kept: true`.
@@ -979,11 +986,16 @@ git commit -m "--pretrained viam:<org>/<model>@<version>: fine-tune from a regis
 ### Task 10 ★: Local fine-tune check
 
 - [ ] **Step 1:** `viam packages export --org-id=16518049-9dd3-479f-9644-c5d112aa42d8 --name=diff-ik-pick-smolvla --version=4 --type=ml_model --destination=<scratch>/v4pkg`, unpack.
-- [ ] **Step 2:** `viam dataset export` `diff-ik-pick-dagger-r1` to the scratchpad; run the training script locally
+- [ ] **Step 2:** Build a small sequence dataset `diff-ik-pick-check` from 5 v3-200 sequences plus 5 corrections,
+  `viam dataset export` it to the scratchpad; run the training script locally
   (branch `pretrained-viam-package`, `.venv`) with the cloud args plus `--pretrained=<unpacked v4> --steps=2 --batch_size=2 --extra "--policy.device cpu --num_workers 0"`
   (or `mps`). Check:
-  (a) the step-1 loss is near v4's final training loss (from the v4 job log), not the base model's;
-  (b) the packaged checkpoint's normalization stats match the r1 dataset's stats, not v4's;
+  (a) the step-1 loss is well below the base model's step-1 loss on the same data (run once more with no
+  `--pretrained` to get it) and near v4's final training loss;
+  (b) the packaged checkpoint's normalization stats match the new dataset's stats, not v4's. If they come from v4's
+  saved processor files instead, report it at the Task 11 check-in with the stat difference: the fix is either to
+  accept v4's stats (the distributions nearly match) or to drop the processor files from the unpacked base before
+  training;
   (c) the scheduler logs its auto-scaling for the step count.
 - [ ] **Step 3:** If an org-readable key is at hand, call `viam_package.package_url` for
   `16518049-9dd3-479f-9644-c5d112aa42d8/diff-ik-pick-smolvla@4` locally. Otherwise the first cloud job is the test (it
@@ -991,6 +1003,8 @@ git commit -m "--pretrained viam:<org>/<model>@<version>: fine-tune from a regis
 
 ### Task 11 ★ [check-in]: Script version and the two jobs
 
+- [ ] **Step 0:** Confirm that script version 4 was uploaded from `early-stop-best` (the `lora-packaging-recipes`
+  commits stayed local), so version 5 from `pretrained-viam-package` rolls nothing back.
 - [ ] **Step 1:** Show the user: the branch's diff, Task 10's results, and the two submit commands. Ask to (a) upload
   the branch as `lerobot-training` version 5 (`viam training-script upload`, as for versions 1–4, per the repo
   README), and (b) submit both jobs. Opening a PR for the branch is a separate question (it stacks on #2).
